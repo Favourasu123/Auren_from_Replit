@@ -36,18 +36,27 @@ async function initStripe() {
     const stripeSync = await getStripeSync();
 
     console.log('Setting up managed webhook...');
-    const webhookBaseUrl = `https://${process.env.REPLIT_DOMAINS?.split(',')[0]}`;
-    try {
-      const result = await stripeSync.findOrCreateManagedWebhook(
-        `${webhookBaseUrl}/api/stripe/webhook`
-      );
-      if (result?.webhook?.url) {
-        console.log(`Webhook configured: ${result.webhook.url}`);
-      } else {
-        console.log('Webhook setup completed (URL not available)');
+    // Railway compatibility: Use RAILWAY_PUBLIC_DOMAIN or custom WEBHOOK_URL
+    // Replit used REPLIT_DOMAINS, Railway provides RAILWAY_PUBLIC_DOMAIN
+    const webhookBaseUrl = process.env.WEBHOOK_URL || 
+                          (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null) ||
+                          (process.env.REPLIT_DOMAINS ? `https://${process.env.REPLIT_DOMAINS.split(',')[0]}` : null);
+    
+    if (webhookBaseUrl) {
+      try {
+        const result = await stripeSync.findOrCreateManagedWebhook(
+          `${webhookBaseUrl}/api/stripe/webhook`
+        );
+        if (result?.webhook?.url) {
+          console.log(`Webhook configured: ${result.webhook.url}`);
+        } else {
+          console.log('Webhook setup completed (URL not available)');
+        }
+      } catch (webhookError) {
+        console.log('Webhook setup skipped (may already exist or not available in this environment)');
       }
-    } catch (webhookError) {
-      console.log('Webhook setup skipped (may already exist or not available in this environment)');
+    } else {
+      console.log('No webhook URL configured (WEBHOOK_URL or RAILWAY_PUBLIC_DOMAIN not set), skipping webhook setup');
     }
 
     console.log('Syncing Stripe data...');
