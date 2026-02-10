@@ -10,7 +10,8 @@ const __dirname = path.dirname(__filename);
 export default defineConfig(async () => {
   const plugins = [react(), runtimeErrorOverlay()];
 
-  if (process.env.NODE_ENV !== "production" && process.env.REPL_ID !== undefined) {
+  // Only add Replit dev plugins in dev mode
+  if (process.env.NODE_ENV !== "production" && process.env.REPL_ID) {
     const { cartographer } = await import("@replit/vite-plugin-cartographer");
     const { devBanner } = await import("@replit/vite-plugin-dev-banner");
     plugins.push(cartographer(), devBanner());
