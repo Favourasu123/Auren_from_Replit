@@ -1,0 +1,13 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gzmodels/segformer_face_parsing.onnx
+models/segformer_face_parsing.onnx
+models/face_parsing_resnet34.onnx
+models/face_parsing_resnet18.onnx
+models/segformer_face_parsing.onnx
+models/face_parsing_resnet34.onnx
+models/face_parsing_resnet18.onnx
+models/*.onnx

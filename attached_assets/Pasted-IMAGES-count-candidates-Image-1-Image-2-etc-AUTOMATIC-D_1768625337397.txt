@@ -1,0 +1,35 @@
+IMAGES: ${count} candidates (Image 1, Image 2, etc.)
+⛔ AUTOMATIC DISQUALIFICATION - CHECK FIRST (CRITICAL):
+   BEFORE evaluating ANY image, perform this check:
+   
+   STEP 1: Is this image a GRID or COLLAGE?
+   - Look for: 2x2 grids, 3x3 grids, side-by-side layouts, before/after splits, Pinterest-style collages
+   - If the image has VISIBLE DIVIDING LINES or MULTIPLE SEPARATE PHOTO SECTIONS → REJECT IMMEDIATELY
+   - Grid/collage images are NEVER acceptable, even if they show the same person
+   
+   STEP 2: Count the number of DISTINCT FACES visible
+   - If you can see 2, 3, 4, or more faces/heads → REJECT IMMEDIATELY
+   - Group photos with multiple people → REJECT
+   - Only images with EXACTLY 1 person and 1 face are valid
+🎯 SELECTION PRIORITY (in order of importance):
+1️⃣ PRIMARY - RACE, GENDER & HAIR TYPE (ABSOLUTELY REQUIRED):
+   - Race: The person MUST be ${raceEthnicity} (verify by looking at FACE/SKIN, not hairstyle)
+   - Gender: The person MUST be ${gender}
+   - Hair Type: MUST have SIMILAR hair texture (coily, curly, wavy, straight)
+   - REJECT ANY image where race, gender, or hair type doesn't match
+2️⃣ SECONDARY - FACE ANGLE (STRICTLY REQUIRED):
+   - MUST be PERFECTLY FRONT-FACING with nose centered between the eyes
+   - BOTH ears must be at least partially visible (indicates true front view)
+   - REJECT: Side profiles, 3/4 angles, turned heads, tilted heads
+3️⃣ TERTIARY - HAIRSTYLE MATCH (REQUIRED):
+   - Select DISTINCT, GOOD-LOOKING hairstyles that match "${hairstylePrompt}"
+   - Choose attractive, well-executed versions of the requested style
+   - Select variations: different LENGTHS and STYLING within the same style type
+4️⃣ QUATERNARY - IMAGE QUALITY (preference):
+   - PREFER high resolution, sharp, well-focused images
+   - PREFER professional lighting with clear visibility of hairstyle details
+   - Full head visible, no hats/durags/hoods/hands blocking hair
+5️⃣ QUINARY - FACE SHAPE COMPATIBILITY (preference):
+   - Prefer references with similar face shape to user: ${faceShape}
+Return ONLY this JSON (no markdown):
+{"selections":[1,5,8,3,12,7,15,2,9,4],"reason":"why these show distinct variations","hairstyle":"SHORT hairstyle name"}

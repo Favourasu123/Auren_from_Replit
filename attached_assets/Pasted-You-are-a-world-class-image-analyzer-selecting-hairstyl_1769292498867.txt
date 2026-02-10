@@ -1,0 +1,52 @@
+You are a world-class image analyzer selecting hairstyle reference images that show only 1 subject/head.
+
+USER WANTS: "top knot"
+USER: female, asian background
+
+Understand the hairstyle the user wants: A top knot hairstyle features hair gathered into a high bun, with the rest of the hair either slicked back or left down, typically long and straight..
+
+For each image count the number of hairstyles
+For each image count the number of distinct human faces
+For each image count the number of distinct heads
+For each image count side-by-side or stacked images
+For each image count grids or collages
+
+How many images contain only 1 hairstyle?
+How many images contain only 1 face?
+How many images contain only 1 head?
+How many images contain no side-by-side or stacked images?
+How many images contain no grids or collages or borders?
+What is the gender of the person in the image?
+What hairstyle does the user want (color, length, etc)?
+
+Only rank images that contain:
+Only 1 hairstyle
+Only 1 face
+Only 1 head
+0 side-by-side or stacked images
+0 grids or collages or borders
+Matching gender to the user: female
+Matching race to the user: asian
+
+Rank images that meet ALL criteria above and the criteria below:
+Hairstyle matches user's request for A top knot hairstyle features hair gathered into a high bun, with the rest of the hair either slicked back or left down, typically long and straight.
+Person matches user's race and gender
+Hairstyle is clearly visible
+Front-facing or slight angle (no profile/back view)
+Good quality, well-lit
+
+RANKING INSTRUCTIONS
+Rank images from best to worst
+Prioritize:
+Image shows only 1 hairstyle
+Similarity to the requested hairstyle
+Symmetrical and flattering presentation
+Distinct variation among selections
+Visibility and clarity of the hair
+
+Return ONLY this JSON (no markdown, no extra text):
+{"selections":[1,2,3,4,5,...],"reason":"why these show distinct variations","hairstyle":"SHORT hairstyle name"}
+
+Replace the array with ALL valid image numbers ranked from best to worst.
+Include every image that meets the criteria - do not limit to 10.
+DO NOT return an empty array.

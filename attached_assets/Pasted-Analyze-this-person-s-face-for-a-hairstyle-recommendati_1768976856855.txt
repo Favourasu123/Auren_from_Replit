@@ -1,0 +1,57 @@
+Analyze this person's face for a hairstyle recommendation system.
+
+CRITICAL - GENDER DETECTION:
+You MUST determine biological sex accurately. DO NOT guess based on hairstyle or clothing.
+Look ONLY at these physical features:
+1. JAWLINE: Males have wider, more angular jaws. Females have narrower, rounder jaws.
+2. BROW RIDGE: Males have prominent brow ridges. Females have flatter foreheads.
+3. NOSE: Males typically have larger, wider noses.
+4. CHIN: Males have squarer chins. Females have pointier chins.
+5. CHEEKBONES: Females often have more prominent cheekbones.
+6. ADAM'S APPLE: If visible, indicates male.
+7. FACIAL HAIR: Any stubble/beard = male.
+
+IGNORE these (they don't indicate gender):
+- Hair length or style
+- Makeup (some men wear makeup)
+- Jewelry
+- Clothing
+
+RACE/ETHNICITY DETECTION:
+Analyze facial features to determine race/ethnicity for finding matching hairstyle references.
+Use these categories: asian, black, white, latino, middle_eastern, south_asian, southeast_asian, mixed
+Look at: eye shape, nose bridge, lip fullness, skin undertones, facial bone structure.
+
+HEAD ANGLE DETECTION (for hairstyle matching):
+Determine the HEAD POSITION/ANGLE - this is CRITICAL for finding matching hairstyle references.
+Focus on which parts of the HEAD and HAIR are visible, not just eye direction.
+- "front": HEAD faces forward, both sides of hair equally visible, forehead centered
+- "three_quarter": HEAD turned 15-45 degrees, one side of hair more visible than the other
+- "side": HEAD in profile view, mostly one side of hair visible, ear may be visible
+- "tilted": HEAD tilted up/down significantly, crown or neck more visible than normal
+
+USER'S HAIRSTYLE REQUEST: "${hairstylePrompt}"
+
+Generate a search query to find reference images in this format (DO NOT include user's hair texture):
+"best [hairstyle name] hairstyle for [race] [gender] (front facing)"
+
+Return this JSON:
+{
+  "userAnalysis": {
+    "skinTone": "light" | "medium-light" | "medium" | "medium-dark" | "dark",
+    "skinToneConfidence": 0.0-1.0,
+    "faceShape": "oval" | "round" | "square" | "heart" | "oblong" | "diamond",
+    "faceShapeConfidence": 0.0-1.0,
+    "gender": "male" | "female",
+    "raceEthnicity": "asian" | "black" | "white" | "latino" | "middle_eastern" | "south_asian" | "southeast_asian" | "mixed",
+    "raceEthnicityConfidence": 0.0-1.0,
+    "hairTexture": "straight" | "wavy" | "curly" | "coily" | null,
+    "currentHairLength": "short" | "medium" | "long" | null,
+    "faceAngle": "front" | "three_quarter" | "side" | "tilted",
+    "faceAngleConfidence": 0.0-1.0
+  },
+  "searchQuery": "best [hairstyle] hairstyle for [race] [gender] (front facing)",
+  "hairstyleInterpretation": "brief description of what the user wants"
+}
+
+Return ONLY valid JSON, no markdown code blocks, no explanation.

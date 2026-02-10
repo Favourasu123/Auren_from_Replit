@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hair Mask Refinement Test</title>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      padding: 2rem;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    h1 {
+      text-align: center;
+      color: #a855f7;
+    }
+    .comparison {
+      display: flex;
+      gap: 2rem;
+      justify-content: center;
+      flex-wrap: wrap;
+      margin: 2rem 0;
+    }
+    .image-container {
+      text-align: center;
+    }
+    .image-container img {
+      border: 2px solid #333;
+      border-radius: 8px;
+      max-width: 400px;
+    }
+    .image-container h3 {
+      margin-top: 0.5rem;
+      color: #a855f7;
+    }
+    .full-comparison {
+      text-align: center;
+      margin: 2rem 0;
+    }
+    .full-comparison img {
+      border: 2px solid #333;
+      border-radius: 8px;
+      max-width: 100%;
+    }
+    .info {
+      background: #2a2a4e;
+      padding: 1.5rem;
+      border-radius: 8px;
+      margin: 1rem 0;
+    }
+    .info h2 {
+      margin-top: 0;
+      color: #a855f7;
+    }
+    code {
+      background: #333;
+      padding: 0.2rem 0.5rem;
+      border-radius: 4px;
+    }
+    .results {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    .result-card {
+      background: #333;
+      padding: 1rem;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .result-card .value {
+      font-size: 1.5rem;
+      font-weight: bold;
+      color: #a855f7;
+    }
+  </style>
+</head>
+<body>
+  <h1>Hair Mask Refinement Test Results</h1>
+  
+  <div class="info">
+    <h2>BiSeNet-Style Mask Refinement Pipeline</h2>
+    <p>This test demonstrates the mask post-processing that fixes common segmentation issues:</p>
+    <ol>
+      <li><strong>Dilation</strong> - Expands the mask to fill hairline gaps</li>
+      <li><strong>Feathering</strong> - Gaussian blur for soft, natural edges</li>
+      <li><strong>Clamping</strong> - Ensures clean 0-255 values</li>
+    </ol>
+    <p>Config used: <code>dilation_kernel=5</code>, <code>iterations=1</code>, <code>feather_size=7</code></p>
+  </div>
+
+  <div class="comparison">
+    <div class="image-container">
+      <img src="mask_original.png" alt="Original mask">
+      <h3>Original (Raw Segmentation)</h3>
+      <p>Notice the gaps at the hairline and jagged edges</p>
+    </div>
+    <div class="image-container">
+      <img src="mask_refined.png" alt="Refined mask">
+      <h3>Refined (After Processing)</h3>
+      <p>Gaps filled, edges softened for natural blending</p>
+    </div>
+  </div>
+
+  <div class="full-comparison">
+    <h2>Side-by-Side Comparison</h2>
+    <img src="mask_comparison.png" alt="Comparison">
+  </div>
+
+  <div class="info">
+    <h2>Results</h2>
+    <div class="results">
+      <div class="result-card">
+        <div class="value">61,361</div>
+        <div>Original Pixels</div>
+      </div>
+      <div class="result-card">
+        <div class="value">67,812</div>
+        <div>Refined Pixels</div>
+      </div>
+      <div class="result-card">
+        <div class="value">+6,451</div>
+        <div>Expansion (Dilation)</div>
+      </div>
+      <div class="result-card">
+        <div class="value">7,565</div>
+        <div>Soft Edge Pixels</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="info">
+    <h2>Configuration Options</h2>
+    <p>These settings can be adjusted in <code>server/config.ts</code> or via environment variables:</p>
+    <ul>
+      <li><code>MASK_DILATION_KERNEL</code> - Size of dilation (default: 5, larger = more expansion)</li>
+      <li><code>MASK_DILATION_ITERATIONS</code> - Number of passes (default: 1)</li>
+      <li><code>MASK_FEATHER_SIZE</code> - Blur amount for soft edges (default: 7)</li>
+      <li><code>MASK_DEBUG_OVERLAY</code> - Generate red overlay for verification (default: false)</li>
+    </ul>
+  </div>
+</body>
+</html>
