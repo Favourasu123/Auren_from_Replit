@@ -1,0 +1,1 @@
+ALTER TABLE "generated_variants" ADD COLUMN "generation_started_at" timestamp;
