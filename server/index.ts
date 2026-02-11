@@ -17,7 +17,7 @@ import { startReminderScheduler } from "./reminders";
 const app = express();
 app.use(cookieParser());
 
-// Initialize Stripe schema and sync on startup
+// Initialize Stripe schema and sync on startup (SAFE FOR PROD)
 async function initStripe() {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
@@ -25,8 +25,27 @@ async function initStripe() {
     return;
   }
 
+  const isReplit = !!process.env.REPL_ID;
+  const shouldRunMigrations = process.env.RUN_STRIPE_MIGRATIONS === "true";
+
+  // 🔴 Never run stripe-replit-sync unless explicitly allowed
+  if (!shouldRunMigrations) {
+    console.log(
+      "Stripe migrations disabled (RUN_STRIPE_MIGRATIONS != true)"
+    );
+    return;
+  }
+
+  // 🔴 stripe-replit-sync is Replit-only
+  if (!isReplit) {
+    console.log(
+      "stripe-replit-sync is Replit-only, skipping Stripe initialization"
+    );
+    return;
+  }
+
   try {
-    console.log("Initializing Stripe schema...");
+    console.log("Running Stripe schema migrations...");
     await runMigrations({
       databaseUrl,
       schema: "stripe",
@@ -34,39 +53,6 @@ async function initStripe() {
     console.log("Stripe schema ready");
 
     const stripeSync = await getStripeSync();
-
-    console.log("Setting up managed webhook...");
-
-    const webhookBaseUrl =
-      process.env.WEBHOOK_URL ||
-      (process.env.RAILWAY_PUBLIC_DOMAIN
-        ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-        : null) ||
-      (process.env.REPLIT_DOMAINS
-        ? `https://${process.env.REPLIT_DOMAINS.split(",")[0]}`
-        : null);
-
-    if (webhookBaseUrl) {
-      try {
-        const result = await stripeSync.findOrCreateManagedWebhook(
-          `${webhookBaseUrl}/api/stripe/webhook`
-        );
-
-        if (result?.webhook?.url) {
-          console.log(`Webhook configured: ${result.webhook.url}`);
-        } else {
-          console.log("Webhook setup completed (URL not available)");
-        }
-      } catch {
-        console.log(
-          "Webhook setup skipped (may already exist or not available in this environment)"
-        );
-      }
-    } else {
-      console.log(
-        "No webhook URL configured, skipping webhook setup"
-      );
-    }
 
     console.log("Syncing Stripe data...");
     stripeSync
@@ -79,6 +65,7 @@ async function initStripe() {
     console.error("Failed to initialize Stripe:", error);
   }
 }
+
 
 // Stripe webhook route MUST come before express.json
 app.post(
