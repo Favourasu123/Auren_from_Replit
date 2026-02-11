@@ -62,6 +62,7 @@ export const userSessions = pgTable("user_sessions", {
 }, (table) => [index("IDX_user_sessions_device").on(table.deviceId)]);
 
 export const generatedVariants = pgTable("generated_variants", {
+  generationStartedAt: timestamp("generation_started_at"),
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
   sessionId: varchar("session_id").notNull(),
   hairstyleId: varchar("hairstyle_id"),
