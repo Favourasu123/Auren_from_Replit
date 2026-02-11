@@ -6,7 +6,7 @@ import { z } from "zod";
 import { db } from "./db";
 import { eq, desc } from "drizzle-orm";
 import Stripe from "stripe";
-import { setupAuth, isAuthenticated } from "./googleAuth";
+import { setupAuth } from "./googleAuth";
 import { getUncachableStripeClient, getStripePublishableKey } from "./stripeClient";
 import { GENERATION_CONFIG, logConfig, buildGenerationPrompt, getRegionBasedEthnicity } from "./config";
 import sharp from "sharp";
