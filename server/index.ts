@@ -17,6 +17,10 @@ import { startReminderScheduler } from "./reminders";
 const app = express();
 app.use(cookieParser());
 
+app.get("/health", (_req, res) => {
+  res.status(200).send("OK");
+});
+
 // Initialize Stripe schema and sync on startup (SAFE FOR PROD)
 async function initStripe() {
   const databaseUrl = process.env.DATABASE_URL;
