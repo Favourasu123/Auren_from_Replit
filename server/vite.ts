@@ -47,6 +47,9 @@ export async function setupVite(app: Express, server: Server) {
   // Only in dev we do HTML transforms
   if (process.env.NODE_ENV !== "production") {
     app.use("*", async (req, res, next) => {
+      // Skip API routes
+      if (req.path.startsWith("/api") || req.path.startsWith("/health")) return next();
+
       const url = req.originalUrl;
 
       try {
@@ -67,25 +70,20 @@ export async function setupVite(app: Express, server: Server) {
 }
 
 export function serveStatic(app: Express) {
-  // In prod, use relative path from current file to dist/public
-  let distPath: string;
-
-  if (process.env.NODE_ENV === "production") {
-    // __dirname points to dist/server after build
-    distPath = path.resolve(__dirname, "../public"); // <-- after build, index.html is at dist/public
-  } else {
-    distPath = path.resolve(__dirname, "../dist/public"); // dev build output
-  }
+  // In prod, use Vite's build output folder
+  const distPath = path.resolve(__dirname, "../dist"); // <-- Vite builds to dist by default
 
   if (!fs.existsSync(distPath)) {
     throw new Error(
-      `Could not find the build directory: ${distPath}, make sure to build the client first`
+      `Could not find the build directory: ${distPath}. Make sure to run 'npm run build' first.`
     );
   }
 
   app.use(express.static(distPath));
 
-  app.use("*", (_req, res) => {
-    res.sendFile(path.resolve(distPath, "index.html"));
+  // Serve index.html for all non-API routes
+  app.use((req, res, next) => {
+    if (req.path.startsWith("/api") || req.path === "/health") return next();
+    res.sendFile(path.join(distPath, "index.html"));
   });
 }
