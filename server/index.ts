@@ -18,7 +18,7 @@ app.use(cookieParser());
 
 // Health & basic root check
 app.get("/health", (_req, res) => res.status(200).send("OK"));
-app.get("/", (_req, res) => res.status(200).send("App is running"));
+// app.get("/", (_req, res) => res.status(200).send("App is running"));
 
 // Initialize Stripe schema and sync
 async function initStripe() {
