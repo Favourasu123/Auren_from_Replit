@@ -168,17 +168,22 @@ app.use((req, res, next) => {
     serveStatic(app);
   }
 
-  const port = parseInt(process.env.PORT || "5000", 10);
+  const port = Number(process.env.PORT);
+  
+  if (!port) {
+    throw new Error("PORT environment variable not set");
+  }
+  
   server.listen(
     {
       port,
       host: "0.0.0.0",
-      reusePort: true,
     },
     () => {
-      log(`serving on port ${port}`);
+      log(`🚀 Server listening on port ${port}`);
     }
   );
+
 
   const CACHE_CLEANUP_INTERVAL = 60 * 60 * 1000;
   setInterval(async () => {
