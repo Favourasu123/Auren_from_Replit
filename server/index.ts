@@ -151,8 +151,6 @@ app.use((req, res, next) => {
 (async () => {
   await initStripe();
 
-  const server = await registerRoutes(app);
-
   app.use(
     (err: any, _req: Request, res: Response, _next: NextFunction) => {
       const status = err.status || err.statusCode || 500;
@@ -168,22 +166,16 @@ app.use((req, res, next) => {
     serveStatic(app);
   }
 
-  const port = Number(process.env.PORT);
+  await registerRoutes(app);
   
+  const port = Number(process.env.PORT);
   if (!port) {
     throw new Error("PORT environment variable not set");
   }
   
-  server.listen(
-    {
-      port,
-      host: "0.0.0.0",
-    },
-    () => {
-      log(`🚀 Server listening on port ${port}`);
-    }
-  );
-
+  app.listen(port, "0.0.0.0", () => {
+    log(`🚀 Server listening on port ${port}`);
+  });
 
   const CACHE_CLEANUP_INTERVAL = 60 * 60 * 1000;
   setInterval(async () => {
