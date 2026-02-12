@@ -97,10 +97,12 @@ app.use((req, res, next) => {
   serveStatic(app);
 
   // Start server
-  const port = Number(process.env.PORT);
-  if (!port) throw new Error("PORT environment variable not set");
-
-  app.listen(port, "0.0.0.0", () => log(`🚀 Server listening on port ${port}`));
+  // Use the environment's port, or fallback to 5000 if not specified
+  const port = process.env.PORT || 5000;
+  
+  app.listen(Number(port), "0.0.0.0", () => {
+    log(`🚀 Server listening on port ${port}`);
+  });
 
   // Global error handler
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
