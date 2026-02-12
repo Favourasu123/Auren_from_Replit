@@ -20,6 +20,10 @@ app.get("/health", (_req, res) => {
   res.status(200).send("OK");
 });
 
+app.get("/", (_req, res) => {
+  res.status(200).send("App is running");
+});
+
 // Initialize Stripe schema and sync on startup
 async function initStripe() {
   const databaseUrl = process.env.DATABASE_URL;
