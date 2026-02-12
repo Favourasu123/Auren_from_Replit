@@ -70,20 +70,23 @@ export async function setupVite(app: Express, server: Server) {
 }
 
 export function serveStatic(app: Express) {
-  // In prod, use Vite's build output folder
-  const distPath = path.resolve(__dirname, "../dist"); // <-- Vite builds to dist by default
+  // Use process.cwd() to always start from the project root (/app on Railway)
+  const distPath = path.resolve(process.cwd(), "dist", "public");
 
   if (!fs.existsSync(distPath)) {
-    throw new Error(
-      `Could not find the build directory: ${distPath}. Make sure to run 'npm run build' first.`
-    );
+    // If we can't find dist/public, check the root dist as a fallback
+    const fallbackPath = path.resolve(process.cwd(), "dist");
+    if (!fs.existsSync(path.join(fallbackPath, "index.html"))) {
+       throw new Error(`Could not find index.html in ${distPath} or ${fallbackPath}`);
+    }
   }
 
   app.use(express.static(distPath));
 
-  // Serve index.html for all non-API routes
   app.use((req, res, next) => {
     if (req.path.startsWith("/api") || req.path === "/health") return next();
-    res.sendFile(path.join(distPath, "index.html"));
+    // Try to serve index.html from the public subfolder first
+    const indexPath = path.join(distPath, "index.html");
+    res.sendFile(indexPath);
   });
 }
