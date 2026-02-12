@@ -6,7 +6,7 @@ if (process.env.NODE_ENV === "development") {
 import express, { raw, type Request, Response, NextFunction } from "express";
 import cookieParser from "cookie-parser";
 import { registerRoutes } from "./routes";
-import { serveStatic, log } from "./vite"; // ❌ setupVite REMOVED
+import { serveStatic, log } from "./vite";
 import { runMigrations } from "stripe-replit-sync";
 import { getStripeSync } from "./stripeClient";
 import { WebhookHandlers } from "./webhookHandlers";
@@ -16,15 +16,11 @@ import { startReminderScheduler } from "./reminders";
 const app = express();
 app.use(cookieParser());
 
-app.get("/health", (_req, res) => {
-  res.status(200).send("OK");
-});
+// Health & basic root check
+app.get("/health", (_req, res) => res.status(200).send("OK"));
+app.get("/", (_req, res) => res.status(200).send("App is running"));
 
-app.get("/", (_req, res) => {
-  res.status(200).send("App is running");
-});
-
-// Initialize Stripe schema and sync on startup
+// Initialize Stripe schema and sync
 async function initStripe() {
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) {
@@ -47,27 +43,23 @@ async function initStripe() {
 
   try {
     console.log("Running Stripe schema migrations...");
-    await runMigrations({
-      databaseUrl,
-      schema: "stripe",
-    });
+    await runMigrations({ databaseUrl, schema: "stripe" });
 
     const stripeSync = await getStripeSync();
     stripeSync.syncBackfill().catch(console.error);
+    console.log("Stripe sync complete");
   } catch (error) {
-    console.error("Stripe init failed:", error);
+    console.error("Stripe initialization failed:", error);
   }
 }
 
-// Stripe webhook MUST come before express.json
+// Stripe webhook route
 app.post(
   "/api/stripe/webhook",
   raw({ type: "application/json" }),
   async (req, res) => {
     const signature = req.headers["stripe-signature"];
-    if (!signature) {
-      return res.status(400).json({ error: "Missing stripe-signature" });
-    }
+    if (!signature) return res.status(400).json({ error: "Missing stripe-signature" });
 
     try {
       const sig = Array.isArray(signature) ? signature[0] : signature;
@@ -98,27 +90,22 @@ app.use((req, res, next) => {
 (async () => {
   await initStripe();
 
-  // ✅ ROUTES FIRST
+  // Register API routes
   await registerRoutes(app);
 
-  // ✅ STATIC FILES (Railway)
+  // Serve frontend static files (Vite build output)
   serveStatic(app);
 
+  // Start server
   const port = Number(process.env.PORT);
-  if (!port) {
-    throw new Error("PORT environment variable not set");
-  }
+  if (!port) throw new Error("PORT environment variable not set");
 
-  app.listen(port, "0.0.0.0", () => {
-    log(`🚀 Server listening on port ${port}`);
-  });
+  app.listen(port, "0.0.0.0", () => log(`🚀 Server listening on port ${port}`));
 
-  // ✅ ERROR HANDLER LAST
+  // Global error handler
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     console.error(err);
-    res.status(err.status || 500).json({
-      message: err.message || "Internal Server Error",
-    });
+    res.status(err.status || 500).json({ message: err.message || "Internal Server Error" });
   });
 
   // Background jobs
