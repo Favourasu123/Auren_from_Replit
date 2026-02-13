@@ -1,8 +1,9 @@
 [build]
 builder = "NIXPACKS"
 buildCommand = "npm run build"
-# This tells Railway to ignore the "Node-only" default and install both
-nixpacksPlan = { providers = ["node", "python"] }
+# We only add the bare-minimum C++ and compression runtimes
+# and ensure Python 3 is explicitly available alongside Node
+nixpacksPlan = { providers = ["node", "python"], aptPackages = ["libstdc++6", "zlib1g", "libsm6"] }
 
 [deploy]
 startCommand = "npm start"
