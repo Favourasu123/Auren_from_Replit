@@ -12,6 +12,9 @@
     "check": "tsc",
     "db:push": "drizzle-kit push"
   },
+  "engines": {
+     "node": "20.x"
+  },
   "dependencies": {
     "@fal-ai/client": "^1.7.2",
     "@google/genai": "^1.30.0",
