@@ -30,12 +30,12 @@ echo "Downloading models (this will take ~30 seconds)..."
 if ! is_valid_model "models/face_parsing_resnet18.onnx"; then
     echo "→ Downloading BiSeNet face parsing model..."
 
-    curl -L --fail --silent --show-error \
-        -o models/face_parsing_resnet18.onnx \
-        "https://huggingface.co/jonathandinu/face-parsing/resolve/main/model.onnx" || {
-        echo "❌ Failed to download BiSeNet model"
-        exit 1
-    }
+curl -L --fail --silent --show-error \
+    -o models/face_parsing_resnet18.onnx \
+    "https://huggingface.co/jonathandinu/face-parsing/resolve/main/face_parsing_resnet18.onnx?download=true" || {
+    echo "❌ Failed to download BiSeNet model"
+    exit 1
+}
 
     echo "✓ BiSeNet model downloaded"
 fi
