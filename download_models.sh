@@ -29,22 +29,28 @@ echo "Downloading models (this will take ~30 seconds)..."
 # Download BiSeNet Face Parsing Model (~30MB)
 if ! is_valid_model "models/face_parsing_resnet18.onnx"; then
     echo "→ Downloading BiSeNet face parsing model..."
-    wget -q --show-progress -O models/face_parsing_resnet18.onnx \
+
+    curl -L --fail --silent --show-error \
+        -o models/face_parsing_resnet18.onnx \
         "https://huggingface.co/jonathandinu/face-parsing/resolve/main/model.onnx" || {
         echo "❌ Failed to download BiSeNet model"
         exit 1
     }
+
     echo "✓ BiSeNet model downloaded"
 fi
 
 # Download Ultra-Light Face Detector (~1MB)
 if ! is_valid_model "models/version-RFB-320.onnx"; then
     echo "→ Downloading Ultra-Light face detector..."
-    wget -q --show-progress -O models/version-RFB-320.onnx \
+
+    curl -L --fail --silent --show-error \
+        -o models/version-RFB-320.onnx \
         "https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB/raw/master/models/onnx/version-RFB-320.onnx" || {
         echo "❌ Failed to download Ultra-Light face detector"
         exit 1
     }
+
     echo "✓ Ultra-Light face detector downloaded"
 fi
 
