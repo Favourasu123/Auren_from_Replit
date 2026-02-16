@@ -1,12 +1,12 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "npm run build"
+buildCommand = "chmod +x download_models.sh && ./download_models.sh && pip install -r requirements.txt --break-system-packages && npm run build"
 # We only add the bare-minimum C++ and compression runtimes
 # and ensure Python 3 is explicitly available alongside Node
 nixpacksPlan = { providers = ["node", "python"], aptPackages = ["libstdc++6", "zlib1g"] }
 
 [deploy]
-startCommand = "npm start"
+startCommand = "npm run db:push && npm start"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
