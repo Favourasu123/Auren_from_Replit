@@ -1,20 +1,16 @@
 [build]
 builder = "NIXPACKS"
-buildCommand = "chmod +x download_models.sh && ./download_models.sh && pip install -r requirements.txt --break-system-packages && npm run build"
-# We only add the bare-minimum C++ and compression runtimes
-# and ensure Python 3 is explicitly available alongside Node
+buildCommand = "pip install -r requirements.txt --break-system-packages && npm run build"
 nixpacksPlan = { 
   providers = ["node", "python"], 
   aptPackages = ["libstdc++6", "zlib1g", "wget"] 
 }
 
 [deploy]
-startCommand = "npm run db:push && npm start"
+startCommand = "bash download_models.sh && npm run db:push && npm start"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
 [env]
-# This ensures Python doesn't buffer logs so you can see the REAL error
 PYTHONUNBUFFERED = "1"
-# Forces OpenCV to run in headless mode just in case
 OPENCV_VIDEOIO_PRIORITY_MSMF = "0"
