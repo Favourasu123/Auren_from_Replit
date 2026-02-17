@@ -15,7 +15,8 @@ is_valid_model() {
 }
 
 if is_valid_model "/app/models/face_parsing_resnet18.onnx" && \
-   is_valid_model "/app/models/version-RFB-320.onnx"; then
+   is_valid_model "/app/models/version-RFB-320.onnx" && \
+   is_valid_model "/app/models/segformer_face_parsing.onnx"; then
     echo "✓ Models already exist on volume - skipping download"
     exit 0
 fi
@@ -28,6 +29,14 @@ if ! is_valid_model "/app/models/face_parsing_resnet18.onnx"; then
         -o /app/models/face_parsing_resnet18.onnx \
         "https://huggingface.co/jonathandinu/face-parsing/resolve/main/onnx/model.onnx"
     echo "✓ BiSeNet model downloaded"
+fi
+
+if ! is_valid_model "/app/models/segformer_face_parsing.onnx"; then
+    echo "→ Downloading SegFormer face parsing model..."
+    curl -L --fail --show-error \
+        -o /app/models/segformer_face_parsing.onnx \
+        "https://huggingface.co/Flafa/hair-segmentation-models/resolve/main/segformer_face_parsing.onnx"
+    echo "✓ SegFormer model downloaded"
 fi
 
 if ! is_valid_model "/app/models/version-RFB-320.onnx"; then
