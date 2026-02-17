@@ -1116,7 +1116,7 @@ interface UserPhotoAnalysis {
 async function analyzeUserPhoto(photoUrl: string): Promise<UserPhotoAnalysis | null> {
   // Use GPT-4o-mini via Replit AI Integrations for face analysis
   const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey) {
     console.error("OpenAI AI Integrations not configured for vision analysis");
