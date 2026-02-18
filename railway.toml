@@ -3,7 +3,6 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "bash /app/download_models.sh && node /app/dist/index.js 2>&1 | tee /tmp/startup.log; cat /tmp/startup.log"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
