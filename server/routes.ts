@@ -563,7 +563,7 @@ type FaceAngle = "front" | "three_quarter" | "side" | "tilted" | "unknown";
 // Detect face angle in a reference image using GPT-4o-mini vision
 async function detectFaceAngle(base64Image: string): Promise<FaceAngle> {
   const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey) {
     return "unknown";
@@ -1337,7 +1337,7 @@ async function analyzeUserPhotoWithPrompt(
   hairstylePrompt: string
 ): Promise<CombinedAnalysisResult | null> {
   const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey) {
     console.error("OpenAI API key not configured for combined analysis");
@@ -1567,7 +1567,7 @@ async function analyzeReferenceImages(
   userPrompt: string
 ): Promise<string> {
   const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey || referenceImageBase64s.length === 0) {
     return userPrompt;
@@ -1813,7 +1813,7 @@ async function selectTopReferencesWithVision(
   hairstyleDescription: string = ""  // Vision model's interpretation of the hairstyle
 ): Promise<VisionSelectionResult> {
   const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   // Config for GPT-4o-mini only selection (no Gemini pre-filter)
   // Max candidates to send to GPT for ranking (default 20)
@@ -2519,7 +2519,7 @@ interface DualImageResult {
 // Use vision model to describe hairstyle in reference image
 async function describeHairstyleFromReference(referenceImageUrl: string): Promise<string | null> {
   const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey) {
     console.error("OpenAI API key not configured for hairstyle description");
@@ -2587,7 +2587,7 @@ async function generateHairstyleWithChatGPT(
 ): Promise<string | null> {
   try {
     const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-    const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+    const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
     
     if (!openaiApiKey) {
       console.error("AI_INTEGRATIONS_OPENAI_API_KEY not configured, skipping ChatGPT generation");
@@ -7747,7 +7747,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // === STEP 3.5: Get original user photo (same as original generation uses for image 3) ===
       // Using original photo as input_image_3 allows the model to apply the refinement
       // rather than being constrained by the generated image as a reference
-      const originalUserPhoto = session.photoUrl;
+      const originalUserPhoto = session.photoUrl; 
       console.log(`[REFINE] Using original user photo for image 3: ${originalUserPhoto?.substring(0, 50)}...`);
       
       if (!originalUserPhoto) {
@@ -7763,7 +7763,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       let refinementFullPrompt: string;
       const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-      const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+      const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
       
       if (openaiApiKey && variant.generatedImageUrl) {
         try {
