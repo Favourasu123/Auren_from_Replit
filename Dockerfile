@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y \
     zlib1g \
     wget \
     curl \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,8 +21,8 @@ RUN python3 -m pip install -r requirements.txt --break-system-packages
 
 COPY . .
 RUN npm run build
+RUN npm rebuild
 
 ENV PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
 
 EXPOSE 5000
-CMD ["node", "dist/index.js"]
