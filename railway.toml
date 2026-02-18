@@ -3,7 +3,7 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "bash download_models.sh && echo 'models done' && npm run db:push && echo 'db done' && npm start"
+startCommand = "bash download_models.sh && npm start"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
 
