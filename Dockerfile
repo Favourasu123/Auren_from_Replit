@@ -21,5 +21,7 @@ RUN python3 -m pip install -r requirements.txt --break-system-packages
 COPY . .
 RUN npm run build
 
+ENV PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+
 EXPOSE 5000
-CMD ["bash", "-c", "bash download_models.sh && npm run db:push && npm start"]
+CMD ["node", "dist/index.js"]
