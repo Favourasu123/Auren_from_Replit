@@ -23,6 +23,5 @@ COPY . .
 RUN npm run build
 RUN npm rebuild
 
-ENV PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
-
 EXPOSE 5000
+CMD ["bash", "-c", "bash /app/download_models.sh && node /app/dist/index.js"]
