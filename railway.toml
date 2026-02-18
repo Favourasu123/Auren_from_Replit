@@ -1,7 +1,6 @@
 [build]
-builder = "NIXPACKS"
-buildCommand = "pip install -r requirements.txt --break-system-packages && npm run build"
-nixpacksPlan = { providers = ["node", "python"], aptPackages = ["libstdc++6", "zlib1g", "wget"] }
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
 
 [deploy]
 startCommand = "bash download_models.sh && npm run db:push && npm start"
