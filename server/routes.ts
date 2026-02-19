@@ -11,7 +11,7 @@ import { getUncachableStripeClient, getStripePublishableKey } from "./stripeClie
 import { GENERATION_CONFIG, logConfig, buildGenerationPrompt, getRegionBasedEthnicity } from "./config";
 import sharp from "sharp";
 import { runHybridPipeline, isHybridModeEnabled } from "./hybridService";
-import { generateHairMask, generateHairMaskWithOverlay, generateHairMaskReplicate, isReplicateConfigured, createHairOnlyImage, createHairOnlyImageSimple, createHairOnlyImageUltra, createUserMaskedImage, createFacialFeaturesOnlyImage, createHairWithSkinBorderImage, createHairAndFaceImage, addWatermark } from "./imageProcessing";
+import { generateHairMask, generateHairMaskWithOverlay, generateHairMaskReplicate, isReplicateConfigured, createHairOnlyImage, createHairOnlyImageSimple, createHairOnlyImageUltra, createHairOnlyImageKontext, createUserMaskedImage, createFacialFeaturesOnlyImage, createHairWithSkinBorderImage, createHairAndFaceImage, addWatermark } from "./imageProcessing";
 import Replicate from "replicate";
 import * as fs from "fs";
 import * as crypto from "crypto";
@@ -3040,6 +3040,7 @@ async function generateWithKontextRefined(
   options?: {
     useRawStage1Prompt?: boolean;
     stage1InputLabel?: string;
+    useKontextDedicatedHairMask?: boolean;
   }
 ): Promise<string | null> {
   try {
@@ -3363,9 +3364,15 @@ async function generateWithKontextRefined(
     // Extra sharpening here can distort segmentation cues and produce incorrect masks.
     console.log(`🧪 Using raw Stage 1 result for masking (no extra sharpening)`);
     
-    // Create RAW hair-only mask from Kontext result using SAME pipeline as user mask raw mode
-    console.log(`🎭 Creating RAW hair-only mask from Stage 1 result (same pipeline as user mask)...`);
-    const kontextHairFaceMask = await createHairOnlyImageUltra(kontextBase64);
+    // Create Stage 1 hair-only mask.
+    // Direct Kontext mode can use a dedicated masking pipeline tuned for generated images.
+    const useDedicatedKontextMask = options?.useKontextDedicatedHairMask === true;
+    console.log(useDedicatedKontextMask
+      ? `🎭 Creating DEDICATED KONTEXT hair-only mask from Stage 1 result...`
+      : `🎭 Creating RAW hair-only mask from Stage 1 result (same pipeline as user mask)...`);
+    const kontextHairFaceMask = useDedicatedKontextMask
+      ? await createHairOnlyImageKontext(kontextBase64)
+      : await createHairOnlyImageUltra(kontextBase64);
     if (!kontextHairFaceMask) {
       console.error("[KONTEXT] Failed to create hair+face mask from Stage 1");
       return null;
@@ -4194,19 +4201,9 @@ async function generateStyleFromInspirationDual(
       return { frontImageUrl: null, sideImageUrl: null };
     }
     
-    // Sharpen Kontext result before masking
-    console.log(`✨ Sharpening Stage 1 result for better mask accuracy...`);
-    try {
-      const kontextBuffer = Buffer.from(kontextBase64.replace(/^data:image\/\w+;base64,/, ''), 'base64');
-      const sharpenedBuffer = await sharp(kontextBuffer)
-        .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
-        .jpeg({ quality: 95 })
-        .toBuffer();
-      kontextBase64 = `data:image/jpeg;base64,${sharpenedBuffer.toString('base64')}`;
-      console.log(`   ✓ Stage 1 result sharpened: ${kontextBase64.length} chars`);
-    } catch (e) {
-      console.log(`   ⚠ Sharpening failed, using original: ${(e as Error).message}`);
-    }
+    // Use raw Stage 1 output for masking.
+    // Extra sharpening can distort segmentation cues and produce neck leakage.
+    console.log(`🧪 Using raw Stage 1 result for masking (no extra sharpening)`);
     
     // Create RAW hair-only mask from Kontext result (same pipeline as text mode)
     console.log(`🎭 Creating RAW hair-only mask from Stage 1 result (HYBRID approach)...`);
@@ -7343,6 +7340,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 {
                   useRawStage1Prompt: true,
                   stage1InputLabel: "user photo",
+                  useKontextDedicatedHairMask: true,
                 }
               );
 
