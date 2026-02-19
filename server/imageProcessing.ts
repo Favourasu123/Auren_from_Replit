@@ -1042,19 +1042,24 @@ async function callBiSeNetPipeline(
     }
   }
 
-  // Normalize EXIF orientation and sharpen for better edge detection
+  // Normalize EXIF orientation.
+  // IMPORTANT: hair_only_ultra already does its own internal sharpening/refinement in Python.
+  // Applying extra sharpening here can skew segmentation toward neck/skin on Kontext outputs.
   const rawBuffer = Buffer.from(
     inputImage.replace(/^data:image\/\w+;base64,/, ''),
     'base64'
   );
   
-  // Sharpen reference images before masking to improve hair edge detection
-  // Uses unsharp mask: sigma=1.0, flat=1.0, jagged=2.0 for balanced sharpening
-  const normalizedBuffer = await sharp(rawBuffer)
-    .rotate()
-    .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
-    .jpeg({ quality: 95 })
-    .toBuffer();
+  const baseProcessor = sharp(rawBuffer).rotate();
+  const shouldSharpenBeforeMask = mode !== "hair_only_ultra";
+  const normalizedBuffer = shouldSharpenBeforeMask
+    ? await baseProcessor
+        .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
+        .jpeg({ quality: 95 })
+        .toBuffer()
+    : await baseProcessor
+        .jpeg({ quality: 95 })
+        .toBuffer();
   
   const normalizedBase64 = `data:image/jpeg;base64,${normalizedBuffer.toString('base64')}`;
   
@@ -1067,7 +1072,8 @@ async function callBiSeNetPipeline(
     mode: mode,
     bufferPx: bufferPx,
     grayOutEyes: options?.grayOutEyes || false,
-    faceBorderPx: options?.faceBorderPx || 0
+    faceBorderPx: options?.faceBorderPx || 0,
+    skinBorderPx: options?.skinBorderPx || 15
   });
   
   const { result, validation } = await new Promise<{ result: string | null; validation?: MaskValidation }>((resolve) => {

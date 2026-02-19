@@ -817,6 +817,11 @@ const BFL_KONTEXT_API_URL = "https://api.bfl.ai/v1/flux-kontext-pro"; // FLUX Ko
 const BFL_FILL_API_URL = "https://api.bfl.ai/v1/flux-pro-1.0-fill"; // FLUX Fill for mask-based inpainting
 const SERPER_API_KEY = process.env.SERPER_API_KEY; // For web image search (fallback)
 const SERPAPI_KEY = process.env.SERPAPI_KEY; // SerpAPI for Google Images search (primary)
+// Direct Kontext mode for text prompts:
+// skips GPT user-photo analysis + web reference search,
+// still uses GPT to interpret the user's hairstyle prompt for Stage 1,
+// then continues normal Stage 2 masking + FLUX.
+const KONTEXT_DIRECT_USER_PIPELINE = process.env.KONTEXT_DIRECT_USER_PIPELINE === "true";
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY_SEARCH || process.env.GOOGLE_CUSTOM_SEARCH_KEY || process.env.GOOGLE_PLACES_API_KEY; // Google Custom Search API
 const GOOGLE_CSE_ID = "c670db0add0214306"; // Custom Search Engine ID
 const SCREENSHOTONE_ACCESS_KEY = process.env.SCREENSHOTONE_ACCESS_KEY; // For high-quality social media screenshots
@@ -1557,6 +1562,83 @@ Return ONLY valid JSON, no markdown code blocks, no explanation.`;
     return result;
   } catch (error) {
     console.error("[COMBINED ANALYSIS] Error:", error);
+    return null;
+  }
+}
+
+// Prompt-only interpretation for direct Kontext mode.
+// This avoids user photo analysis while still using GPT to normalize user intent.
+async function interpretHairstylePromptWithGPT(
+  hairstylePrompt: string
+): Promise<string | null> {
+  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://api.openai.com/v1";
+
+  if (!openaiApiKey) {
+    console.error("[PROMPT INTERPRET] OpenAI API key not configured");
+    return null;
+  }
+
+  try {
+    console.log(`[PROMPT INTERPRET] Interpreting prompt with GPT-4o-mini: "${hairstylePrompt.substring(0, 80)}..."`);
+    const startTime = Date.now();
+
+    const prompt = `You are a professional hairstylist assistant.
+Interpret the user's hairstyle request and rewrite it as a concise hairstyle descriptor.
+
+Rules:
+- Return ONLY the hairstyle descriptor text, no JSON, no quotes, no markdown.
+- Keep it specific and visually clear.
+- Keep it under 20 words.
+- Do not include camera, lighting, studio, quality, or rendering terms.
+- Do not include any disclaimers.
+
+User request: "${hairstylePrompt}"`;
+
+    const openaiResponse = await fetch(`${openaiBaseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${openaiApiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 120,
+        temperature: 0.1,
+      }),
+    });
+
+    const responseTime = Date.now() - startTime;
+    console.log(`   ⏱️ GPT-4o-mini response time: ${(responseTime / 1000).toFixed(2)}s`);
+
+    if (!openaiResponse.ok) {
+      const errorText = await openaiResponse.text();
+      console.error(`[PROMPT INTERPRET] GPT-4o-mini error: ${openaiResponse.status} - ${errorText}`);
+      return null;
+    }
+
+    const data = await openaiResponse.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content || typeof content !== "string") {
+      console.error("[PROMPT INTERPRET] No content in response");
+      return null;
+    }
+
+    const interpreted = content
+      .trim()
+      .replace(/^["'`]+|["'`]+$/g, "")
+      .replace(/\s+/g, " ");
+
+    if (!interpreted) {
+      console.error("[PROMPT INTERPRET] Empty interpreted prompt");
+      return null;
+    }
+
+    console.log(`[PROMPT INTERPRET] ✓ "${interpreted}"`);
+    return interpreted;
+  } catch (error) {
+    console.error("[PROMPT INTERPRET] Error:", error);
     return null;
   }
 }
@@ -2954,7 +3036,11 @@ async function generateWithKontextRefined(
   referenceBase64: string,
   maskedUserPhoto: string,
   userRace: string = "person",
-  userGender: string = ""
+  userGender: string = "",
+  options?: {
+    useRawStage1Prompt?: boolean;
+    stage1InputLabel?: string;
+  }
 ): Promise<string | null> {
   try {
     if (!BFL_API_KEY) {
@@ -2975,8 +3061,9 @@ async function generateWithKontextRefined(
       normalizedPhotoUrl = await normalizeImageOrientation(photoUrl);
     }
     
-    // NOTE: Stage 1 now uses ONLY the reference image - no user mask sent to Kontext
-    // The user mask is only used in Stage 2 (FLUX 2 Pro) for face preservation
+    // Stage 1 uses a single input image (usually a reference image).
+    // In direct mode it can use the user photo instead.
+    // The user mask is only used in Stage 2 (FLUX 2 Pro) for face preservation.
     
     // Extract dimensions for output
     let outputWidth = 1024;
@@ -3003,18 +3090,21 @@ async function generateWithKontextRefined(
     console.log(`   - referenceBase64 preview: ${referenceBase64.substring(0, 100)}...`);
     console.log(`   - maskedUserPhoto (for Stage 2): ${maskedUserPhoto?.substring(0, 60) || 'N/A'}...`);
     
-    const kontextPrompt = buildGenerationPrompt(
-      GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT,
-      hairstylePrompt,
-      userRace,
-      userGender
-    );
+    const kontextPrompt = options?.useRawStage1Prompt
+      ? hairstylePrompt
+      : buildGenerationPrompt(
+          GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT,
+          hairstylePrompt,
+          userRace,
+          userGender
+        );
     console.log(`📝 Prompt: ${kontextPrompt}`);
     
-    // Build Kontext Pro request (SINGLE image: reference only - no user mask)
+    // Build Kontext Pro request (single Stage 1 input image)
+    const stage1InputLabel = options?.stage1InputLabel || "reference";
     const kontextRequestBody: any = {
       prompt: kontextPrompt,
-      input_image: referenceBase64,    // Single image: Reference hairstyle photo (no sharpening)
+      input_image: referenceBase64,    // Single image for Stage 1
       width: outputWidth,
       height: outputHeight,
       guidance: GENERATION_CONFIG.KONTEXT_STAGE1_GUIDANCE,
@@ -3023,19 +3113,19 @@ async function generateWithKontextRefined(
     };
     
     console.log(`📦 Kontext request keys: ${Object.keys(kontextRequestBody).join(", ")}`);
-    console.log(`  📤 input_image (reference - single image): ${referenceBase64.length} chars`);
+    console.log(`  📤 input_image (${stage1InputLabel} - single image): ${referenceBase64.length} chars`);
     
-    // DEBUG: Save Stage 1 input for verification (only reference image now)
+    // DEBUG: Save Stage 1 input for verification
     const fsDebugInputs = await import("fs/promises");
     try {
-      // Save reference input (single image)
+      // Save Stage 1 input (single image)
       if (referenceBase64.startsWith('data:')) {
         const refInputBuffer = Buffer.from(
           referenceBase64.replace(/^data:image\/\w+;base64,/, ''),
           'base64'
         );
         await fsDebugInputs.writeFile("/tmp/debug_kontext_stage1_input_ref.jpg", refInputBuffer);
-        console.log(`   ✓ Saved Stage 1 reference to /tmp/debug_kontext_stage1_input_ref.jpg`);
+        console.log(`   ✓ Saved Stage 1 input image to /tmp/debug_kontext_stage1_input_ref.jpg`);
       }
     } catch (e) {
       console.warn("Could not save Stage 1 input debug image:", e);
@@ -3269,22 +3359,9 @@ async function generateWithKontextRefined(
       return null;
     }
     
-    // Sharpen Kontext result before masking for better hair edge detection
-    console.log(`✨ Sharpening Stage 1 result for better mask accuracy...`);
-    try {
-      const kontextBuffer = Buffer.from(
-        kontextBase64.replace(/^data:image\/\w+;base64,/, ''),
-        'base64'
-      );
-      const sharpenedBuffer = await sharp(kontextBuffer)
-        .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
-        .jpeg({ quality: 95 })
-        .toBuffer();
-      kontextBase64 = `data:image/jpeg;base64,${sharpenedBuffer.toString('base64')}`;
-      console.log(`   ✓ Stage 1 result sharpened: ${kontextBase64.length} chars`);
-    } catch (e) {
-      console.log(`   ⚠ Sharpening failed, using original: ${(e as Error).message}`);
-    }
+    // Use raw Stage 1 output for masking.
+    // Extra sharpening here can distort segmentation cues and produce incorrect masks.
+    console.log(`🧪 Using raw Stage 1 result for masking (no extra sharpening)`);
     
     // Create RAW hair-only mask from Kontext result using SAME pipeline as user mask raw mode
     console.log(`🎭 Creating RAW hair-only mask from Stage 1 result (same pipeline as user mask)...`);
@@ -6698,7 +6775,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       let visionHairstyleDescription: string = ""; // Vision model's interpretation of the hairstyle
       let storedSearchQuery: string = ""; // Store search query for auto-refresh
       
-      if (textModeVariants.length > 0) {
+      if (textModeVariants.length > 0 && !KONTEXT_DIRECT_USER_PIPELINE) {
         console.log(`[REFS] Pre-fetching for ${textModeVariants.length} text variants (vision: ${USE_VISION_SELECTION ? 'on' : 'off'}, candidates: ${CANDIDATES_TO_ANALYZE})`);
         
         try {
@@ -6970,6 +7047,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
           });
           console.log(`[REFS] Stored ${prefetchedRefs.length} ranked references to session (${seenUrls.length} URLs tracked)`);
         }
+      } else if (textModeVariants.length > 0 && KONTEXT_DIRECT_USER_PIPELINE) {
+        console.log(`[REFS] KONTEXT_DIRECT_USER_PIPELINE=true - skipping user photo analysis and reference search (prompt interpretation only)`);
       }
 
       for (const variant of variants) {
@@ -7223,6 +7302,69 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 });
                 console.log(`✓ Saved masked user photo to cache (key: ${maskCacheKey.substring(0, 40)}...)`);
               }
+            }
+
+            if (KONTEXT_DIRECT_USER_PIPELINE) {
+              console.log(`🚀 Direct Kontext pipeline enabled - using GPT prompt interpretation, no user-photo analysis, no reference search`);
+
+              if (!maskedUserPhoto) {
+                console.error(`❌ Missing user mask, cannot run direct Kontext pipeline`);
+                await storage.updateGeneratedVariant(variant.id, { status: "failed" });
+                continue;
+              }
+
+              const stage1InputImage = session.photoUrl.startsWith("data:")
+                ? session.photoUrl
+                : await fetchImageAsBase64(session.photoUrl);
+
+              if (!stage1InputImage) {
+                console.error(`❌ Failed to convert user photo to base64 for Kontext Stage 1`);
+                await storage.updateGeneratedVariant(variant.id, { status: "failed" });
+                continue;
+              }
+
+              const interpretedHairstylePrompt =
+                (await interpretHairstylePromptWithGPT(variant.customPrompt!)) || variant.customPrompt!;
+              const kontextDirectStage1Prompt =
+                `Give the person a ${interpretedHairstylePrompt} hairstyle while preserving the person. ` +
+                `Use bright, frontal lighting aligned with the camera axis, producing flat, even illumination across the entire subject. ` +
+                `Professional photorealistic studio portrait. ` +
+                `Shot in a bright professional studio using a Phase One XF IQ4 medium format camera, ultra-sharp focus, high clarity, high dynamic range, no depth-of-field blur, and no cinematic softness.`;
+
+              console.log(`📝 Direct Kontext Stage 1 prompt: ${kontextDirectStage1Prompt}`);
+
+              const directKontextResult = await generateWithKontextRefined(
+                session.photoUrl,
+                kontextDirectStage1Prompt,
+                stage1InputImage,
+                maskedUserPhoto,
+                userAnalysis?.raceEthnicity || "person",
+                userAnalysis?.gender || "",
+                {
+                  useRawStage1Prompt: true,
+                  stage1InputLabel: "user photo",
+                }
+              );
+
+              if (directKontextResult) {
+                generationSucceeded = true;
+                await storage.updateGeneratedVariant(variant.id, {
+                  generatedImageUrl: directKontextResult,
+                  sideImageUrl: null,
+                  webReferenceImageUrl: null,
+                  webReferenceSource: null,
+                  renderType: "ai",
+                  variantIndex: 0,
+                  referenceIndex: null,
+                  status: "completed",
+                });
+                console.log(`✅ Direct Kontext pipeline complete`);
+              } else {
+                await storage.updateGeneratedVariant(variant.id, {
+                  status: "failed",
+                });
+              }
+              continue;
             }
             
             // Generate using references with TWO-PHASE approach:
