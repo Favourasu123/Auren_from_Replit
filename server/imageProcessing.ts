@@ -1243,18 +1243,18 @@ export async function createHairOnlyImageUltra(
 /**
  * Creates a dedicated hair-only mask for Kontext Stage 1 results.
  * Uses specialized Python mode tuned for generated images.
- * Output: hair-only region with 40px buffer, face/neck excluded.
+ * Output: hair-only region with 30px buffer.
  */
 export async function createHairOnlyImageKontext(
   imageBase64: string
 ): Promise<string | null> {
   try {
-    console.log(`Creating dedicated Kontext hair-only mask (40px buffer, neck-safe)...`);
+    console.log(`Creating dedicated Kontext hair-only mask (30px buffer)...`);
 
-    const { result, width, height } = await callBiSeNetPipeline(imageBase64, "hair_only_kontext", 40);
+    const { result, width, height } = await callBiSeNetPipeline(imageBase64, "hair_only_kontext", 30);
 
     if (result) {
-      console.log(`✓ Dedicated Kontext hair mask created at ${width}x${height} (40px buffer, neck-safe)`);
+      console.log(`✓ Dedicated Kontext hair mask created at ${width}x${height} (30px buffer)`);
     }
 
     return result;

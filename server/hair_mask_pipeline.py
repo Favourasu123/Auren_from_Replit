@@ -1842,77 +1842,104 @@ def create_hair_only_mask_raw(image: np.ndarray, return_masks: bool = False, fac
 
 
 def create_hair_only_mask_kontext(image: np.ndarray, return_masks: bool = False,
-                                   hair_buffer_px: int = 40, blot_eyes: bool = True):
+                                   hair_buffer_px: int = 30, blot_eyes: bool = False):
     """
-    Kontext-specific hair-only masking pipeline.
+    BRAND-NEW Kontext-specific hair-only mask pipeline.
 
-    Purpose: robustly mask Stage 1 Kontext outputs where generic pipelines can leak neck pixels.
-    Strategy:
-      1) Full-image multi-scale hair segmentation (avoid face-crop bias)
-      2) Exclude neck and facial regions
-      3) Keep only components that start near the upper/head region
-      4) Expand with fixed 40px buffer
-      5) Gray everything else
+    Goal:
+      Gray out everything except:
+        1) detected hair
+        2) a fixed 30px buffer around detected hair
+
+    This pipeline is isolated from other modes and only used for Kontext outputs.
     """
-    log_debug(f"[HAIR ONLY KONTEXT] Starting dedicated pipeline - buffer={hair_buffer_px}px")
+    log_debug(f"[HAIR ONLY KONTEXT V2] Starting new pipeline - buffer={hair_buffer_px}px")
 
-    original_image = image.copy()
+    original = image.copy()
     h, w = image.shape[:2]
-
-    # 1) Full-image segmentation only (more stable for generated images)
-    hair_mask, facial_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
-
-    # 2) Build exclusion masks from parsing map
     session = get_session()
-    seg_map = segment_at_scale(original_image, 512, session)
-    neck_mask = (seg_map == NECK_ID).astype(np.uint8)
-    eye_mask = ((seg_map == LEFT_EYE_ID) | (seg_map == RIGHT_EYE_ID)).astype(np.uint8)
-    eyebrow_mask = ((seg_map == LEFT_EYEBROW_ID) | (seg_map == RIGHT_EYEBROW_ID)).astype(np.uint8)
 
-    # Remove neck immediately from the core hair mask
-    hair_core = hair_mask & (~neck_mask)
+    # 1) Multi-scale hair votes using BiSeNet classes:
+    #    class 17 = hair, class 18 = hat fallback (often captures braids/locs/waves).
+    scales = [512, 768, 1024]
+    hair_votes = np.zeros((h, w), dtype=np.float32)
 
-    # 3) Remove components that don't originate near the head region
-    # Use eyebrow top as anchor when available; otherwise use 55% of image height.
-    eyebrow_rows = np.where(eyebrow_mask.any(axis=1))[0]
-    if len(eyebrow_rows) > 0:
-        head_origin_cutoff = int(min(h - 1, eyebrow_rows[0] + 40))
-    else:
-        head_origin_cutoff = int(h * 0.55)
+    for scale in scales:
+        seg_map = segment_at_scale(original, scale, session)
+        hair_like = ((seg_map == HAIR_CLASS_ID) | (seg_map == 18)).astype(np.float32)
+        hair_votes += hair_like
 
-    if np.sum(hair_core) > 0:
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(hair_core.astype(np.uint8), connectivity=8)
-        filtered = np.zeros_like(hair_core, dtype=np.uint8)
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            top = stats[i, cv2.CC_STAT_TOP]
-            if area >= 200 and top <= head_origin_cutoff:
+    # Keep any pixel classified as hair-like by at least one scale.
+    hair_seed = (hair_votes >= 1.0).astype(np.uint8)
+
+    # 2) Clean noise while keeping fine strands.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    hair_seed = cv2.morphologyEx(hair_seed, cv2.MORPH_OPEN, kernel)
+    hair_seed = cv2.morphologyEx(hair_seed, cv2.MORPH_CLOSE, kernel)
+
+    # 3) Spatial filtering to avoid neck-only components.
+    # Prefer components near detected face/head region when face is found.
+    face_info = early_face_check(original)
+    if np.sum(hair_seed) > 0:
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(hair_seed, connectivity=8)
+        filtered = np.zeros_like(hair_seed, dtype=np.uint8)
+
+        if face_info.get("face_found") and face_info.get("faces"):
+            fx, fy, fw, fh = face_info["faces"][0]["bbox"]
+            x_min = max(0, fx - int(0.9 * fw))
+            x_max = min(w - 1, fx + fw + int(0.9 * fw))
+            y_max = min(h - 1, fy + int(1.15 * fh))
+            y_min = max(0, fy - int(1.2 * fh))
+
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                top = stats[i, cv2.CC_STAT_TOP]
+                left = stats[i, cv2.CC_STAT_LEFT]
+                width_i = stats[i, cv2.CC_STAT_WIDTH]
+                cx = left + width_i // 2
+                if area < 180:
+                    continue
+                if cx < x_min or cx > x_max:
+                    continue
+                if top > y_max or top < y_min:
+                    continue
                 filtered[labels == i] = 1
-        hair_core = filtered
+        else:
+            # Generic upper-region prior if no face found.
+            upper_limit = int(h * 0.80)
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                top = stats[i, cv2.CC_STAT_TOP]
+                if area >= 180 and top <= upper_limit:
+                    filtered[labels == i] = 1
 
-    # 4) Expand by dedicated Kontext buffer (40px default)
+        # If filtering removes everything, keep original seed to avoid all-gray failure.
+        if np.sum(filtered) > 0:
+            hair_seed = filtered
+
+    # 4) Build fixed buffer around hair seed.
     if hair_buffer_px > 0:
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hair_buffer_px * 2 + 1, hair_buffer_px * 2 + 1))
-        visible_mask = cv2.dilate(hair_core, kernel, iterations=1)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hair_buffer_px * 2 + 1, hair_buffer_px * 2 + 1))
+        visible = cv2.dilate(hair_seed, k, iterations=1)
     else:
-        visible_mask = hair_core.copy()
+        visible = hair_seed.copy()
 
-    # Exclude face+neck after expansion so buffer won't bleed into face/neck
-    exclusion_mask = (facial_mask > 0) | (neck_mask > 0)
-    visible_mask[exclusion_mask] = 0
+    # 5) Render: gray everything except hair + buffer.
+    output = np.full_like(original, GRAY_BG)
+    output[visible > 0] = original[visible > 0]
 
-    # 5) Render output (hair+buffer visible, everything else gray)
-    output = np.full_like(original_image, GRAY_BG)
-    output[visible_mask > 0] = original_image[visible_mask > 0]
+    # Optional eye blotting if explicitly requested.
+    if blot_eyes:
+        seg_map_512 = segment_at_scale(original, 512, session)
+        eye_mask = ((seg_map_512 == LEFT_EYE_ID) | (seg_map_512 == RIGHT_EYE_ID))
+        output[eye_mask] = GRAY_BG
 
-    # Optional eye blot for privacy/consistency
-    if blot_eyes and np.sum(eye_mask) > 0:
-        output[eye_mask > 0] = GRAY_BG
-
-    log_debug(f"[HAIR ONLY KONTEXT] Complete - visible pixels: {np.sum(visible_mask > 0)}")
+    log_debug(f"[HAIR ONLY KONTEXT V2] Complete - seed={np.sum(hair_seed)} visible={np.sum(visible)}")
 
     if return_masks:
-        return output, hair_core, facial_mask
+        # facial-like mask for validation consistency (used only as a sanity metric)
+        facial_like = np.zeros_like(hair_seed, dtype=np.uint8)
+        return output, hair_seed, facial_like
     return output
 
 
@@ -2961,8 +2988,8 @@ def main():
                 "validation": validation
             }
         elif mode == "hair_only_kontext":
-            # Dedicated Kontext Stage 1 mask pipeline (hair-only + 40px buffer).
-            hair_only, hair_mask, facial_mask = create_hair_only_mask_kontext(image, return_masks=True, hair_buffer_px=40)
+            # Dedicated Kontext Stage 1 mask pipeline (hair-only + 30px buffer).
+            hair_only, hair_mask, facial_mask = create_hair_only_mask_kontext(image, return_masks=True, hair_buffer_px=30)
 
             validation = validate_hair_mask(hair_mask, facial_mask, image.shape)
             log_debug(f"[HAIR ONLY KONTEXT] Validation: valid={validation['valid']}, score={validation['score']}, issues={validation['issues']}")
