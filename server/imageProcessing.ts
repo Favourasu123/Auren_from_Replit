@@ -1026,7 +1026,7 @@ export interface PhotoQualityValidation {
  */
 async function callBiSeNetPipeline(
   imageBase64: string,
-  mode: "hair_only" | "hair_only_simple" | "hair_only_ultra" | "hair_only_kontext" | "reference" | "reference_face_masked" | "facial_features_only" | "hair_with_skin_border",
+  mode: "hair_only" | "hair_only_simple" | "hair_only_ultra" | "hair_only_kontext" | "kontext_face_hair" | "reference" | "reference_face_masked" | "facial_features_only" | "hair_with_skin_border",
   bufferPx: number,
   options?: { grayOutEyes?: boolean; skinBorderPx?: number; faceBorderPx?: number }
 ): Promise<{ result: string | null; width: number; height: number; validation?: MaskValidation }> {
@@ -1051,7 +1051,7 @@ async function callBiSeNetPipeline(
   );
   
   const baseProcessor = sharp(rawBuffer).rotate();
-  const shouldSharpenBeforeMask = mode !== "hair_only_ultra" && mode !== "hair_only_kontext";
+  const shouldSharpenBeforeMask = mode !== "hair_only_ultra" && mode !== "hair_only_kontext" && mode !== "kontext_face_hair";
   const normalizedBuffer = shouldSharpenBeforeMask
     ? await baseProcessor
         .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
@@ -1097,7 +1097,7 @@ async function callBiSeNetPipeline(
         if (output.success) {
           // Handle different output keys based on mode
           let resultKey = "referenceImage";
-          if (mode === "hair_only" || mode === "hair_only_simple" || mode === "hair_only_ultra" || mode === "hair_only_kontext") {
+          if (mode === "hair_only" || mode === "hair_only_simple" || mode === "hair_only_ultra" || mode === "hair_only_kontext" || mode === "kontext_face_hair") {
             resultKey = "hairOnlyImage";
           } else if (mode === "reference_face_masked") {
             resultKey = "referenceFaceMaskedImage";
@@ -1260,6 +1260,29 @@ export async function createHairOnlyImageKontext(
     return result;
   } catch (error: any) {
     console.error("Error creating dedicated Kontext hair mask:", error);
+    return null;
+  }
+}
+
+/**
+ * Creates a Kontext mask using the same hybrid segmentation approach as user mask,
+ * but keeps face + hair visible and grays everything else.
+ */
+export async function createKontextFaceHairMask(
+  imageBase64: string
+): Promise<string | null> {
+  try {
+    console.log(`Creating Kontext face+hair mask (user-mask-style hybrid segmentation)...`);
+
+    const { result, width, height } = await callBiSeNetPipeline(imageBase64, "kontext_face_hair", 0);
+
+    if (result) {
+      console.log(`✓ Kontext face+hair mask created at ${width}x${height}`);
+    }
+
+    return result;
+  } catch (error: any) {
+    console.error("Error creating Kontext face+hair mask:", error);
     return null;
   }
 }

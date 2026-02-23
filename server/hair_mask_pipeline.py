@@ -1943,6 +1943,62 @@ def create_hair_only_mask_kontext(image: np.ndarray, return_masks: bool = False,
     return output
 
 
+def create_kontext_face_hair_mask_user_style(image: np.ndarray, return_masks: bool = False,
+                                             face_crop_region: tuple = None, include_neck: bool = True):
+    """
+    Kontext mask using the SAME hybrid segmentation approach as user_mask raw mode,
+    but rendering face + hair visible (everything else gray).
+    """
+    log_debug(f"[KONTEXT FACE+HAIR] Starting user-mask-style hybrid segmentation")
+
+    original_image = image.copy()
+    h, w = image.shape[:2]
+
+    # Match user_mask raw approach: early face crop, then focused + full-image hybrid.
+    if face_crop_region is None:
+        face_check = early_face_check(original_image)
+        if face_check["face_found"] and face_check["crop_region"]:
+            face_crop_region = face_check["crop_region"]
+            log_debug(f"[KONTEXT FACE+HAIR] Using face crop region: {face_crop_region}")
+
+    if face_crop_region is not None:
+        # Keep this identical to create_user_masked_image_raw:
+        # union hair from focused + full-image, but keep focused facial mask only.
+        focused_hair_mask, focused_facial_mask = segment_hair_focused(image, face_crop_region, scales=[512, 768, 1024])
+        full_hair_mask, _ = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+        hair_mask = focused_hair_mask | full_hair_mask
+        facial_mask = focused_facial_mask
+    else:
+        hair_mask, facial_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+
+    # Face/feature keep mask from segmentation classes (same family as user_mask logic).
+    session = get_session()
+    seg_map = segment_at_scale(original_image, 512, session)
+    face_keep = (
+        (seg_map == SKIN_CLASS_ID) |
+        (seg_map == LEFT_EYE_ID) | (seg_map == RIGHT_EYE_ID) |
+        (seg_map == LEFT_EYEBROW_ID) | (seg_map == RIGHT_EYEBROW_ID) |
+        (seg_map == NOSE_ID) |
+        (seg_map == UPPER_LIP_ID) | (seg_map == LOWER_LIP_ID) | (seg_map == MOUTH_ID) |
+        (seg_map == LEFT_EAR_ID) | (seg_map == RIGHT_EAR_ID)
+    )
+    if include_neck:
+        face_keep = face_keep | (seg_map == NECK_ID)
+
+    # Final visible region: face + hair.
+    visible_mask = (hair_mask > 0) | face_keep
+
+    # Render gray background with only visible regions.
+    output = np.full_like(original_image, GRAY_BG)
+    output[visible_mask] = original_image[visible_mask]
+
+    log_debug(f"[KONTEXT FACE+HAIR] Complete - visible pixels: {np.sum(visible_mask)}")
+
+    if return_masks:
+        return output, hair_mask.astype(np.uint8), facial_mask.astype(np.uint8)
+    return output
+
+
 def create_user_masked_image(image: np.ndarray, face_buffer_px: int = 25, sharpen: bool = True, 
                               use_multi_scale: bool = False, use_guided_filter: bool = True,
                               return_masks: bool = False, hairline_visible_px: int = 20,
@@ -3002,6 +3058,29 @@ def main():
             output = {
                 "success": True,
                 "hairOnlyImage": hair_only_base64,
+                "width": image.shape[1],
+                "height": image.shape[0],
+                "validation": validation
+            }
+        elif mode == "kontext_face_hair":
+            # Kontext mask using user-mask hybrid segmentation, but with face + hair visible.
+            face_hair, hair_mask, facial_mask = create_kontext_face_hair_mask_user_style(
+                image,
+                return_masks=True,
+                include_neck=True
+            )
+
+            validation = validate_hair_mask(hair_mask, facial_mask, image.shape)
+            log_debug(f"[KONTEXT FACE+HAIR] Validation: valid={validation['valid']}, score={validation['score']}, issues={validation['issues']}")
+
+            success, buffer = cv2.imencode('.png', face_hair)
+            if not success:
+                raise ValueError("Failed to encode kontext face+hair image")
+            face_hair_base64 = f"data:image/png;base64,{base64.b64encode(buffer).decode('utf-8')}"
+
+            output = {
+                "success": True,
+                "hairOnlyImage": face_hair_base64,
                 "width": image.shape[1],
                 "height": image.shape[0],
                 "validation": validation
