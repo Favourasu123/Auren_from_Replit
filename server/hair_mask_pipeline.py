@@ -23,6 +23,15 @@ import os
 MODEL_PATH = Path(__file__).parent.parent / "models" / "face_parsing_resnet18.onnx"
 SEGFORMER_MODEL_PATH = Path(__file__).parent.parent / "models" / "segformer_face_parsing.onnx"
 ULTRA_LIGHT_FACE_MODEL_PATH = Path(__file__).parent.parent / "models" / "version-RFB-320.onnx"
+SCRFD_FACE_MODEL_PATH = Path(__file__).parent.parent / "models" / "scrfd_2.5g_bnkps.onnx"
+RETINAFACE_AMD_MODEL_PATH = Path(__file__).parent.parent / "models" / "retinaface_amd_int.onnx"
+RETINAFACE_STANDARD_MODEL_PATH = Path(__file__).parent.parent / "models" / "retinaface_standard_conversion.onnx"
+MODNET_MODEL_PATH = Path(
+    os.environ.get(
+        "MODNET_MODEL_PATH",
+        str(Path(__file__).parent.parent / "models" / "modnet_photographic_portrait_matting.onnx")
+    )
+)
 
 # Quiet mode - suppress verbose logging (only errors and final status shown)
 QUIET_MODE = os.environ.get("BISENET_QUIET", "1") == "1"
@@ -30,6 +39,106 @@ QUIET_MODE = os.environ.get("BISENET_QUIET", "1") == "1"
 # Enable/disable early face detection (Ultra-Light-Fast face detector before BiSeNet)
 USE_EARLY_FACE_DETECTION = os.environ.get("EARLY_FACE_DETECTION", "1") == "1"
 FACE_DETECTION_CONFIDENCE = 0.7  # Minimum confidence for face detection
+
+# Kontext face detector settings
+KONTEXT_FACE_DETECTOR = os.environ.get("KONTEXT_FACE_DETECTOR", "ultralight").strip().lower()
+ULTRALIGHT_DET_THRESHOLD = float(os.environ.get("ULTRALIGHT_DET_THRESHOLD", "0.60"))
+SCRFD_DET_THRESHOLD = float(os.environ.get("SCRFD_DET_THRESHOLD", "0.50"))
+RETINAFACE_DET_THRESHOLD = float(os.environ.get("RETINAFACE_DET_THRESHOLD", "0.45"))
+KONTEXT_MULTI_PASS_SCALES_ENV = os.environ.get("KONTEXT_MULTI_PASS_SCALES", "1.0,1.2,0.9")
+KONTEXT_MATTING_BACKEND = os.environ.get("KONTEXT_MATTING_BACKEND", "trimap").strip().lower()
+MODNET_INPUT_SIZE = int(os.environ.get("MODNET_INPUT_SIZE", "512"))
+KONTEXT_EDGE_DECONTAMINATE = os.environ.get("KONTEXT_EDGE_DECONTAMINATE", "1") == "1"
+KONTEXT_EDGE_DECONTAM_STRENGTH = float(os.environ.get("KONTEXT_EDGE_DECONTAM_STRENGTH", "0.65"))
+
+
+def parse_multipass_scales(raw: str) -> list:
+    scales = []
+    for p in (raw or "").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            v = float(p)
+            if 0.6 <= v <= 2.0:
+                scales.append(v)
+        except Exception:
+            continue
+    if not scales:
+        return [1.0, 1.2, 0.9]
+    if 1.0 not in scales:
+        scales.insert(0, 1.0)
+    return scales
+
+
+def parse_boolish(value, default: bool = False) -> bool:
+    """Parse booleans from bool/int/str values."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(default)
+
+
+KONTEXT_MULTI_PASS_SCALES = parse_multipass_scales(KONTEXT_MULTI_PASS_SCALES_ENV)
+
+
+def resolve_runtime_detector(detector_type: str) -> str:
+    """
+    Resolve requested detector to an available runtime detector.
+    Falls back to ultralight if the requested detector model is unavailable.
+    """
+    detector = (detector_type or "ultralight").strip().lower()
+    if detector not in {"ultralight", "scrfd", "retinaface"}:
+        detector = "ultralight"
+
+    if detector == "scrfd" and not SCRFD_FACE_MODEL_PATH.exists():
+        log_info("[FACE DET] SCRFD model missing at runtime; falling back to ultralight")
+        return "ultralight"
+
+    if detector == "retinaface":
+        has_retina = RETINAFACE_AMD_MODEL_PATH.exists() or RETINAFACE_STANDARD_MODEL_PATH.exists()
+        if not has_retina:
+            log_info("[FACE DET] RetinaFace model missing at runtime; falling back to ultralight")
+            return "ultralight"
+
+    if detector == "ultralight" and not ULTRA_LIGHT_FACE_MODEL_PATH.exists():
+        # Keep behavior explicit if deployment is missing the only supported detector.
+        log_info(f"[FACE DET] Ultra-Light model not found at {ULTRA_LIGHT_FACE_MODEL_PATH}")
+
+    return detector
+
+
+def resolve_runtime_matting_backend(backend_type: str) -> str:
+    """
+    Resolve requested matting backend to an available backend.
+    Falls back to trimap if MODNet model is unavailable.
+    """
+    backend = (backend_type or KONTEXT_MATTING_BACKEND or "trimap").strip().lower()
+    if backend not in {"trimap", "modnet"}:
+        backend = "trimap"
+
+    if backend == "modnet" and not MODNET_MODEL_PATH.exists():
+        log_info(f"[MATTING] MODNet model missing at runtime ({MODNET_MODEL_PATH}); falling back to trimap")
+        return "trimap"
+    return backend
+
+
+def get_detector_default_threshold(detector_type: str) -> float:
+    detector = resolve_runtime_detector(detector_type)
+    if detector == "scrfd":
+        return float(SCRFD_DET_THRESHOLD)
+    if detector == "retinaface":
+        return float(RETINAFACE_DET_THRESHOLD)
+    return float(ULTRALIGHT_DET_THRESHOLD)
 
 def log_debug(msg: str):
     """Log debug message (suppressed in quiet mode)"""
@@ -81,6 +190,10 @@ MASK_VALIDATION = {
 
 # Ultra-Light face detector globals (lazy loaded)
 _ultra_light_face_session = None
+_scrfd_face_session = None
+_retinaface_face_session = None
+_retinaface_model_kind = None
+_modnet_session = None
 
 def get_ultra_light_face_detector():
     """Get or create the Ultra-Light face detector session (lazy loading)."""
@@ -224,6 +337,428 @@ def detect_faces_ultra_light(image: np.ndarray, confidence_threshold: float = FA
     
     return final_faces
 
+
+def nms_xyxy(dets: np.ndarray, iou_threshold: float = 0.4) -> np.ndarray:
+    """NMS for Nx5 detections in [x1,y1,x2,y2,score] format."""
+    if dets is None or dets.size == 0:
+        return np.array([], dtype=np.int32)
+
+    x1 = dets[:, 0]
+    y1 = dets[:, 1]
+    x2 = dets[:, 2]
+    y2 = dets[:, 3]
+    scores = dets[:, 4]
+    areas = np.maximum(0.0, x2 - x1 + 1.0) * np.maximum(0.0, y2 - y1 + 1.0)
+    order = scores.argsort()[::-1]
+
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        if order.size == 1:
+            break
+
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1 + 1.0)
+        h = np.maximum(0.0, yy2 - yy1 + 1.0)
+        inter = w * h
+        iou = inter / np.maximum(1e-6, areas[i] + areas[order[1:]] - inter)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    return np.array(keep, dtype=np.int32)
+
+
+def distance2bbox(points: np.ndarray, distance: np.ndarray) -> np.ndarray:
+    """Decode ltrb distances to xyxy boxes."""
+    x1 = points[:, 0] - distance[:, 0]
+    y1 = points[:, 1] - distance[:, 1]
+    x2 = points[:, 0] + distance[:, 2]
+    y2 = points[:, 1] + distance[:, 3]
+    return np.stack([x1, y1, x2, y2], axis=-1)
+
+
+def _faces_to_dets(faces: list) -> np.ndarray:
+    if not faces:
+        return np.zeros((0, 5), dtype=np.float32)
+    rows = []
+    for f in faces:
+        x, y, w, h = f["bbox"]
+        rows.append([float(x), float(y), float(x + w), float(y + h), float(f.get("confidence", 0.0))])
+    return np.array(rows, dtype=np.float32)
+
+
+def _dets_to_faces(dets: np.ndarray, image_shape: tuple) -> list:
+    h, w = image_shape[:2]
+    faces = []
+    if dets is None:
+        return faces
+    for d in dets:
+        x1, y1, x2, y2, score = d.tolist()
+        x1 = max(0, min(w - 1, int(round(x1))))
+        y1 = max(0, min(h - 1, int(round(y1))))
+        x2 = max(0, min(w - 1, int(round(x2))))
+        y2 = max(0, min(h - 1, int(round(y2))))
+        fw = max(0, x2 - x1)
+        fh = max(0, y2 - y1)
+        if fw < 20 or fh < 20:
+            continue
+        faces.append({
+            "bbox": (x1, y1, fw, fh),
+            "confidence": float(score),
+            "area": int(fw * fh)
+        })
+    faces.sort(key=lambda f: (f["area"], f["confidence"]), reverse=True)
+    return faces
+
+
+def get_scrfd_face_detector():
+    """Load SCRFD ONNX detector session."""
+    global _scrfd_face_session
+    if _scrfd_face_session is not None:
+        return _scrfd_face_session
+
+    if not SCRFD_FACE_MODEL_PATH.exists():
+        log_debug(f"SCRFD model missing: {SCRFD_FACE_MODEL_PATH}")
+        return None
+    try:
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.intra_op_num_threads = 4
+        _scrfd_face_session = ort.InferenceSession(
+            str(SCRFD_FACE_MODEL_PATH),
+            sess_options=opts,
+            providers=['CPUExecutionProvider']
+        )
+        log_debug("SCRFD face detector loaded")
+        return _scrfd_face_session
+    except Exception as e:
+        log_info(f"Failed to load SCRFD detector: {e}")
+        return None
+
+
+def get_retinaface_face_detector():
+    """Load RetinaFace ONNX detector session."""
+    global _retinaface_face_session, _retinaface_model_kind
+    if _retinaface_face_session is not None:
+        return _retinaface_face_session, _retinaface_model_kind
+
+    candidates = [
+        (RETINAFACE_AMD_MODEL_PATH, "amd"),
+        (RETINAFACE_STANDARD_MODEL_PATH, "standard"),
+    ]
+    for path, kind in candidates:
+        if not path.exists():
+            continue
+        try:
+            opts = ort.SessionOptions()
+            opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.intra_op_num_threads = 4
+            sess = ort.InferenceSession(str(path), sess_options=opts, providers=['CPUExecutionProvider'])
+            _retinaface_face_session = sess
+            _retinaface_model_kind = kind
+            log_debug(f"RetinaFace detector loaded ({kind}): {path.name}")
+            return _retinaface_face_session, _retinaface_model_kind
+        except Exception as e:
+            log_info(f"Could not load RetinaFace model {path.name}: {e}")
+    return None, None
+
+
+def detect_faces_scrfd_single(image: np.ndarray, confidence_threshold: float = 0.5,
+                              input_size: tuple = (640, 640), nms_thresh: float = 0.4) -> list:
+    """Single-pass SCRFD face detection."""
+    session = get_scrfd_face_detector()
+    if session is None:
+        return []
+
+    img_h, img_w = image.shape[:2]
+    in_w, in_h = int(input_size[0]), int(input_size[1])
+    im_ratio = float(img_h) / float(max(1, img_w))
+    model_ratio = float(in_h) / float(max(1, in_w))
+    if im_ratio > model_ratio:
+        new_h = in_h
+        new_w = int(new_h / im_ratio)
+    else:
+        new_w = in_w
+        new_h = int(new_w * im_ratio)
+
+    det_scale = float(new_h) / float(max(1, img_h))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    det_img = np.zeros((in_h, in_w, 3), dtype=np.uint8)
+    det_img[:new_h, :new_w, :] = resized
+
+    blob = cv2.dnn.blobFromImage(
+        det_img, 1.0 / 128.0, (in_w, in_h), (127.5, 127.5, 127.5), swapRB=True
+    )
+
+    try:
+        net_outs = session.run(None, {session.get_inputs()[0].name: blob})
+    except Exception as e:
+        log_info(f"SCRFD inference error: {e}")
+        return []
+
+    feat_strides = [8, 16, 32]
+    num_anchors = 2
+    scores_list = []
+    boxes_list = []
+    for idx, stride in enumerate(feat_strides):
+        scores = net_outs[idx]
+        bbox_preds = net_outs[idx + len(feat_strides)] * stride
+        scores = np.squeeze(scores).astype(np.float32)  # (N,)
+        bbox_preds = np.array(bbox_preds, dtype=np.float32)
+        if bbox_preds.ndim == 3:
+            bbox_preds = bbox_preds[0]
+
+        fh = in_h // stride
+        fw = in_w // stride
+        anchor_centers = np.stack(np.mgrid[:fh, :fw][::-1], axis=-1).astype(np.float32)
+        anchor_centers = (anchor_centers * stride).reshape((-1, 2))
+        if num_anchors > 1:
+            anchor_centers = np.stack([anchor_centers] * num_anchors, axis=1).reshape((-1, 2))
+
+        pos = np.where(scores >= confidence_threshold)[0]
+        if pos.size == 0:
+            continue
+        bboxes = distance2bbox(anchor_centers, bbox_preds)
+        boxes_list.append(bboxes[pos])
+        scores_list.append(scores[pos][:, None])
+
+    if not boxes_list:
+        return []
+
+    bboxes = np.vstack(boxes_list) / float(max(1e-6, det_scale))
+    scores = np.vstack(scores_list)
+    dets = np.hstack((bboxes, scores)).astype(np.float32, copy=False)
+    order = dets[:, 4].argsort()[::-1]
+    dets = dets[order]
+    keep = nms_xyxy(dets, nms_thresh)
+    dets = dets[keep]
+    return _dets_to_faces(dets, image.shape)
+
+
+def detect_faces_retinaface_single(image: np.ndarray, confidence_threshold: float = 0.4,
+                                   nms_thresh: float = 0.4) -> list:
+    """Single-pass RetinaFace detection (AMD ONNX + standard ONNX fallback)."""
+    session, model_kind = get_retinaface_face_detector()
+    if session is None:
+        return []
+
+    input_meta = session.get_inputs()[0]
+    input_name = input_meta.name
+    shape = input_meta.shape
+    if len(shape) != 4:
+        return []
+
+    if model_kind == "amd":
+        input_h = int(shape[1])
+        input_w = int(shape[2])
+    else:
+        input_h = int(shape[1]) if isinstance(shape[1], int) else 640
+        input_w = int(shape[2]) if isinstance(shape[2], int) else 640
+
+    img_h, img_w = image.shape[:2]
+    ratio = min(float(input_w) / float(max(1, img_w)), float(input_h) / float(max(1, img_h)))
+    new_w = max(1, int(round(img_w * ratio)))
+    new_h = max(1, int(round(img_h * ratio)))
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    pad_x = (input_w - new_w) // 2
+    pad_y = (input_h - new_h) // 2
+    canvas = np.zeros((input_h, input_w, 3), dtype=np.float32)
+    canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized.astype(np.float32)
+
+    if model_kind == "amd":
+        network_input = np.expand_dims(canvas, axis=0)
+        loc, conf, _ = session.run(None, {input_name: network_input})
+        loc = loc[0].astype(np.float32)
+        conf = conf[0].astype(np.float32)
+        if loc.shape[0] == 0 or conf.shape[0] != loc.shape[0]:
+            return []
+
+        min_sizes = [[16, 32], [64, 128], [256, 512]]
+        steps = [8, 16, 32]
+        priors = []
+        for k, step in enumerate(steps):
+            fh = int(np.ceil(float(input_h) / float(step)))
+            fw = int(np.ceil(float(input_w) / float(step)))
+            for i in range(fh):
+                for j in range(fw):
+                    for ms in min_sizes[k]:
+                        s_kx = ms / float(input_w)
+                        s_ky = ms / float(input_h)
+                        cx = (j + 0.5) * step / float(input_w)
+                        cy = (i + 0.5) * step / float(input_h)
+                        priors.append([cx, cy, s_kx, s_ky])
+        priors = np.array(priors, dtype=np.float32)
+        if priors.shape[0] != loc.shape[0]:
+            log_info(f"RetinaFace prior mismatch: priors={priors.shape[0]} loc={loc.shape[0]}")
+            return []
+
+        x = conf - np.max(conf, axis=1, keepdims=True)
+        e = np.exp(x)
+        probs = e / np.maximum(1e-8, np.sum(e, axis=1, keepdims=True))
+        scores = probs[:, 1]
+
+        variances = [0.1, 0.2]
+        boxes = np.concatenate(
+            [
+                priors[:, :2] + loc[:, :2] * variances[0] * priors[:, 2:],
+                priors[:, 2:] * np.exp(np.clip(loc[:, 2:] * variances[1], -8.0, 8.0)),
+            ],
+            axis=1,
+        )
+        boxes[:, :2] -= boxes[:, 2:] / 2.0
+        boxes[:, 2:] += boxes[:, :2]
+        boxes[:, 0::2] *= float(input_w)
+        boxes[:, 1::2] *= float(input_h)
+    else:
+        # Fallback decoder for the NHWC "standard conversion" checkpoint.
+        network_input = np.expand_dims(canvas, axis=0)
+        outs = session.run(None, {input_name: network_input})
+        cls_heads = {}
+        box_heads = {}
+        for out in outs:
+            arr = out[0] if out.ndim == 4 else out
+            if arr.ndim != 3:
+                continue
+            h, _, c = arr.shape
+            if h <= 0:
+                continue
+            stride = int(round(float(input_h) / float(h)))
+            if c == 4:
+                cls_heads[stride] = arr.astype(np.float32)
+            elif c == 8:
+                box_heads[stride] = arr.astype(np.float32)
+
+        min_sizes = {8: [16, 32], 16: [64, 128], 32: [256, 512]}
+        dets_accum = []
+        for stride in [8, 16, 32]:
+            if stride not in cls_heads or stride not in box_heads:
+                continue
+            cls = cls_heads[stride]
+            bbox = box_heads[stride]
+            fg_scores = np.stack([cls[:, :, 2], cls[:, :, 3]], axis=-1).reshape(-1)
+            deltas = bbox.reshape(-1, 4)
+            h, w = cls.shape[:2]
+            anchors = []
+            for iy in range(h):
+                for ix in range(w):
+                    cx = (ix + 0.5) * stride
+                    cy = (iy + 0.5) * stride
+                    for ms in min_sizes.get(stride, [stride * 2, stride * 4]):
+                        anchors.append([cx, cy, float(ms), float(ms)])
+            anchors = np.array(anchors, dtype=np.float32)
+            if anchors.shape[0] != deltas.shape[0]:
+                continue
+            dx, dy, dw, dh = deltas[:, 0], deltas[:, 1], deltas[:, 2], deltas[:, 3]
+            cx, cy, aw, ah = anchors[:, 0], anchors[:, 1], anchors[:, 2], anchors[:, 3]
+            pcx = dx * aw + cx
+            pcy = dy * ah + cy
+            pw = np.exp(np.clip(dw, -8.0, 8.0)) * aw
+            ph = np.exp(np.clip(dh, -8.0, 8.0)) * ah
+            x1 = pcx - pw / 2.0
+            y1 = pcy - ph / 2.0
+            x2 = pcx + pw / 2.0
+            y2 = pcy + ph / 2.0
+            det = np.stack([x1, y1, x2, y2, fg_scores], axis=1)
+            dets_accum.append(det)
+        if not dets_accum:
+            return []
+        det_all = np.vstack(dets_accum).astype(np.float32)
+        boxes = det_all[:, :4]
+        scores = det_all[:, 4]
+
+    # Map from detector input canvas back to original image coordinates.
+    boxes[:, 0::2] = (boxes[:, 0::2] - float(pad_x)) / float(max(1e-6, ratio))
+    boxes[:, 1::2] = (boxes[:, 1::2] - float(pad_y)) / float(max(1e-6, ratio))
+    dets = np.hstack([boxes, scores.reshape(-1, 1)]).astype(np.float32)
+    keep_thresh = max(0.05, float(confidence_threshold))
+    dets = dets[dets[:, 4] >= keep_thresh]
+    if dets.shape[0] == 0:
+        return []
+    keep = nms_xyxy(dets, nms_thresh)
+    dets = dets[keep]
+    return _dets_to_faces(dets, image.shape)
+
+
+def detect_faces_multipass(image: np.ndarray, detector_type: str = "ultralight",
+                           confidence_threshold: float = None, pass_scales: list = None) -> list:
+    """Run face detection with configurable detector + multi-pass scales."""
+    detector = resolve_runtime_detector(detector_type)
+    scales = pass_scales if pass_scales is not None else KONTEXT_MULTI_PASS_SCALES
+    if not scales:
+        scales = [1.0]
+
+    if confidence_threshold is None:
+        confidence_threshold = get_detector_default_threshold(detector)
+
+    img_h, img_w = image.shape[:2]
+    det_rows = []
+
+    for s in scales:
+        s = float(s)
+        if s <= 0:
+            continue
+        sw = max(64, int(round(img_w * s)))
+        sh = max(64, int(round(img_h * s)))
+        scaled = cv2.resize(image, (sw, sh), interpolation=cv2.INTER_LINEAR)
+        pass_threshold = float(confidence_threshold)
+        if s > 1.05:
+            pass_threshold = min(0.95, pass_threshold + 0.03)
+        elif s < 0.95:
+            pass_threshold = max(0.05, pass_threshold - 0.03)
+
+        try:
+            if detector == "scrfd":
+                faces = detect_faces_scrfd_single(scaled, confidence_threshold=pass_threshold)
+            elif detector == "retinaface":
+                faces = detect_faces_retinaface_single(scaled, confidence_threshold=pass_threshold)
+            else:
+                faces = detect_faces_ultra_light(scaled, confidence_threshold=pass_threshold)
+        except Exception as e:
+            log_info(f"[FACE DET] {detector} pass@{s:.2f} failed: {e}")
+            faces = []
+
+        for f in faces:
+            x, y, w, h = f["bbox"]
+            x1 = float(x) / s
+            y1 = float(y) / s
+            x2 = float(x + w) / s
+            y2 = float(y + h) / s
+            det_rows.append([x1, y1, x2, y2, float(f.get("confidence", 0.0))])
+
+    if not det_rows:
+        return []
+
+    dets = np.array(det_rows, dtype=np.float32)
+    keep = nms_xyxy(dets, iou_threshold=0.45)
+    merged = dets[keep]
+    return _dets_to_faces(merged, image.shape)
+
+def build_face_crop_region_from_bbox(face_bbox: tuple, image_shape: tuple,
+                                     expand_top: float = 0.6, expand_sides: float = 0.3,
+                                     expand_bottom: float = 0.2) -> tuple:
+    """Build expanded face crop region from a detector bbox."""
+    if face_bbox is None:
+        return None
+    try:
+        x, y, w, h = [int(v) for v in face_bbox]
+    except Exception:
+        return None
+
+    img_h, img_w = image_shape[:2]
+    if img_h <= 0 or img_w <= 0 or w <= 0 or h <= 0:
+        return None
+
+    crop_x = max(0, x - int(round(w * expand_sides)))
+    crop_y = max(0, y - int(round(h * expand_top)))
+    crop_x2 = min(img_w, x + w + int(round(w * expand_sides)))
+    crop_y2 = min(img_h, y + h + int(round(h * expand_bottom)))
+    crop_w = max(1, crop_x2 - crop_x)
+    crop_h = max(1, crop_y2 - crop_y)
+    return (crop_x, crop_y, crop_w, crop_h)
+
 def early_face_check(image: np.ndarray) -> dict:
     """
     Perform early face detection before BiSeNet processing.
@@ -273,25 +808,163 @@ def early_face_check(image: np.ndarray) -> dict:
     largest_face = faces[0]
     x, y, w, h = largest_face["bbox"]
     
-    # Expand the crop region to include hair (expand up by 60%, sides by 30%)
-    img_h, img_w = image.shape[:2]
-    expand_top = int(h * 0.6)
-    expand_sides = int(w * 0.3)
-    expand_bottom = int(h * 0.2)
-    
-    crop_x = max(0, x - expand_sides)
-    crop_y = max(0, y - expand_top)
-    crop_x2 = min(img_w, x + w + expand_sides)
-    crop_y2 = min(img_h, y + h + expand_bottom)
-    crop_w = crop_x2 - crop_x
-    crop_h = crop_y2 - crop_y
+    crop_region = build_face_crop_region_from_bbox((x, y, w, h), image.shape)
+    if crop_region is None:
+        crop_region = (x, y, w, h)
     
     return {
         "face_found": True,
         "faces": faces,
-        "crop_region": (crop_x, crop_y, crop_w, crop_h),
+        "crop_region": crop_region,
         "message": f"Face detected with {largest_face['confidence']*100:.1f}% confidence"
     }
+
+def resolve_dynamic_hair_neck_class_ids(seg_map: np.ndarray, face_bbox: tuple = None) -> tuple:
+    """
+    Resolve hair/neck class ids from the current model output.
+    Handles model variants where class ids differ from fixed constants.
+    """
+    h, w = seg_map.shape[:2]
+    total = float(max(1, h * w))
+
+    top_roi = np.zeros((h, w), dtype=np.uint8)
+    side_roi = np.zeros((h, w), dtype=np.uint8)
+    lower_roi = np.zeros((h, w), dtype=np.uint8)
+    center_lower_roi = np.zeros((h, w), dtype=np.uint8)
+    face_roi = np.zeros((h, w), dtype=np.uint8)
+
+    face_area = 0
+    if face_bbox is not None:
+        fx, fy, fw, fh = [int(v) for v in face_bbox]
+        fx2 = min(w - 1, fx + fw)
+        fy2 = min(h - 1, fy + fh)
+        face_roi[max(0, fy):fy2 + 1, max(0, fx):fx2 + 1] = 1
+        face_area = int(max(1, fw * fh))
+
+        tx1 = max(0, fx - int(0.7 * fw))
+        tx2 = min(w - 1, fx + int(1.7 * fw))
+        ty1 = max(0, fy - int(0.9 * fh))
+        ty2 = min(h - 1, fy + int(0.45 * fh))
+        top_roi[ty1:ty2 + 1, tx1:tx2 + 1] = 1
+
+        ly1 = max(0, fy + int(0.25 * fh))
+        ly2 = min(h - 1, fy + int(2.0 * fh))
+        lx1 = max(0, fx - int(1.15 * fw))
+        lx2 = min(w - 1, fx + int(0.12 * fw))
+        rx1 = max(0, fx + int(0.88 * fw))
+        rx2 = min(w - 1, fx + int(2.15 * fw))
+        side_roi[ly1:ly2 + 1, lx1:lx2 + 1] = 1
+        side_roi[ly1:ly2 + 1, rx1:rx2 + 1] = 1
+
+        lower_roi[max(0, fy + int(0.9 * fh)):, :] = 1
+        cx1 = max(0, fx + int(0.10 * fw))
+        cx2 = min(w - 1, fx + int(0.90 * fw))
+        cy1 = max(0, fy + int(0.85 * fh))
+        center_lower_roi[cy1:, cx1:cx2 + 1] = 1
+    else:
+        top_roi[:int(0.42 * h), :] = 1
+        lower_roi[int(0.60 * h):, :] = 1
+        center_lower_roi[int(0.55 * h):, int(0.30 * w):int(0.70 * w)] = 1
+        side_roi[int(0.15 * h):int(0.80 * h), :int(0.22 * w)] = 1
+        side_roi[int(0.15 * h):int(0.80 * h), int(0.78 * w):] = 1
+
+    candidates = [int(cid) for cid in np.unique(seg_map) if int(cid) != 0]
+
+    best_hair_id = None
+    best_hair_score = -1e9
+    min_hair_pixels = max(600, int(0.004 * h * w))
+    if face_area > 0:
+        min_hair_pixels = max(min_hair_pixels, int(0.05 * face_area))
+
+    for cid in candidates:
+        if cid == SKIN_CLASS_ID:
+            continue
+        mask = (seg_map == cid).astype(np.uint8)
+        area = int(np.sum(mask))
+        if area < min_hair_pixels:
+            continue
+        area_ratio = area / total
+        top_ratio = float(np.sum(mask & top_roi)) / float(max(1, area))
+        side_ratio = float(np.sum(mask & side_roi)) / float(max(1, area))
+        lower_ratio = float(np.sum(mask & lower_roi)) / float(max(1, area))
+        center_lower_ratio = float(np.sum(mask & center_lower_roi)) / float(max(1, area))
+        face_ratio = float(np.sum(mask & face_roi)) / float(max(1, area))
+
+        score = (
+            2.8 * top_ratio +
+            2.1 * side_ratio -
+            3.4 * center_lower_ratio -
+            2.2 * lower_ratio -
+            2.0 * face_ratio
+        )
+        if area_ratio < 0.01:
+            score -= 2.5
+        if area_ratio > 0.35:
+            score -= 2.0
+
+        if score > best_hair_score:
+            best_hair_score = score
+            best_hair_id = cid
+
+    best_neck_id = None
+    best_neck_score = -1e9
+    min_neck_pixels = max(200, int(0.001 * h * w))
+    if face_area > 0:
+        min_neck_pixels = max(min_neck_pixels, int(0.01 * face_area))
+
+    for cid in candidates:
+        if cid == SKIN_CLASS_ID:
+            continue
+        mask = (seg_map == cid).astype(np.uint8)
+        area = int(np.sum(mask))
+        if area < min_neck_pixels:
+            continue
+        top_ratio = float(np.sum(mask & top_roi)) / float(max(1, area))
+        side_ratio = float(np.sum(mask & side_roi)) / float(max(1, area))
+        lower_ratio = float(np.sum(mask & lower_roi)) / float(max(1, area))
+        center_lower_ratio = float(np.sum(mask & center_lower_roi)) / float(max(1, area))
+        face_ratio = float(np.sum(mask & face_roi)) / float(max(1, area))
+
+        score = (
+            3.8 * center_lower_ratio +
+            2.0 * lower_ratio -
+            2.4 * top_ratio -
+            1.6 * side_ratio -
+            1.2 * face_ratio
+        )
+        if score > best_neck_score:
+            best_neck_score = score
+            best_neck_id = cid
+
+    resolved_hair = best_hair_id if best_hair_id is not None else HAIR_CLASS_ID
+    resolved_neck = best_neck_id if best_neck_id is not None else NECK_ID
+    return resolved_hair, resolved_neck
+
+def get_dynamic_hair_neck_ids_for_image(image: np.ndarray, face_crop_region: tuple = None,
+                                        detector_type: str = "ultralight") -> tuple:
+    """
+    Resolve dynamic hair/neck ids for a full image by probing a 512-scale segmentation.
+    """
+    face_bbox = None
+    try:
+        faces = detect_faces_multipass(
+            image,
+            detector_type=detector_type,
+            confidence_threshold=None,
+            pass_scales=[1.0]
+        )
+        if faces:
+            face_bbox = faces[0]["bbox"]
+    except Exception:
+        face_bbox = None
+
+    if face_bbox is None and face_crop_region is not None:
+        cx, cy, cw, ch = [int(v) for v in face_crop_region]
+        face_bbox = (cx, cy, cw, ch)
+
+    session = get_session()
+    probe_seg = segment_at_scale(image, 512, session)
+    return resolve_dynamic_hair_neck_class_ids(probe_seg, face_bbox)
 
 def validate_hair_mask(hair_mask: np.ndarray, facial_mask: np.ndarray, image_shape: tuple) -> dict:
     """
@@ -847,6 +1520,32 @@ def get_segformer_session():
         )
     return _segformer_session
 
+
+def get_modnet_session():
+    """Load MODNet ONNX model with optimized settings."""
+    global _modnet_session
+    if _modnet_session is not None:
+        return _modnet_session
+
+    if not MODNET_MODEL_PATH.exists():
+        return None
+
+    try:
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        opts.intra_op_num_threads = 4
+        opts.inter_op_num_threads = 1
+        _modnet_session = ort.InferenceSession(
+            str(MODNET_MODEL_PATH),
+            sess_options=opts,
+            providers=['CPUExecutionProvider']
+        )
+        log_debug(f"[MATTING] Loaded MODNet model: {MODNET_MODEL_PATH}")
+        return _modnet_session
+    except Exception as e:
+        log_info(f"[MATTING] Failed to load MODNet model ({MODNET_MODEL_PATH}): {e}")
+        return None
+
 def download_image(url: str) -> np.ndarray:
     """Download image from URL or decode base64."""
     if url.startswith("data:"):
@@ -934,6 +1633,313 @@ def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int = 8, eps: floa
     return result
 
 
+def composite_with_feather(
+    image: np.ndarray,
+    keep_mask: np.ndarray,
+    exclusion_mask: np.ndarray = None,
+    feather_px: int = 6,
+    guided_radius: int = 8,
+    guided_eps: float = 0.01
+) -> np.ndarray:
+    """
+    Composite image over gray background with edge feathering.
+    Uses signed-distance feathering, then guided-filter refinement on boundary band.
+    """
+    keep_bin = (keep_mask > 0).astype(np.uint8)
+    if exclusion_mask is not None:
+        keep_bin[exclusion_mask > 0] = 0
+
+    # Fast hard-edge path when feathering disabled.
+    if feather_px <= 0:
+        out = np.full_like(image, GRAY_BG, dtype=np.uint8)
+        out[keep_bin > 0] = image[keep_bin > 0]
+        return out
+
+    inside_dist = cv2.distanceTransform(keep_bin, cv2.DIST_L2, 5)
+    outside_dist = cv2.distanceTransform((1 - keep_bin).astype(np.uint8), cv2.DIST_L2, 5)
+    signed_dist = inside_dist - outside_dist
+
+    feather = float(max(1, int(feather_px)))
+    alpha = np.clip((signed_dist + feather) / (2.0 * feather), 0.0, 1.0)
+    alpha[inside_dist >= feather] = 1.0
+    alpha[outside_dist >= feather] = 0.0
+
+    band = ((inside_dist < feather * 1.5) & (outside_dist < feather * 1.5)).astype(np.uint8)
+    if guided_radius > 0 and np.any(band):
+        alpha_255 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+        guided_alpha = guided_filter(image, alpha_255, radius=guided_radius, eps=guided_eps).astype(np.float32) / 255.0
+        alpha = np.where(band > 0, guided_alpha, alpha)
+
+    if exclusion_mask is not None:
+        alpha[exclusion_mask > 0] = 0.0
+
+    alpha3 = np.repeat(alpha[:, :, None], 3, axis=2)
+    image_f = image.astype(np.float32)
+    bg_f = np.full_like(image_f, GRAY_BG, dtype=np.float32)
+    comp = image_f * alpha3 + bg_f * (1.0 - alpha3)
+    return np.clip(comp, 0, 255).astype(np.uint8)
+
+
+def build_trimap_from_mask(
+    mask: np.ndarray,
+    exclusion_mask: np.ndarray = None,
+    fg_erode_px: int = 3,
+    unknown_dilate_px: int = 9,
+    min_area_ratio: float = 0.0002
+) -> tuple:
+    """
+    Build a 3-class trimap from a hard mask.
+
+    Trimap convention:
+      - 255: definite foreground
+      - 128: unknown boundary band
+      - 0:   definite background
+    """
+    keep = (mask > 0).astype(np.uint8) * 255
+    keep = cleanup_mask(keep, min_area_ratio=min_area_ratio)
+
+    if exclusion_mask is not None:
+        keep = keep.copy()
+        keep[exclusion_mask > 0] = 0
+
+    keep_bin = (keep > 0).astype(np.uint8)
+
+    if fg_erode_px > 0:
+        fg_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (fg_erode_px * 2 + 1, fg_erode_px * 2 + 1)
+        )
+        definite_fg = cv2.erode(keep_bin, fg_kernel, iterations=1)
+    else:
+        definite_fg = keep_bin.copy()
+
+    if unknown_dilate_px > 0:
+        unk_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (unknown_dilate_px * 2 + 1, unknown_dilate_px * 2 + 1)
+        )
+        unknown_extent = cv2.dilate(keep_bin, unk_kernel, iterations=1)
+    else:
+        unknown_extent = keep_bin.copy()
+
+    if exclusion_mask is not None:
+        definite_fg[exclusion_mask > 0] = 0
+        unknown_extent[exclusion_mask > 0] = 0
+
+    trimap = np.zeros_like(keep_bin, dtype=np.uint8)
+    trimap[unknown_extent > 0] = 128
+    trimap[definite_fg > 0] = 255
+
+    unknown_band = ((trimap == 128)).astype(np.uint8)
+    log_debug(
+        f"[TRIMAP] fg={np.sum(definite_fg)} "
+        f"unknown={np.sum(unknown_band)} bg={np.sum(trimap == 0)} "
+        f"(erode={fg_erode_px}px, dilate={unknown_dilate_px}px)"
+    )
+    return trimap, definite_fg, unknown_band
+
+
+def estimate_alpha_from_trimap(
+    image: np.ndarray,
+    trimap: np.ndarray,
+    guided_radius: int = 8,
+    guided_eps: float = 0.008
+) -> np.ndarray:
+    """
+    Estimate an alpha matte from trimap seeds.
+    Refines only unknown pixels while keeping FG/BG seeds fixed.
+    """
+    fg = trimap == 255
+    bg = trimap == 0
+    unknown = trimap == 128
+
+    alpha = np.zeros(trimap.shape, dtype=np.float32)
+    alpha[fg] = 1.0
+
+    if np.any(unknown):
+        # Distance ratio gives a smooth initialization inside unknown band.
+        dist_to_fg = cv2.distanceTransform((~fg).astype(np.uint8), cv2.DIST_L2, 5)
+        dist_to_bg = cv2.distanceTransform((~bg).astype(np.uint8), cv2.DIST_L2, 5)
+        denom = dist_to_fg + dist_to_bg + 1e-6
+        init_unknown = np.clip(dist_to_bg / denom, 0.0, 1.0)
+        alpha[unknown] = init_unknown[unknown]
+
+        alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+        refined = guided_filter(
+            image,
+            alpha_u8,
+            radius=max(1, int(guided_radius)),
+            eps=float(guided_eps)
+        ).astype(np.float32) / 255.0
+        alpha[unknown] = refined[unknown]
+
+    alpha[fg] = 1.0
+    alpha[bg] = 0.0
+    return np.clip(alpha, 0.0, 1.0)
+
+
+def _decode_modnet_matte(raw_output) -> np.ndarray:
+    """Decode MODNet output to a 2D float matte in [0,1]."""
+    arr = np.asarray(raw_output)
+    if arr.ndim == 4:
+        if arr.shape[1] == 1:
+            matte = arr[0, 0]
+        elif arr.shape[-1] == 1:
+            matte = arr[0, :, :, 0]
+        else:
+            matte = arr[0, 0]
+    elif arr.ndim == 3:
+        matte = arr[0]
+    elif arr.ndim == 2:
+        matte = arr
+    else:
+        return None
+
+    matte = matte.astype(np.float32)
+    if np.max(matte) > 1.2 or np.min(matte) < -0.2:
+        matte = 1.0 / (1.0 + np.exp(-np.clip(matte, -18.0, 18.0)))
+    else:
+        matte = np.clip(matte, 0.0, 1.0)
+    return matte
+
+
+def estimate_alpha_with_modnet(
+    image: np.ndarray,
+    trimap: np.ndarray = None,
+    keep_mask: np.ndarray = None,
+    exclusion_mask: np.ndarray = None,
+    target_size: int = None
+) -> np.ndarray:
+    """
+    Estimate alpha matte using MODNet ONNX.
+    Falls back to None if MODNet is unavailable/inference fails.
+    """
+    session = get_modnet_session()
+    if session is None:
+        return None
+
+    img_h, img_w = image.shape[:2]
+    input_meta = session.get_inputs()[0]
+    input_name = input_meta.name
+    shape = input_meta.shape
+
+    # Determine inference size; prefer model-declared static size.
+    in_h, in_w = None, None
+    if len(shape) == 4:
+        if isinstance(shape[2], int) and shape[2] > 0:
+            in_h = int(shape[2])
+        if isinstance(shape[3], int) and shape[3] > 0:
+            in_w = int(shape[3])
+
+    if in_h is None or in_w is None:
+        target = max(256, int(target_size if target_size is not None else MODNET_INPUT_SIZE))
+        scale = target / float(max(1, max(img_h, img_w)))
+        in_w = max(32, int(round((img_w * scale) / 32.0) * 32))
+        in_h = max(32, int(round((img_h * scale) / 32.0) * 32))
+
+    resized = cv2.resize(image, (in_w, in_h), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    normalized = (rgb - 0.5) / 0.5
+    network_input = np.expand_dims(np.transpose(normalized, (2, 0, 1)), axis=0).astype(np.float32)
+
+    try:
+        outs = session.run(None, {input_name: network_input})
+    except Exception as e:
+        log_info(f"[MATTING] MODNet inference failed: {e}")
+        return None
+
+    if not outs:
+        return None
+
+    matte = _decode_modnet_matte(outs[0])
+    if matte is None:
+        return None
+
+    alpha = cv2.resize(matte, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
+    alpha = np.clip(alpha, 0.0, 1.0)
+
+    # Constrain MODNet output with segmentation-derived priors for robustness.
+    if trimap is not None:
+        alpha[trimap == 255] = 1.0
+        alpha[trimap == 0] = 0.0
+
+    if keep_mask is not None:
+        allowed = (keep_mask > 0)
+        if trimap is not None:
+            allowed = allowed | (trimap == 128)
+        alpha[~allowed] = 0.0
+
+    if exclusion_mask is not None:
+        alpha[exclusion_mask > 0] = 0.0
+
+    # Snap unknown band edges to image gradients while keeping seeds fixed.
+    if trimap is not None and np.any(trimap == 128):
+        alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+        refined = guided_filter(
+            image,
+            alpha_u8,
+            radius=max(6, int(round(min(img_h, img_w) * 0.02))),
+            eps=0.006
+        ).astype(np.float32) / 255.0
+        unknown = trimap == 128
+        alpha[unknown] = refined[unknown]
+        alpha[trimap == 255] = 1.0
+        alpha[trimap == 0] = 0.0
+
+    return np.clip(alpha, 0.0, 1.0)
+
+
+def decontaminate_edge_colors(
+    image: np.ndarray,
+    alpha: np.ndarray,
+    unknown_band: np.ndarray = None,
+    strength: float = 0.65
+) -> np.ndarray:
+    """
+    Reduce background color spill on semi-transparent hair edges.
+    Pulls edge colors toward nearby high-alpha foreground estimates.
+    """
+    s = float(np.clip(strength, 0.0, 1.0))
+    if s <= 0.0:
+        return image
+
+    alpha_f = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+    if unknown_band is not None:
+        edge = (unknown_band > 0) & (alpha_f > 0.01) & (alpha_f < 0.99)
+    else:
+        edge = (alpha_f > 0.01) & (alpha_f < 0.99)
+    if not np.any(edge):
+        return image
+
+    img_f = image.astype(np.float32)
+    w = np.clip(alpha_f, 0.0, 1.0) ** 2
+    w3 = w[:, :, None]
+
+    sigma = max(1.2, float(min(image.shape[:2])) * 0.012)
+    num = cv2.GaussianBlur(img_f * w3, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    den = cv2.GaussianBlur(w, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    fg_est = num / np.maximum(den[:, :, None], 1e-4)
+
+    t = np.clip(s * (1.0 - alpha_f), 0.0, 1.0)
+    out = img_f.copy()
+    out[edge] = img_f[edge] * (1.0 - t[edge, None]) + fg_est[edge] * t[edge, None]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def composite_with_alpha(
+    image: np.ndarray,
+    alpha: np.ndarray,
+    background: tuple = GRAY_BG
+) -> np.ndarray:
+    """Composite original image over a solid background using alpha matte."""
+    alpha_f = np.clip(alpha, 0.0, 1.0).astype(np.float32)
+    alpha3 = np.repeat(alpha_f[:, :, None], 3, axis=2)
+    img_f = image.astype(np.float32)
+    bg_f = np.full_like(img_f, background, dtype=np.float32)
+    comp = img_f * alpha3 + bg_f * (1.0 - alpha3)
+    return np.clip(comp, 0, 255).astype(np.uint8)
+
+
 def segment_at_scale(image: np.ndarray, scale: int, session) -> np.ndarray:
     """
     Run BiSeNet inference at a specific conceptual scale.
@@ -997,6 +2003,402 @@ def segment_at_scale(image: np.ndarray, scale: int, session) -> np.ndarray:
     return seg_map_full
 
 
+def softmax_channelwise(logits: np.ndarray) -> np.ndarray:
+    """Softmax over class/channel axis for logits shaped [C,H,W]."""
+    x = logits - np.max(logits, axis=0, keepdims=True)
+    e = np.exp(x)
+    return e / np.maximum(1e-8, np.sum(e, axis=0, keepdims=True))
+
+
+def segment_logits_at_scale_standard(image: np.ndarray, scale: int, session) -> tuple:
+    """
+    Standard BiSeNet preprocessing (legacy square path), returning logits at original resolution.
+    Returns: (seg_map_full, logits_full[C,H,W])
+    """
+    original_h, original_w = image.shape[:2]
+    if scale != 512:
+        scaled = cv2.resize(image, (scale, scale), interpolation=cv2.INTER_LINEAR)
+        resized = cv2.resize(scaled, (512, 512), interpolation=cv2.INTER_LINEAR)
+    else:
+        resized = cv2.resize(image, (512, 512), interpolation=cv2.INTER_LINEAR)
+
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    normalized = rgb.astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    normalized = (normalized - mean) / std
+    batched = np.expand_dims(np.transpose(normalized, (2, 0, 1)), axis=0)
+
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: batched})
+    logits_512 = outputs[0][0].astype(np.float32)  # [C,512,512]
+    channels = logits_512.shape[0]
+    logits_full = np.zeros((channels, original_h, original_w), dtype=np.float32)
+    for c in range(channels):
+        logits_full[c] = cv2.resize(logits_512[c], (original_w, original_h), interpolation=cv2.INTER_LINEAR)
+    seg_map_full = np.argmax(logits_full, axis=0).astype(np.uint8)
+    return seg_map_full, logits_full
+
+
+def segment_logits_at_scale_aspect(image: np.ndarray, scale: int, session) -> tuple:
+    """
+    Run BiSeNet inference using aspect-ratio preserving preprocessing.
+    Returns: (seg_map_full, logits_full[C,H,W])
+    """
+    original_h, original_w = image.shape[:2]
+    if original_h <= 0 or original_w <= 0:
+        raise ValueError("Invalid image size")
+
+    target_long = int(max(256, scale))
+    long_side = float(max(original_h, original_w))
+    resize_ratio = target_long / long_side
+    scaled_w = max(1, int(round(original_w * resize_ratio)))
+    scaled_h = max(1, int(round(original_h * resize_ratio)))
+    scaled = cv2.resize(image, (scaled_w, scaled_h), interpolation=cv2.INTER_LINEAR)
+
+    model_size = 512
+    fit_ratio = min(float(model_size) / float(scaled_w), float(model_size) / float(scaled_h))
+    fit_w = max(1, int(round(scaled_w * fit_ratio)))
+    fit_h = max(1, int(round(scaled_h * fit_ratio)))
+    fit_img = cv2.resize(scaled, (fit_w, fit_h), interpolation=cv2.INTER_LINEAR)
+
+    pad_x = (model_size - fit_w) // 2
+    pad_y = (model_size - fit_h) // 2
+    pad_left = pad_x
+    pad_right = model_size - fit_w - pad_x
+    pad_top = pad_y
+    pad_bottom = model_size - fit_h - pad_y
+    # Reflect padding avoids introducing large flat-black regions that bias parsing.
+    canvas = cv2.copyMakeBorder(
+        fit_img,
+        pad_top, pad_bottom, pad_left, pad_right,
+        borderType=cv2.BORDER_REFLECT_101
+    )
+
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+    normalized = rgb.astype(np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    normalized = (normalized - mean) / std
+    batched = np.expand_dims(np.transpose(normalized, (2, 0, 1)), axis=0)
+
+    input_name = session.get_inputs()[0].name
+    outputs = session.run(None, {input_name: batched})
+    logits_512 = outputs[0][0].astype(np.float32)  # [C,512,512]
+
+    logits_crop = logits_512[:, pad_y:pad_y + fit_h, pad_x:pad_x + fit_w]
+    channels = logits_crop.shape[0]
+    logits_full = np.zeros((channels, original_h, original_w), dtype=np.float32)
+    for c in range(channels):
+        logits_full[c] = cv2.resize(
+            logits_crop[c], (original_w, original_h), interpolation=cv2.INTER_LINEAR
+        )
+
+    seg_map_full = np.argmax(logits_full, axis=0).astype(np.uint8)
+    return seg_map_full, logits_full
+
+
+def build_spatial_rois(h: int, w: int, face_bbox: tuple = None) -> tuple:
+    top_roi = np.zeros((h, w), dtype=np.uint8)
+    side_roi = np.zeros((h, w), dtype=np.uint8)
+    lower_roi = np.zeros((h, w), dtype=np.uint8)
+    center_lower_roi = np.zeros((h, w), dtype=np.uint8)
+    face_roi = np.zeros((h, w), dtype=np.uint8)
+
+    if face_bbox is not None:
+        fx, fy, fw, fh = [int(v) for v in face_bbox]
+        fx2 = min(w - 1, fx + fw)
+        fy2 = min(h - 1, fy + fh)
+        face_roi[max(0, fy):fy2 + 1, max(0, fx):fx2 + 1] = 1
+
+        tx1 = max(0, fx - int(0.7 * fw))
+        tx2 = min(w - 1, fx + int(1.7 * fw))
+        ty1 = max(0, fy - int(0.9 * fh))
+        ty2 = min(h - 1, fy + int(0.45 * fh))
+        top_roi[ty1:ty2 + 1, tx1:tx2 + 1] = 1
+
+        ly1 = max(0, fy + int(0.25 * fh))
+        ly2 = min(h - 1, fy + int(2.0 * fh))
+        lx1 = max(0, fx - int(1.15 * fw))
+        lx2 = min(w - 1, fx + int(0.12 * fw))
+        rx1 = max(0, fx + int(0.88 * fw))
+        rx2 = min(w - 1, fx + int(2.15 * fw))
+        side_roi[ly1:ly2 + 1, lx1:lx2 + 1] = 1
+        side_roi[ly1:ly2 + 1, rx1:rx2 + 1] = 1
+
+        lower_roi[max(0, fy + int(0.9 * fh)):, :] = 1
+        cx1 = max(0, fx + int(0.10 * fw))
+        cx2 = min(w - 1, fx + int(0.90 * fw))
+        cy1 = max(0, fy + int(0.85 * fh))
+        center_lower_roi[cy1:, cx1:cx2 + 1] = 1
+    else:
+        top_roi[:int(0.42 * h), :] = 1
+        lower_roi[int(0.60 * h):, :] = 1
+        center_lower_roi[int(0.55 * h):, int(0.30 * w):int(0.70 * w)] = 1
+        side_roi[int(0.15 * h):int(0.80 * h), :int(0.22 * w)] = 1
+        side_roi[int(0.15 * h):int(0.80 * h), int(0.78 * w):] = 1
+    return top_roi, side_roi, lower_roi, center_lower_roi, face_roi
+
+
+def resolve_dynamic_hair_neck_class_ids_scored(avg_probs: np.ndarray, face_bbox: tuple = None) -> tuple:
+    """
+    Model-score based class ID selection using averaged probability maps.
+    avg_probs shape: [C,H,W]
+    """
+    c, h, w = avg_probs.shape
+    top_roi, side_roi, lower_roi, center_lower_roi, face_roi = build_spatial_rois(h, w, face_bbox)
+    head_roi = np.zeros((h, w), dtype=np.uint8)
+    face_area = max(1, int(0.06 * h * w))
+    face_bottom_ratio = 0.58
+    if face_bbox is not None:
+        fx, fy, fw, fh = [int(v) for v in face_bbox]
+        face_area = max(1, int(fw * fh))
+        face_bottom_ratio = float(min(h - 1, fy + fh)) / float(max(1, h))
+        hx1 = max(0, fx - int(0.85 * fw))
+        hx2 = min(w - 1, fx + int(1.85 * fw))
+        hy1 = max(0, fy - int(1.05 * fh))
+        hy2 = min(h - 1, fy + int(1.05 * fh))
+        head_roi[hy1:hy2 + 1, hx1:hx2 + 1] = 1
+    else:
+        head_roi[:int(0.60 * h), :] = 1
+
+    face_ring_roi = np.zeros((h, w), dtype=np.uint8)
+    if np.any(face_roi):
+        ring_k = max(15, (int(round(min(h, w) * 0.10)) | 1))
+        ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ring_k, ring_k))
+        face_ring_roi = cv2.dilate(face_roi, ring_kernel, iterations=1)
+        face_ring_roi[face_roi > 0] = 0
+
+    argmax_map = np.argmax(avg_probs, axis=0).astype(np.uint8)
+    all_candidates = [int(cid) for cid in np.unique(argmax_map) if int(cid) != 0]
+    fallback_hair, fallback_neck = resolve_dynamic_hair_neck_class_ids(argmax_map, face_bbox)
+    candidates = []
+    for cid in [fallback_hair, HAIR_CLASS_ID, 13, 17, 18]:
+        if 0 <= int(cid) < int(c) and int(cid) != SKIN_CLASS_ID and int(cid) not in candidates:
+            candidates.append(int(cid))
+    for cid in all_candidates:
+        if cid in candidates or cid == SKIN_CLASS_ID:
+            continue
+        candidates.append(cid)
+
+    total = float(max(1, h * w))
+    min_hair_px = max(1200, int(0.010 * h * w), int(0.08 * face_area))
+    max_hair_px = int(0.68 * h * w)
+
+    best_hair = (None, -1e9)
+    for cid in candidates:
+        area_est = int(np.sum(argmax_map == cid))
+        if area_est < min_hair_px or area_est > max_hair_px:
+            continue
+        p = avg_probs[cid]
+        p_sum = float(np.sum(p)) + 1e-6
+        top_score = float(np.sum(p[top_roi > 0])) / p_sum if np.any(top_roi) else 0.0
+        side_score = float(np.sum(p[side_roi > 0])) / p_sum if np.any(side_roi) else 0.0
+        lower_score = float(np.sum(p[lower_roi > 0])) / p_sum if np.any(lower_roi) else 0.0
+        center_lower_score = float(np.sum(p[center_lower_roi > 0])) / p_sum if np.any(center_lower_roi) else 0.0
+        face_score = float(np.sum(p[face_roi > 0])) / p_sum if np.any(face_roi) else 0.0
+        head_score = float(np.sum(p[head_roi > 0])) / p_sum if np.any(head_roi) else 0.0
+        ring_score = float(np.sum(p[face_ring_roi > 0])) / p_sum if np.any(face_ring_roi) else 0.0
+        hi = float(np.percentile(p, 99.5))
+        ys = np.where(argmax_map == cid)[0]
+        centroid_y_ratio = float(np.mean(ys)) / float(max(1, h)) if ys.size > 0 else 1.0
+
+        if head_score < 0.20:
+            continue
+        if lower_score > 0.82 or center_lower_score > 0.45:
+            continue
+        if face_bbox is not None and centroid_y_ratio > min(0.92, face_bottom_ratio + 0.26):
+            continue
+        if face_bbox is not None and center_lower_score > 0.24 and centroid_y_ratio > face_bottom_ratio + 0.16:
+            continue
+
+        hair_score = (
+            3.4 * head_score +
+            2.5 * top_score +
+            2.2 * ring_score +
+            1.6 * side_score +
+            0.6 * hi +
+            0.25 * np.log1p(float(area_est)) -
+            3.2 * lower_score -
+            4.2 * center_lower_score -
+            1.9 * face_score
+        )
+        if area_est < int(0.015 * h * w):
+            hair_score -= 1.5
+        if cid == fallback_hair:
+            hair_score += 0.35
+        if hair_score > best_hair[1]:
+            best_hair = (cid, hair_score)
+
+    if best_hair[0] is not None:
+        hair_id = best_hair[0]
+    else:
+        hair_id = None
+        for cid in [13, HAIR_CLASS_ID, fallback_hair]:
+            if int(cid) < 0 or int(cid) >= int(c):
+                continue
+            if int(cid) == SKIN_CLASS_ID:
+                continue
+            area_est = int(np.sum(argmax_map == int(cid)))
+            if area_est >= max(800, int(0.002 * h * w)):
+                hair_id = int(cid)
+                break
+        if hair_id is None:
+            hair_id = fallback_hair
+
+    neck_candidates = []
+    for cid in [fallback_neck, NECK_ID, 17, 18]:
+        if 0 <= int(cid) < int(c) and int(cid) not in neck_candidates and int(cid) != SKIN_CLASS_ID:
+            neck_candidates.append(int(cid))
+    for cid in all_candidates:
+        if cid in neck_candidates or cid == SKIN_CLASS_ID:
+            continue
+        if cid in {LEFT_EYE_ID, RIGHT_EYE_ID, LEFT_EYEBROW_ID, RIGHT_EYEBROW_ID, NOSE_ID, MOUTH_ID, UPPER_LIP_ID, LOWER_LIP_ID}:
+            continue
+        neck_candidates.append(cid)
+
+    best_neck = (None, -1e9)
+    min_neck_px = max(300, int(0.004 * h * w), int(0.02 * face_area))
+    for cid in neck_candidates:
+        area_est = int(np.sum(argmax_map == cid))
+        if area_est < min_neck_px:
+            continue
+        p = avg_probs[cid]
+        p_sum = float(np.sum(p)) + 1e-6
+        top_score = float(np.sum(p[top_roi > 0])) / p_sum if np.any(top_roi) else 0.0
+        side_score = float(np.sum(p[side_roi > 0])) / p_sum if np.any(side_roi) else 0.0
+        lower_score = float(np.sum(p[lower_roi > 0])) / p_sum if np.any(lower_roi) else 0.0
+        center_lower_score = float(np.sum(p[center_lower_roi > 0])) / p_sum if np.any(center_lower_roi) else 0.0
+        face_score = float(np.sum(p[face_roi > 0])) / p_sum if np.any(face_roi) else 0.0
+
+        neck_score = (
+            3.8 * center_lower_score +
+            2.2 * lower_score -
+            2.0 * top_score -
+            1.4 * side_score -
+            1.2 * face_score
+        )
+        if cid == fallback_neck:
+            neck_score += 0.2
+        if neck_score > best_neck[1]:
+            best_neck = (cid, neck_score)
+
+    neck_id = best_neck[0] if best_neck[0] is not None else fallback_neck
+    if neck_id == hair_id:
+        neck_id = fallback_neck if fallback_neck != hair_id else NECK_ID
+    return hair_id, neck_id
+
+
+def compute_face_focus_crop(image_shape: tuple, face_bbox: tuple = None) -> tuple:
+    """Build a face-centered crop for context-aware segmentation."""
+    h, w = image_shape[:2]
+    if face_bbox is None:
+        return (0, 0, w, h), None
+
+    fx, fy, fw, fh = [int(v) for v in face_bbox]
+    x1 = max(0, fx - int(0.65 * fw))
+    x2 = min(w, fx + fw + int(0.65 * fw))
+    y1 = max(0, fy - int(0.95 * fh))
+    y2 = min(h, fy + fh + int(0.95 * fh))
+
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    min_w = max(220, int(1.8 * fw))
+    min_h = max(280, int(2.0 * fh))
+    if crop_w < min_w:
+        pad = (min_w - crop_w) // 2 + 1
+        x1 = max(0, x1 - pad)
+        x2 = min(w, x2 + pad)
+    if crop_h < min_h:
+        pad = (min_h - crop_h) // 2 + 1
+        y1 = max(0, y1 - pad)
+        y2 = min(h, y2 + pad)
+
+    crop_w = max(1, x2 - x1)
+    crop_h = max(1, y2 - y1)
+    local_face = (
+        max(0, fx - x1),
+        max(0, fy - y1),
+        min(crop_w - 1, fw),
+        min(crop_h - 1, fh)
+    )
+    return (x1, y1, crop_w, crop_h), local_face
+
+
+def multi_scale_segment_hair_aspect_scored(
+    image: np.ndarray,
+    scales: list = [512, 768, 1024],
+    face_bbox: tuple = None
+) -> tuple:
+    """
+    Aspect-ratio-preserving multi-scale segmentation with model-score class selection.
+    Returns: (hair_mask, facial_mask, hair_class_id, neck_class_id)
+    """
+    session = get_session()
+    full_h, full_w = image.shape[:2]
+    crop_region, local_face_bbox = compute_face_focus_crop(image.shape, face_bbox)
+    crop_x, crop_y, crop_w, crop_h = crop_region
+    crop_img = image[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w]
+
+    probs_list = []
+    seg_maps = []
+    for scale in scales:
+        seg_map, logits = segment_logits_at_scale_aspect(crop_img, scale, session)
+        probs = softmax_channelwise(logits)
+        seg_maps.append(seg_map)
+        probs_list.append(probs)
+
+    avg_probs = np.mean(np.stack(probs_list, axis=0), axis=0)
+    hair_class_id, neck_class_id = resolve_dynamic_hair_neck_class_ids_scored(avg_probs, local_face_bbox)
+    argmax_avg = np.argmax(avg_probs, axis=0).astype(np.uint8)
+
+    hair_prob = avg_probs[hair_class_id]
+    hair_seed = hair_prob[argmax_avg == hair_class_id]
+    if hair_seed.size > 0:
+        thr = max(0.16, float(np.percentile(hair_seed, 32.0)))
+    else:
+        thr = 0.30
+    hair_mask = ((argmax_avg == hair_class_id) | (hair_prob >= max(0.35, thr))).astype(np.uint8)
+
+    if local_face_bbox is not None:
+        fx, fy, fw, fh = [int(v) for v in local_face_bbox]
+        gx1 = max(0, fx - int(0.45 * fw))
+        gx2 = min(crop_w, fx + fw + int(0.45 * fw))
+        gy1 = max(0, fy - int(0.95 * fh))
+        gy2 = min(crop_h, fy + fh + int(1.35 * fh))
+        allowed = np.zeros((crop_h, crop_w), dtype=np.uint8)
+        allowed[gy1:gy2, gx1:gx2] = 1
+        hair_mask = hair_mask & allowed.astype(np.uint8)
+
+    min_hair_px = max(1200, int(0.006 * crop_h * crop_w))
+    if int(np.sum(hair_mask)) < min_hair_px:
+        hair_mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
+        for seg in seg_maps:
+            hair_mask = hair_mask | (seg == hair_class_id).astype(np.uint8)
+
+    # Face exclusion mask: use detector bbox geometry as primary, with skin class as secondary.
+    facial_mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
+    if local_face_bbox is not None:
+        fx, fy, fw, fh = [int(v) for v in local_face_bbox]
+        fx1 = max(0, fx - int(0.10 * fw))
+        fx2 = min(crop_w, fx + fw + int(0.10 * fw))
+        fy1 = max(0, fy - int(0.06 * fh))
+        fy2 = min(crop_h, fy + fh + int(0.22 * fh))
+        facial_mask[fy1:fy2, fx1:fx2] = 1
+    facial_mask = facial_mask | (argmax_avg == SKIN_CLASS_ID).astype(np.uint8)
+    hair_mask[facial_mask > 0] = 0
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    hair_mask = cv2.morphologyEx(hair_mask, cv2.MORPH_OPEN, kernel)
+    hair_mask = cv2.morphologyEx(hair_mask, cv2.MORPH_CLOSE, kernel)
+
+    full_hair_mask = np.zeros((full_h, full_w), dtype=np.uint8)
+    full_facial_mask = np.zeros((full_h, full_w), dtype=np.uint8)
+    full_hair_mask[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w] = hair_mask
+    full_facial_mask[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w] = facial_mask
+    return full_hair_mask.astype(np.uint8), full_facial_mask.astype(np.uint8), hair_class_id, neck_class_id
+
+
 def segment_at_scale_segformer(image: np.ndarray, scale: int, session) -> np.ndarray:
     """
     Run SegFormer inference at a specific conceptual scale.
@@ -1051,7 +2453,9 @@ def segment_at_scale_segformer(image: np.ndarray, scale: int, session) -> np.nda
     return seg_map_full
 
 
-def multi_scale_segment_hair_segformer(image: np.ndarray, scales: list = [512, 768, 1024]) -> tuple:
+def multi_scale_segment_hair_segformer(image: np.ndarray, scales: list = [512, 768, 1024],
+                                       hair_class_id = None,
+                                       neck_class_id = None) -> tuple:
     """
     Run multi-scale hair segmentation using SegFormer for improved accuracy.
     Same approach as BiSeNet but using SegFormer model.
@@ -1066,6 +2470,13 @@ def multi_scale_segment_hair_segformer(image: np.ndarray, scales: list = [512, 7
     session = get_segformer_session()
     original_h, original_w = image.shape[:2]
     
+    if hair_class_id is None or neck_class_id is None:
+        resolved_hair, resolved_neck = get_dynamic_hair_neck_ids_for_image(image)
+        if hair_class_id is None:
+            hair_class_id = resolved_hair
+        if neck_class_id is None:
+            neck_class_id = resolved_neck
+
     # Initialize vote counters
     hair_votes = np.zeros((original_h, original_w), dtype=np.float32)
     facial_votes = np.zeros((original_h, original_w), dtype=np.float32)
@@ -1075,13 +2486,12 @@ def multi_scale_segment_hair_segformer(image: np.ndarray, scales: list = [512, 7
         seg_map = segment_at_scale_segformer(image, scale, session)
         
         # Accumulate hair votes
-        hair_votes += (seg_map == HAIR_CLASS_ID).astype(np.float32)
+        hair_votes += (seg_map == hair_class_id).astype(np.float32)
         
-        # Accumulate facial feature votes (eyes, eyebrows, nose, mouth, lips, neck)
-        # Neck is included to prevent neck leakage into hair-only masks on some Kontext outputs.
+        # Accumulate facial feature votes (eyes, eyebrows, nose, mouth, lips)
         facial_mask = np.zeros_like(seg_map, dtype=np.float32)
         for class_id in [LEFT_EYE_ID, RIGHT_EYE_ID, LEFT_EYEBROW_ID, RIGHT_EYEBROW_ID,
-                         NOSE_ID, UPPER_LIP_ID, LOWER_LIP_ID, MOUTH_ID, NECK_ID]:
+                         NOSE_ID, UPPER_LIP_ID, LOWER_LIP_ID, MOUTH_ID]:
             facial_mask += (seg_map == class_id).astype(np.float32)
         facial_votes += (facial_mask > 0).astype(np.float32)
     
@@ -1096,7 +2506,9 @@ def multi_scale_segment_hair_segformer(image: np.ndarray, scales: list = [512, 7
 
 
 def segment_hair_focused_segformer(image: np.ndarray, face_crop_region: tuple = None, 
-                                     scales: list = [512, 768, 1024]) -> tuple:
+                                     scales: list = [512, 768, 1024],
+                                     hair_class_id = None,
+                                     neck_class_id = None) -> tuple:
     """
     Run SegFormer hair segmentation focused on the face region for better accuracy.
     
@@ -1120,14 +2532,14 @@ def segment_hair_focused_segformer(image: np.ndarray, face_crop_region: tuple = 
     # If no face crop region, fall back to full-image processing
     if face_crop_region is None:
         log_debug("[SEGFORMER FOCUSED] No face crop region - using full image")
-        return multi_scale_segment_hair_segformer(image, scales)
+        return multi_scale_segment_hair_segformer(image, scales, hair_class_id, neck_class_id)
     
     crop_x, crop_y, crop_w, crop_h = face_crop_region
     
     # Validate crop region
     if crop_w < 100 or crop_h < 100:
         log_debug(f"[SEGFORMER FOCUSED] Crop region too small ({crop_w}x{crop_h}) - using full image")
-        return multi_scale_segment_hair_segformer(image, scales)
+        return multi_scale_segment_hair_segformer(image, scales, hair_class_id, neck_class_id)
     
     log_debug(f"[SEGFORMER FOCUSED] Using face-focused crop: ({crop_x}, {crop_y}) {crop_w}x{crop_h}")
     
@@ -1144,7 +2556,9 @@ def segment_hair_focused_segformer(image: np.ndarray, face_crop_region: tuple = 
     log_debug(f"[SEGFORMER FOCUSED] Running SegFormer at scales: {focused_scales}")
     
     # Get masks for the cropped region
-    cropped_hair_mask, cropped_facial_mask = multi_scale_segment_hair_segformer(cropped_image, focused_scales)
+    cropped_hair_mask, cropped_facial_mask = multi_scale_segment_hair_segformer(
+        cropped_image, focused_scales, hair_class_id, neck_class_id
+    )
     
     # Map masks back to original image coordinates
     full_hair_mask = np.zeros((original_h, original_w), dtype=np.uint8)
@@ -1160,7 +2574,9 @@ def segment_hair_focused_segformer(image: np.ndarray, face_crop_region: tuple = 
     return full_hair_mask, full_facial_mask
 
 
-def multi_scale_segment_hair(image: np.ndarray, scales: list = [512, 768, 1024]) -> tuple:
+def multi_scale_segment_hair(image: np.ndarray, scales: list = [512, 768, 1024],
+                             hair_class_id = None,
+                             neck_class_id = None) -> tuple:
     """
     Run multi-scale hair segmentation for improved accuracy.
     Runs BiSeNet at multiple resolutions and merges results.
@@ -1178,7 +2594,14 @@ def multi_scale_segment_hair(image: np.ndarray, scales: list = [512, 768, 1024])
     session = get_session()
     original_h, original_w = image.shape[:2]
     
-    log_debug(f"[MULTI-SCALE] Running segmentation at scales: {scales}")
+    if hair_class_id is None or neck_class_id is None:
+        resolved_hair, resolved_neck = get_dynamic_hair_neck_ids_for_image(image)
+        if hair_class_id is None:
+            hair_class_id = resolved_hair
+        if neck_class_id is None:
+            neck_class_id = resolved_neck
+
+    log_debug(f"[MULTI-SCALE] Running segmentation at scales: {scales} (hair={hair_class_id}, neck={neck_class_id})")
     
     # Collect hair masks and facial feature masks from each scale
     hair_masks = []
@@ -1187,17 +2610,22 @@ def multi_scale_segment_hair(image: np.ndarray, scales: list = [512, 768, 1024])
     for scale in scales:
         seg_map = segment_at_scale(image, scale, session)
         
-        # Extract hair mask
-        hair_mask = (seg_map == HAIR_CLASS_ID).astype(np.uint8)
+        # Extract hair mask using resolved hair class id
+        hair_mask = (seg_map == hair_class_id).astype(np.uint8)
         
-        # Fallback: use hat class if hair is too small (common for locs/braids/waves)
+        # Fallback: try alternate known hair class ids when current class is weak
         hair_pixels = np.sum(hair_mask)
         if hair_pixels < 1000:
-            hat_mask = (seg_map == 18).astype(np.uint8)  # Hat class
-            hat_pixels = np.sum(hat_mask)
-            if hat_pixels > hair_pixels:
-                log_debug(f"[MULTI-SCALE] Scale {scale}: Using hat class fallback ({hat_pixels} vs {hair_pixels} hair pixels)")
-                hair_mask = hat_mask
+            alt_ids = [HAIR_CLASS_ID, 13]
+            for alt_id in alt_ids:
+                if alt_id == hair_class_id:
+                    continue
+                alt_mask = (seg_map == alt_id).astype(np.uint8)
+                alt_pixels = np.sum(alt_mask)
+                if alt_pixels > hair_pixels:
+                    hair_mask = alt_mask
+                    hair_pixels = alt_pixels
+                    log_debug(f"[MULTI-SCALE] Scale {scale}: Using alt class {alt_id} ({alt_pixels} px)")
         
         # Exclude ears from hair
         ear_mask = ((seg_map == LEFT_EAR_ID) | (seg_map == RIGHT_EAR_ID)).astype(np.uint8)
@@ -1215,7 +2643,7 @@ def multi_scale_segment_hair(image: np.ndarray, scales: list = [512, 768, 1024])
             (seg_map == LEFT_EAR_ID) |
             (seg_map == RIGHT_EAR_ID) |
             (seg_map == SKIN_CLASS_ID) |
-            (seg_map == NECK_ID)
+            (seg_map == neck_class_id)
         ).astype(np.uint8)
         facial_masks.append(facial_mask)
         
@@ -1282,7 +2710,9 @@ def expand_face_box_for_hair(face_box: tuple, img_h: int, img_w: int,
 
 
 def segment_hair_focused(image: np.ndarray, face_crop_region: tuple = None, 
-                          scales: list = [512, 768, 1024]) -> tuple:
+                          scales: list = [512, 768, 1024],
+                          hair_class_id = None,
+                          neck_class_id = None) -> tuple:
     """
     Run hair segmentation focused on the face region for better accuracy and speed.
     
@@ -1311,14 +2741,14 @@ def segment_hair_focused(image: np.ndarray, face_crop_region: tuple = None,
     # If no face crop region, fall back to full-image processing
     if face_crop_region is None:
         log_debug("[FOCUSED] No face crop region - using full image")
-        return multi_scale_segment_hair(image, scales)
+        return multi_scale_segment_hair(image, scales, hair_class_id, neck_class_id)
     
     crop_x, crop_y, crop_w, crop_h = face_crop_region
     
     # Validate crop region
     if crop_w < 100 or crop_h < 100:
         log_debug(f"[FOCUSED] Crop region too small ({crop_w}x{crop_h}) - using full image")
-        return multi_scale_segment_hair(image, scales)
+        return multi_scale_segment_hair(image, scales, hair_class_id, neck_class_id)
     
     log_debug(f"[FOCUSED] Using face-focused crop: ({crop_x}, {crop_y}) {crop_w}x{crop_h}")
     
@@ -1335,7 +2765,9 @@ def segment_hair_focused(image: np.ndarray, face_crop_region: tuple = None,
     log_debug(f"[FOCUSED] Running BiSeNet at scales: {focused_scales}")
     
     # Get masks for the cropped region
-    cropped_hair_mask, cropped_facial_mask = multi_scale_segment_hair(cropped_image, focused_scales)
+    cropped_hair_mask, cropped_facial_mask = multi_scale_segment_hair(
+        cropped_image, focused_scales, hair_class_id, neck_class_id
+    )
     
     # Map masks back to original image coordinates
     full_hair_mask = np.zeros((original_h, original_w), dtype=np.uint8)
@@ -1354,7 +2786,9 @@ def segment_hair_focused(image: np.ndarray, face_crop_region: tuple = None,
 def segment_hair(image: np.ndarray, include_forehead: bool = False, 
                   forehead_extension: int = 80, above_hair: int = 20,
                   eyebrow_margin: int = 20, forehead_fraction: float = 0.5,
-                  exclude_facial_features: bool = True) -> tuple:
+                  exclude_facial_features: bool = True,
+                  hair_class_id = None,
+                  neck_class_id = None) -> tuple:
     """Run BiSeNet inference to extract hair mask (optionally with forehead).
     
     Args:
@@ -1392,8 +2826,15 @@ def segment_hair(image: np.ndarray, include_forehead: bool = False,
     # Get full segmentation map
     seg_map = np.argmax(outputs[0], axis=1)[0]
     
+    if hair_class_id is None or neck_class_id is None:
+        resolved_hair, resolved_neck = resolve_dynamic_hair_neck_class_ids(seg_map)
+        if hair_class_id is None:
+            hair_class_id = resolved_hair
+        if neck_class_id is None:
+            neck_class_id = resolved_neck
+
     # Extract hair mask
-    hair_mask = (seg_map == HAIR_CLASS_ID).astype(np.uint8)
+    hair_mask = (seg_map == hair_class_id).astype(np.uint8)
     
     # Exclude ears from the mask
     ear_mask = ((seg_map == LEFT_EAR_ID) | (seg_map == RIGHT_EAR_ID)).astype(np.uint8)
@@ -1643,16 +3084,25 @@ def create_user_masked_image_raw(image: np.ndarray, face_crop_region: tuple = No
         if face_check["face_found"] and face_check["crop_region"]:
             face_crop_region = face_check["crop_region"]
             log_debug(f"[USER MASK RAW] Detected face with crop region: {face_crop_region}")
+
+    hair_class_id, neck_class_id = get_dynamic_hair_neck_ids_for_image(original_image, face_crop_region)
+    log_debug(f"[USER MASK RAW] Resolved class IDs: hair={hair_class_id}, neck={neck_class_id}")
     
     # STEP 2: HYBRID APPROACH - combine face-focused (for face) + full-image (for hair)
     if face_crop_region is not None:
         # Face-focused segmentation - better at finding the face accurately
-        focused_hair_mask, focused_facial_mask = segment_hair_focused(image, face_crop_region, scales=[512, 768, 1024])
+        focused_hair_mask, focused_facial_mask = segment_hair_focused(
+            image, face_crop_region, scales=[512, 768, 1024],
+            hair_class_id=hair_class_id, neck_class_id=neck_class_id
+        )
         focused_hair_pixels = np.sum(focused_hair_mask)
         log_debug(f"[USER MASK RAW] Face-focused: {focused_hair_pixels} hair pixels, {np.sum(focused_facial_mask)} facial pixels")
         
         # Full-image segmentation - better at finding ALL hair (including edges far from face)
-        full_hair_mask, full_facial_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+        full_hair_mask, full_facial_mask = multi_scale_segment_hair(
+            image, scales=[512, 768, 1024],
+            hair_class_id=hair_class_id, neck_class_id=neck_class_id
+        )
         full_hair_pixels = np.sum(full_hair_mask)
         log_debug(f"[USER MASK RAW] Full-image: {full_hair_pixels} hair pixels, {np.sum(full_facial_mask)} facial pixels")
         
@@ -1664,7 +3114,10 @@ def create_user_masked_image_raw(image: np.ndarray, face_crop_region: tuple = No
         log_debug(f"[USER MASK RAW] HYBRID result: {combined_hair_pixels} hair pixels (union of both)")
     else:
         # No face detected - use full-image only
-        hair_mask, facial_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+        hair_mask, facial_mask = multi_scale_segment_hair(
+            image, scales=[512, 768, 1024],
+            hair_class_id=hair_class_id, neck_class_id=neck_class_id
+        )
         log_debug(f"[USER MASK RAW] No face detected, using full-image only")
     
     hair_pixels = np.sum(hair_mask)
@@ -1675,7 +3128,7 @@ def create_user_masked_image_raw(image: np.ndarray, face_crop_region: tuple = No
     if not include_neck:
         session = get_session()
         seg_map = segment_at_scale(image, 512, session)
-        neck_mask = (seg_map == NECK_ID).astype(np.uint8)
+        neck_mask = (seg_map == neck_class_id).astype(np.uint8)
         neck_pixels = np.sum(neck_mask)
         log_debug(f"[USER MASK RAW] Will gray out {neck_pixels} neck pixels")
     
@@ -1704,7 +3157,7 @@ def create_user_masked_image_raw(image: np.ndarray, face_crop_region: tuple = No
             (seg_map == LEFT_EAR_ID) | (seg_map == RIGHT_EAR_ID)  # Ears
         )
         if include_neck:
-            keep_visible = keep_visible | (seg_map == NECK_ID)
+            keep_visible = keep_visible | (seg_map == neck_class_id)
         # Gray out everything not face-related (background, clothes, etc.)
         background_mask = ~keep_visible & (hair_mask == 0)  # Not face and not already hair
         output[background_mask] = GRAY_BG
@@ -1722,7 +3175,8 @@ def create_user_masked_image_raw(image: np.ndarray, face_crop_region: tuple = No
 
 
 def create_hair_only_mask_raw(image: np.ndarray, return_masks: bool = False, face_crop_region: tuple = None,
-                               hair_buffer_px: int = 40, sharpen: bool = True, blot_eyes: bool = True):
+                               hair_buffer_px: int = 40, sharpen: bool = True, blot_eyes: bool = True,
+                               face_bbox_override: tuple = None):
     """
     Create a RAW hair-only mask - shows hair with buffer, grays out face and everything else.
     Uses HYBRID approach: face-focused for accurate face detection + full-image for complete hair outline.
@@ -1739,6 +3193,7 @@ def create_hair_only_mask_raw(image: np.ndarray, return_masks: bool = False, fac
         hair_buffer_px: Pixels to expand hair mask outward (default 40)
         sharpen: Whether to sharpen image before segmentation for better accuracy (default True)
         blot_eyes: Whether to always gray out eyes (default True)
+        face_bbox_override: Optional detector bbox (x, y, w, h) to use instead of Ultra-Light face box
     
     Returns:
         If return_masks=False: output image (np.ndarray)
@@ -1757,21 +3212,54 @@ def create_hair_only_mask_raw(image: np.ndarray, return_masks: bool = False, fac
         log_debug(f"[HAIR ONLY RAW] Applied sharpening for better mask accuracy")
     
     # STEP 1: Try to detect face for focused segmentation
+    face_bbox = None
+    if face_bbox_override is not None:
+        try:
+            face_bbox = tuple(int(v) for v in face_bbox_override)
+            log_debug(f"[HAIR ONLY RAW] Using face bbox override: {face_bbox}")
+        except Exception:
+            face_bbox = None
+
+    if face_crop_region is None and face_bbox is not None:
+        face_crop_region = build_face_crop_region_from_bbox(face_bbox, original_image.shape)
+        if face_crop_region is not None:
+            log_debug(f"[HAIR ONLY RAW] Built crop region from override bbox: {face_crop_region}")
+
     if face_crop_region is None:
         face_check = early_face_check(original_image)  # Use original for face detection
         if face_check["face_found"] and face_check["crop_region"]:
             face_crop_region = face_check["crop_region"]
             log_debug(f"[HAIR ONLY RAW] Detected face with crop region: {face_crop_region}")
+        if face_bbox is None and face_check.get("faces"):
+            face_bbox = face_check["faces"][0]["bbox"]
+    else:
+        # If crop was provided externally, still try to get face bbox for class resolution.
+        if face_bbox is None:
+            faces = detect_faces_ultra_light(original_image, confidence_threshold=0.55)
+            if faces:
+                face_bbox = faces[0]["bbox"]
+
+    # Resolve dynamic class ids for this image to handle model label-map variants.
+    session = get_session()
+    probe_seg = segment_at_scale(original_image, 512, session)
+    hair_class_id, neck_class_id = resolve_dynamic_hair_neck_class_ids(probe_seg, face_bbox)
+    log_debug(f"[HAIR ONLY RAW] Resolved class IDs: hair={hair_class_id}, neck={neck_class_id}")
     
     # STEP 2: HYBRID APPROACH - combine face-focused (for face) + full-image (for hair)
     if face_crop_region is not None:
         # Face-focused segmentation - better at finding the face accurately
-        focused_hair_mask, focused_facial_mask = segment_hair_focused(image, face_crop_region, scales=[512, 768, 1024])
+        focused_hair_mask, focused_facial_mask = segment_hair_focused(
+            image, face_crop_region, scales=[512, 768, 1024],
+            hair_class_id=hair_class_id, neck_class_id=neck_class_id
+        )
         focused_hair_pixels = np.sum(focused_hair_mask)
         log_debug(f"[HAIR ONLY RAW] Face-focused: {focused_hair_pixels} hair pixels, {np.sum(focused_facial_mask)} facial pixels")
         
         # Full-image segmentation - better at finding ALL hair (including edges far from face)
-        full_hair_mask, full_facial_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+        full_hair_mask, full_facial_mask = multi_scale_segment_hair(
+            image, scales=[512, 768, 1024],
+            hair_class_id=hair_class_id, neck_class_id=neck_class_id
+        )
         full_hair_pixels = np.sum(full_hair_mask)
         log_debug(f"[HAIR ONLY RAW] Full-image: {full_hair_pixels} hair pixels, {np.sum(full_facial_mask)} facial pixels")
         
@@ -1783,27 +3271,22 @@ def create_hair_only_mask_raw(image: np.ndarray, return_masks: bool = False, fac
         log_debug(f"[HAIR ONLY RAW] HYBRID result: {combined_hair_pixels} hair pixels (union of both)")
     else:
         # No face detected - use full-image only
-        hair_mask, facial_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+        hair_mask, facial_mask = multi_scale_segment_hair(
+            image, scales=[512, 768, 1024],
+            hair_class_id=hair_class_id, neck_class_id=neck_class_id
+        )
         log_debug(f"[HAIR ONLY RAW] No face detected, using full-image only")
     
     hair_pixels = np.sum(hair_mask)
     log_debug(f"[HAIR ONLY RAW] Final hair mask: {hair_pixels} pixels")
     
-    # Get segmentation for eye/neck exclusion masks
-    session = get_session()
+    # Get segmentation for eyebrow detection
     seg_map = segment_at_scale(original_image, 512, session)
     
     # Use full hair mask without any cutoff - show all detected hair
     hair_mask_visible = hair_mask
     log_debug(f"[HAIR ONLY RAW] Using full hair mask without cutoff, pixels: {np.sum(hair_mask)}")
     
-    # Remove neck from visible hair region before buffer expansion.
-    # This directly prevents neck-only leaks when Stage 1 output confuses boundaries.
-    neck_mask = (seg_map == NECK_ID).astype(np.uint8)
-    if np.sum(neck_mask) > 0:
-        hair_mask_visible = hair_mask_visible & (~neck_mask)
-        log_debug(f"[HAIR ONLY RAW] Excluded {np.sum(neck_mask)} neck pixels from visible hair mask")
-
     # Expand hair mask by buffer_px for softer edges and better blending
     if hair_buffer_px > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hair_buffer_px * 2 + 1, hair_buffer_px * 2 + 1))
@@ -1812,18 +3295,23 @@ def create_hair_only_mask_raw(image: np.ndarray, return_masks: bool = False, fac
         # IMPORTANT: Subtract facial mask to prevent buffer bleeding into face
         # The buffer should expand outward (background) but NOT into facial features
         expanded_hair_mask = expanded_hair_mask & ~facial_mask
-        # Also keep neck excluded after expansion
-        expanded_hair_mask = expanded_hair_mask & (~neck_mask)
         
         buffer_pixels = np.sum(expanded_hair_mask) - np.sum(hair_mask_visible)
         log_debug(f"[HAIR ONLY RAW] Expanded hair mask by {hair_buffer_px}px buffer (+{buffer_pixels} pixels, face excluded)")
     else:
         expanded_hair_mask = hair_mask_visible
     
-    # Show hair + buffer area, gray out everything else (including face)
-    # Use ORIGINAL image pixels (not sharpened) for output quality
-    output = np.full_like(original_image, GRAY_BG)
-    output[expanded_hair_mask > 0] = original_image[expanded_hair_mask > 0]
+    # Show hair + buffer area with feathered boundaries for smoother edges.
+    # Use ORIGINAL image pixels (not sharpened) for output quality.
+    feather_px = max(4, min(10, int(round(min(original_h, original_w) * 0.004))))
+    output = composite_with_feather(
+        original_image,
+        expanded_hair_mask,
+        exclusion_mask=facial_mask,
+        feather_px=feather_px,
+        guided_radius=max(6, feather_px + 2),
+        guided_eps=0.008
+    )
     
     # Always blot out eyes for privacy/consistency
     if blot_eyes:
@@ -1841,161 +3329,499 @@ def create_hair_only_mask_raw(image: np.ndarray, return_masks: bool = False, fac
     return output
 
 
-def create_hair_only_mask_kontext(image: np.ndarray, return_masks: bool = False,
-                                   hair_buffer_px: int = 30, blot_eyes: bool = False):
+def create_kontext_result_mask_test(image: np.ndarray, return_masks: bool = False, buffer_px: int = 30,
+                                    detector_type: str = None, detector_threshold: float = None,
+                                    pass_scales: list = None, return_debug: bool = False,
+                                    trimap_fg_erode_px: int = None, trimap_unknown_dilate_px: int = None,
+                                    matting_backend: str = None, modnet_input_size: int = None,
+                                    edge_decontaminate: bool = None, edge_decontam_strength: float = None):
     """
-    BRAND-NEW Kontext-specific hair-only mask pipeline.
+    Kontext Stage-1 mask test with explicit trimap pipeline.
 
-    Goal:
-      Gray out everything except:
-        1) detected hair
-        2) a fixed 30px buffer around detected hair
-
-    This pipeline is isolated from other modes and only used for Kontext outputs.
+    Steps:
+      1. Detect face and create hard hair mask.
+      2. Build trimap (definite FG / unknown band / BG).
+      3. Estimate alpha matte via selected backend (trimap or MODNet).
+      4. Optional edge color decontamination.
+      5. Composite over neutral background.
     """
-    log_debug(f"[HAIR ONLY KONTEXT V2] Starting new pipeline - buffer={hair_buffer_px}px")
+    effective_buffer = max(0, int(buffer_px if buffer_px is not None else 30))
+    detector = resolve_runtime_detector(detector_type or KONTEXT_FACE_DETECTOR or "ultralight")
+    faces = detect_faces_multipass(
+        image,
+        detector_type=detector,
+        confidence_threshold=detector_threshold,
+        pass_scales=pass_scales if pass_scales is not None else KONTEXT_MULTI_PASS_SCALES
+    )
+    face_bbox = faces[0]["bbox"] if faces else None
+    face_crop_region = build_face_crop_region_from_bbox(face_bbox, image.shape) if face_bbox is not None else None
+    _, hair_mask, facial_mask = create_hair_only_mask_raw(
+        image,
+        return_masks=True,
+        face_crop_region=face_crop_region,
+        hair_buffer_px=effective_buffer,
+        sharpen=True,
+        blot_eyes=True,
+        face_bbox_override=face_bbox
+    )
 
-    original = image.copy()
-    h, w = image.shape[:2]
-    session = get_session()
+    keep_mask = hair_mask.astype(np.uint8)
+    if effective_buffer > 0:
+        keep_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (effective_buffer * 2 + 1, effective_buffer * 2 + 1)
+        )
+        keep_mask = cv2.dilate(keep_mask, keep_kernel, iterations=1)
+    keep_mask[facial_mask > 0] = 0
 
-    # 1) Multi-scale hair votes using BiSeNet classes:
-    #    class 17 = hair, class 18 = hat fallback (often captures braids/locs/waves).
-    scales = [512, 768, 1024]
-    hair_votes = np.zeros((h, w), dtype=np.float32)
-
-    for scale in scales:
-        seg_map = segment_at_scale(original, scale, session)
-        hair_like = ((seg_map == HAIR_CLASS_ID) | (seg_map == 18)).astype(np.float32)
-        hair_votes += hair_like
-
-    # Keep any pixel classified as hair-like by at least one scale.
-    hair_seed = (hair_votes >= 1.0).astype(np.uint8)
-
-    # 2) Clean noise while keeping fine strands.
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    hair_seed = cv2.morphologyEx(hair_seed, cv2.MORPH_OPEN, kernel)
-    hair_seed = cv2.morphologyEx(hair_seed, cv2.MORPH_CLOSE, kernel)
-
-    # 3) Spatial filtering to avoid neck-only components.
-    # Prefer components near detected face/head region when face is found.
-    face_info = early_face_check(original)
-    if np.sum(hair_seed) > 0:
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(hair_seed, connectivity=8)
-        filtered = np.zeros_like(hair_seed, dtype=np.uint8)
-
-        if face_info.get("face_found") and face_info.get("faces"):
-            fx, fy, fw, fh = face_info["faces"][0]["bbox"]
-            x_min = max(0, fx - int(0.9 * fw))
-            x_max = min(w - 1, fx + fw + int(0.9 * fw))
-            y_max = min(h - 1, fy + int(1.15 * fh))
-            y_min = max(0, fy - int(1.2 * fh))
-
-            for i in range(1, num_labels):
-                area = stats[i, cv2.CC_STAT_AREA]
-                top = stats[i, cv2.CC_STAT_TOP]
-                left = stats[i, cv2.CC_STAT_LEFT]
-                width_i = stats[i, cv2.CC_STAT_WIDTH]
-                cx = left + width_i // 2
-                if area < 180:
-                    continue
-                if cx < x_min or cx > x_max:
-                    continue
-                if top > y_max or top < y_min:
-                    continue
-                filtered[labels == i] = 1
-        else:
-            # Generic upper-region prior if no face found.
-            upper_limit = int(h * 0.80)
-            for i in range(1, num_labels):
-                area = stats[i, cv2.CC_STAT_AREA]
-                top = stats[i, cv2.CC_STAT_TOP]
-                if area >= 180 and top <= upper_limit:
-                    filtered[labels == i] = 1
-
-        # If filtering removes everything, keep original seed to avoid all-gray failure.
-        if np.sum(filtered) > 0:
-            hair_seed = filtered
-
-    # 4) Build fixed buffer around hair seed.
-    if hair_buffer_px > 0:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hair_buffer_px * 2 + 1, hair_buffer_px * 2 + 1))
-        visible = cv2.dilate(hair_seed, k, iterations=1)
+    if trimap_fg_erode_px is None:
+        trimap_fg_erode_px = max(1, min(12, int(round(max(6, effective_buffer) * 0.20))))
     else:
-        visible = hair_seed.copy()
+        trimap_fg_erode_px = max(0, int(trimap_fg_erode_px))
 
-    # 5) Render: gray everything except hair + buffer.
-    output = np.full_like(original, GRAY_BG)
-    output[visible > 0] = original[visible > 0]
+    if trimap_unknown_dilate_px is None:
+        trimap_unknown_dilate_px = max(2, min(24, int(round(max(8, effective_buffer) * 0.35))))
+    else:
+        trimap_unknown_dilate_px = max(0, int(trimap_unknown_dilate_px))
 
-    # Optional eye blotting if explicitly requested.
-    if blot_eyes:
-        seg_map_512 = segment_at_scale(original, 512, session)
-        eye_mask = ((seg_map_512 == LEFT_EYE_ID) | (seg_map_512 == RIGHT_EYE_ID))
-        output[eye_mask] = GRAY_BG
+    trimap, _, unknown_band = build_trimap_from_mask(
+        keep_mask,
+        exclusion_mask=facial_mask,
+        fg_erode_px=trimap_fg_erode_px,
+        unknown_dilate_px=trimap_unknown_dilate_px
+    )
 
-    log_debug(f"[HAIR ONLY KONTEXT V2] Complete - seed={np.sum(hair_seed)} visible={np.sum(visible)}")
+    requested_backend = (matting_backend or KONTEXT_MATTING_BACKEND or "trimap").strip().lower()
+    effective_backend = resolve_runtime_matting_backend(requested_backend)
+
+    alpha = None
+    if effective_backend == "modnet":
+        alpha = estimate_alpha_with_modnet(
+            image,
+            trimap=trimap,
+            keep_mask=keep_mask,
+            exclusion_mask=facial_mask,
+            target_size=modnet_input_size
+        )
+        if alpha is None:
+            effective_backend = "trimap"
+            log_info("[MATTING] MODNet inference unavailable; using trimap alpha")
+
+    if alpha is None:
+        alpha = estimate_alpha_from_trimap(
+            image,
+            trimap,
+            guided_radius=max(6, trimap_unknown_dilate_px),
+            guided_eps=0.008
+        )
+
+    decontam_enabled = (
+        KONTEXT_EDGE_DECONTAMINATE
+        if edge_decontaminate is None
+        else bool(edge_decontaminate)
+    )
+    decontam_strength = (
+        KONTEXT_EDGE_DECONTAM_STRENGTH
+        if edge_decontam_strength is None
+        else float(edge_decontam_strength)
+    )
+    decontam_strength = float(np.clip(decontam_strength, 0.0, 1.0))
+
+    image_for_comp = image
+    if decontam_enabled and decontam_strength > 0.0:
+        image_for_comp = decontaminate_edge_colors(
+            image,
+            alpha,
+            unknown_band=unknown_band,
+            strength=decontam_strength
+        )
+
+    output = composite_with_alpha(image_for_comp, alpha, background=GRAY_BG)
+
+    # Keep eyes neutral for consistency with other mask modes.
+    session = get_session()
+    seg_map = segment_at_scale(image, 512, session)
+    eye_mask = ((seg_map == LEFT_EYE_ID) | (seg_map == RIGHT_EYE_ID)).astype(np.uint8)
+    output[eye_mask > 0] = GRAY_BG
+
+    log_debug(
+        f"[KONTEXT RESULT MASK TEST] detector={detector} faces={len(faces)} "
+        f"face_bbox={face_bbox} crop_region={face_crop_region} buffer={effective_buffer} "
+        f"matting={effective_backend} "
+        f"trimap(erode={trimap_fg_erode_px}, dilate={trimap_unknown_dilate_px}) "
+        f"unknown_pixels={int(np.sum(unknown_band))} "
+        f"decontam={'on' if decontam_enabled else 'off'} strength={decontam_strength:.2f}"
+    )
+
+    if return_debug:
+        alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+        debug_meta = {
+            "mattingBackendRequested": requested_backend,
+            "mattingBackendUsed": effective_backend,
+            "edgeDecontaminate": bool(decontam_enabled),
+            "edgeDecontamStrength": float(decontam_strength),
+        }
+        return output, hair_mask, facial_mask, trimap, alpha_u8, debug_meta
 
     if return_masks:
-        # facial-like mask for validation consistency (used only as a sanity metric)
-        facial_like = np.zeros_like(hair_seed, dtype=np.uint8)
-        return output, hair_seed, facial_like
+        return output, hair_mask, facial_mask
     return output
 
 
-def create_kontext_face_hair_mask_user_style(image: np.ndarray, return_masks: bool = False,
-                                             face_crop_region: tuple = None, include_neck: bool = True):
+def create_kontext_result_mask_test_v2(image: np.ndarray, return_masks: bool = False, buffer_px: int = 30,
+                                       detector_type: str = None, detector_threshold: float = None,
+                                       pass_scales: list = None, return_debug: bool = False,
+                                       trimap_fg_erode_px: int = None, trimap_unknown_dilate_px: int = None,
+                                       matting_backend: str = None, modnet_input_size: int = None,
+                                       edge_decontaminate: bool = None, edge_decontam_strength: float = None,
+                                       roi_dilate_px: int = 100):
     """
-    Kontext mask using the SAME hybrid segmentation approach as user_mask raw mode,
-    but rendering face + hair visible (everything else gray).
+    Kontext Stage-1 mask test V2.
+
+    Pipeline:
+      1) Coarse high-recall hair mask on original image.
+      2) Dilate coarse mask to build ROI.
+      3) Re-run segmentation on ORIGINAL pixels inside ROI crop.
+      4) Map refined masks back to full resolution.
+      5) Build trimap + alpha refinement in boundary band.
     """
-    log_debug(f"[KONTEXT FACE+HAIR] Starting user-mask-style hybrid segmentation")
+    effective_buffer = max(0, int(buffer_px if buffer_px is not None else 30))
+    effective_roi_dilate = max(10, int(roi_dilate_px if roi_dilate_px is not None else 100))
 
-    original_image = image.copy()
-    h, w = image.shape[:2]
-
-    # Match user_mask raw approach: early face crop, then focused + full-image hybrid.
-    if face_crop_region is None:
-        face_check = early_face_check(original_image)
-        if face_check["face_found"] and face_check["crop_region"]:
-            face_crop_region = face_check["crop_region"]
-            log_debug(f"[KONTEXT FACE+HAIR] Using face crop region: {face_crop_region}")
-
-    if face_crop_region is not None:
-        # Keep this identical to create_user_masked_image_raw:
-        # union hair from focused + full-image, but keep focused facial mask only.
-        focused_hair_mask, focused_facial_mask = segment_hair_focused(image, face_crop_region, scales=[512, 768, 1024])
-        full_hair_mask, _ = multi_scale_segment_hair(image, scales=[512, 768, 1024])
-        hair_mask = focused_hair_mask | full_hair_mask
-        facial_mask = focused_facial_mask
-    else:
-        hair_mask, facial_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
-
-    # Face/feature keep mask from segmentation classes (same family as user_mask logic).
-    session = get_session()
-    seg_map = segment_at_scale(original_image, 512, session)
-    face_keep = (
-        (seg_map == SKIN_CLASS_ID) |
-        (seg_map == LEFT_EYE_ID) | (seg_map == RIGHT_EYE_ID) |
-        (seg_map == LEFT_EYEBROW_ID) | (seg_map == RIGHT_EYEBROW_ID) |
-        (seg_map == NOSE_ID) |
-        (seg_map == UPPER_LIP_ID) | (seg_map == LOWER_LIP_ID) | (seg_map == MOUTH_ID) |
-        (seg_map == LEFT_EAR_ID) | (seg_map == RIGHT_EAR_ID)
+    detector = resolve_runtime_detector(detector_type or KONTEXT_FACE_DETECTOR or "ultralight")
+    faces = detect_faces_multipass(
+        image,
+        detector_type=detector,
+        confidence_threshold=detector_threshold,
+        pass_scales=pass_scales if pass_scales is not None else KONTEXT_MULTI_PASS_SCALES
     )
-    if include_neck:
-        face_keep = face_keep | (seg_map == NECK_ID)
+    face_bbox = faces[0]["bbox"] if faces else None
+    face_crop_region = build_face_crop_region_from_bbox(face_bbox, image.shape) if face_bbox is not None else None
 
-    # Final visible region: face + hair.
-    visible_mask = (hair_mask > 0) | face_keep
+    # Step 1: coarse high-recall mask on full original image
+    _, coarse_hair_mask, coarse_facial_mask = create_hair_only_mask_raw(
+        image,
+        return_masks=True,
+        face_crop_region=face_crop_region,
+        hair_buffer_px=0,
+        sharpen=True,
+        blot_eyes=True,
+        face_bbox_override=face_bbox
+    )
+    coarse_hair_mask = coarse_hair_mask.astype(np.uint8)
+    coarse_facial_mask = coarse_facial_mask.astype(np.uint8)
 
-    # Render gray background with only visible regions.
-    output = np.full_like(original_image, GRAY_BG)
-    output[visible_mask] = original_image[visible_mask]
+    # Step 2: ROI from coarse mask (+face region for contextual stability)
+    roi_seed = coarse_hair_mask.copy()
+    if face_bbox is not None:
+        fx, fy, fw, fh = [int(v) for v in face_bbox]
+        h, w = image.shape[:2]
+        fx1 = max(0, fx - int(round(fw * 0.35)))
+        fy1 = max(0, fy - int(round(fh * 0.65)))
+        fx2 = min(w, fx + fw + int(round(fw * 0.35)))
+        fy2 = min(h, fy + fh + int(round(fh * 0.40)))
+        roi_seed[fy1:fy2, fx1:fx2] = 1
 
-    log_debug(f"[KONTEXT FACE+HAIR] Complete - visible pixels: {np.sum(visible_mask)}")
+    roi_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (effective_roi_dilate * 2 + 1, effective_roi_dilate * 2 + 1)
+    )
+    roi_mask = cv2.dilate(roi_seed, roi_kernel, iterations=1)
+
+    ys, xs = np.where(roi_mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        # Degenerate ROI: keep coarse masks.
+        x1, y1, x2, y2 = 0, 0, image.shape[1], image.shape[0]
+        refined_hair_mask = coarse_hair_mask
+        refined_facial_mask = coarse_facial_mask
+    else:
+        x1, x2 = int(np.min(xs)), int(np.max(xs)) + 1
+        y1, y2 = int(np.min(ys)), int(np.max(ys)) + 1
+
+        roi_image = image[y1:y2, x1:x2].copy()
+        if roi_image.shape[0] < 64 or roi_image.shape[1] < 64:
+            refined_hair_mask = coarse_hair_mask
+            refined_facial_mask = coarse_facial_mask
+        else:
+            face_bbox_roi = None
+            if face_bbox is not None:
+                bx, by, bw, bh = [int(v) for v in face_bbox]
+                face_bbox_roi = (
+                    max(0, bx - x1),
+                    max(0, by - y1),
+                    bw,
+                    bh
+                )
+            face_crop_region_roi = (
+                build_face_crop_region_from_bbox(face_bbox_roi, roi_image.shape)
+                if face_bbox_roi is not None else None
+            )
+
+            # Step 3: re-segment inside ROI on original pixels
+            _, roi_hair_mask, roi_facial_mask = create_hair_only_mask_raw(
+                roi_image,
+                return_masks=True,
+                face_crop_region=face_crop_region_roi,
+                hair_buffer_px=0,
+                sharpen=True,
+                blot_eyes=True,
+                face_bbox_override=face_bbox_roi
+            )
+
+            # Step 4: map back to full image
+            refined_hair_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+            refined_facial_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+            refined_hair_mask[y1:y2, x1:x2] = roi_hair_mask.astype(np.uint8)
+            refined_facial_mask[y1:y2, x1:x2] = roi_facial_mask.astype(np.uint8)
+
+            if int(np.sum(refined_hair_mask)) < 300:
+                # Keep coarse if ROI refinement collapses.
+                refined_hair_mask = coarse_hair_mask
+                refined_facial_mask = coarse_facial_mask
+
+    # Step 5: trimap + alpha refinement
+    keep_mask = refined_hair_mask.astype(np.uint8)
+    if effective_buffer > 0:
+        keep_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (effective_buffer * 2 + 1, effective_buffer * 2 + 1)
+        )
+        keep_mask = cv2.dilate(keep_mask, keep_kernel, iterations=1)
+    keep_mask[refined_facial_mask > 0] = 0
+
+    if trimap_fg_erode_px is None:
+        trimap_fg_erode_px = max(1, min(12, int(round(max(6, effective_buffer) * 0.20))))
+    else:
+        trimap_fg_erode_px = max(0, int(trimap_fg_erode_px))
+
+    if trimap_unknown_dilate_px is None:
+        trimap_unknown_dilate_px = max(2, min(24, int(round(max(8, effective_buffer) * 0.35))))
+    else:
+        trimap_unknown_dilate_px = max(0, int(trimap_unknown_dilate_px))
+
+    trimap, _, unknown_band = build_trimap_from_mask(
+        keep_mask,
+        exclusion_mask=refined_facial_mask,
+        fg_erode_px=trimap_fg_erode_px,
+        unknown_dilate_px=trimap_unknown_dilate_px
+    )
+
+    requested_backend = (matting_backend or KONTEXT_MATTING_BACKEND or "trimap").strip().lower()
+    effective_backend = resolve_runtime_matting_backend(requested_backend)
+
+    alpha = None
+    if effective_backend == "modnet":
+        alpha = estimate_alpha_with_modnet(
+            image,
+            trimap=trimap,
+            keep_mask=keep_mask,
+            exclusion_mask=refined_facial_mask,
+            target_size=modnet_input_size
+        )
+        if alpha is None:
+            effective_backend = "trimap"
+            log_info("[MATTING V2] MODNet inference unavailable; using trimap alpha")
+
+    if alpha is None:
+        alpha = estimate_alpha_from_trimap(
+            image,
+            trimap,
+            guided_radius=max(6, trimap_unknown_dilate_px),
+            guided_eps=0.008
+        )
+
+    decontam_enabled = (
+        KONTEXT_EDGE_DECONTAMINATE
+        if edge_decontaminate is None
+        else bool(edge_decontaminate)
+    )
+    decontam_strength = (
+        KONTEXT_EDGE_DECONTAM_STRENGTH
+        if edge_decontam_strength is None
+        else float(edge_decontam_strength)
+    )
+    decontam_strength = float(np.clip(decontam_strength, 0.0, 1.0))
+
+    image_for_comp = image
+    if decontam_enabled and decontam_strength > 0.0:
+        image_for_comp = decontaminate_edge_colors(
+            image,
+            alpha,
+            unknown_band=unknown_band,
+            strength=decontam_strength
+        )
+
+    output = composite_with_alpha(image_for_comp, alpha, background=GRAY_BG)
+
+    # Keep eyes neutral for consistency with other mask modes.
+    session = get_session()
+    seg_map = segment_at_scale(image, 512, session)
+    eye_mask = ((seg_map == LEFT_EYE_ID) | (seg_map == RIGHT_EYE_ID)).astype(np.uint8)
+    output[eye_mask > 0] = GRAY_BG
+
+    roi_bbox = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+    log_debug(
+        f"[KONTEXT RESULT MASK TEST V2] detector={detector} faces={len(faces)} "
+        f"face_bbox={face_bbox} roi_bbox={roi_bbox} roi_dilate={effective_roi_dilate}px "
+        f"buffer={effective_buffer}px matting={effective_backend} "
+        f"trimap(erode={trimap_fg_erode_px}, dilate={trimap_unknown_dilate_px}) "
+        f"unknown_pixels={int(np.sum(unknown_band))}"
+    )
+
+    if return_debug:
+        alpha_u8 = np.clip(alpha * 255.0, 0, 255).astype(np.uint8)
+        debug_meta = {
+            "mattingBackendRequested": requested_backend,
+            "mattingBackendUsed": effective_backend,
+            "edgeDecontaminate": bool(decontam_enabled),
+            "edgeDecontamStrength": float(decontam_strength),
+            "roiDilatePx": int(effective_roi_dilate),
+            "roiBBox": roi_bbox,
+            "coarseHairPixels": int(np.sum(coarse_hair_mask)),
+            "refinedHairPixels": int(np.sum(refined_hair_mask)),
+        }
+        return output, refined_hair_mask, refined_facial_mask, trimap, alpha_u8, debug_meta
 
     if return_masks:
-        return output, hair_mask.astype(np.uint8), facial_mask.astype(np.uint8)
+        return output, refined_hair_mask, refined_facial_mask
+    return output
+
+
+def create_user_face_only_mask_from_kontext_pipeline(
+    image: np.ndarray,
+    return_masks: bool = False,
+    include_neck: bool = False,
+    detector_type: str = None,
+    detector_threshold: float = None,
+    pass_scales: list = None,
+    trimap_fg_erode_px: int = None,
+    trimap_unknown_dilate_px: int = None,
+    matting_backend: str = None,
+    modnet_input_size: int = None,
+    edge_decontaminate: bool = None,
+    edge_decontam_strength: float = None,
+):
+    """
+    Face-only user mask using the SAME detector/segmentation/matting path as
+    create_kontext_result_mask_test, but keeping only facial region (no buffer).
+    """
+    detector = resolve_runtime_detector(detector_type or KONTEXT_FACE_DETECTOR or "ultralight")
+    faces = detect_faces_multipass(
+        image,
+        detector_type=detector,
+        confidence_threshold=detector_threshold,
+        pass_scales=pass_scales if pass_scales is not None else KONTEXT_MULTI_PASS_SCALES,
+    )
+    face_bbox = faces[0]["bbox"] if faces else None
+    face_crop_region = build_face_crop_region_from_bbox(face_bbox, image.shape) if face_bbox is not None else None
+
+    # Reuse the same core segmentation path used by kontext_result_mask_test.
+    _, hair_mask, facial_mask = create_hair_only_mask_raw(
+        image,
+        return_masks=True,
+        face_crop_region=face_crop_region,
+        hair_buffer_px=0,
+        sharpen=True,
+        blot_eyes=False,
+        face_bbox_override=face_bbox,
+    )
+
+    session = get_session()
+    seg_map = segment_at_scale(image, 512, session)
+    _, neck_class_id = resolve_dynamic_hair_neck_class_ids(seg_map, face_bbox)
+
+    # Build face-only keep mask (explicitly excludes hair and neck).
+    lip_mask = (
+        (seg_map == UPPER_LIP_ID)
+        | (seg_map == LOWER_LIP_ID)
+        | (seg_map == MOUTH_ID)
+    ).astype(np.uint8)
+    face_keep = facial_mask.astype(np.uint8) | lip_mask
+    face_keep[hair_mask > 0] = 0
+    if not include_neck:
+        face_keep[seg_map == neck_class_id] = 0
+
+    face_keep = cleanup_mask(face_keep)
+
+    if trimap_fg_erode_px is None:
+        trimap_fg_erode_px = 1
+    else:
+        trimap_fg_erode_px = max(0, int(trimap_fg_erode_px))
+
+    if trimap_unknown_dilate_px is None:
+        trimap_unknown_dilate_px = 3
+    else:
+        trimap_unknown_dilate_px = max(0, int(trimap_unknown_dilate_px))
+
+    trimap, _, unknown_band = build_trimap_from_mask(
+        face_keep,
+        exclusion_mask=hair_mask,
+        fg_erode_px=trimap_fg_erode_px,
+        unknown_dilate_px=trimap_unknown_dilate_px,
+    )
+
+    requested_backend = (matting_backend or KONTEXT_MATTING_BACKEND or "trimap").strip().lower()
+    effective_backend = resolve_runtime_matting_backend(requested_backend)
+
+    alpha = None
+    if effective_backend == "modnet":
+        alpha = estimate_alpha_with_modnet(
+            image,
+            trimap=trimap,
+            keep_mask=face_keep,
+            exclusion_mask=hair_mask,
+            target_size=modnet_input_size,
+        )
+        if alpha is None:
+            effective_backend = "trimap"
+            log_info("[USER MASK FACE-ONLY] MODNet inference unavailable; using trimap alpha")
+
+    if alpha is None:
+        alpha = estimate_alpha_from_trimap(
+            image,
+            trimap,
+            guided_radius=max(5, trimap_unknown_dilate_px + 2),
+            guided_eps=0.008,
+        )
+
+    decontam_enabled = (
+        KONTEXT_EDGE_DECONTAMINATE if edge_decontaminate is None else bool(edge_decontaminate)
+    )
+    decontam_strength = (
+        KONTEXT_EDGE_DECONTAM_STRENGTH
+        if edge_decontam_strength is None
+        else float(edge_decontam_strength)
+    )
+    decontam_strength = float(np.clip(decontam_strength, 0.0, 1.0))
+
+    image_for_comp = image
+    if decontam_enabled and decontam_strength > 0.0:
+        image_for_comp = decontaminate_edge_colors(
+            image, alpha, unknown_band=unknown_band, strength=decontam_strength
+        )
+
+    output = composite_with_alpha(image_for_comp, alpha, background=GRAY_BG)
+
+    facial_features_mask = (
+        (seg_map == LEFT_EYEBROW_ID)
+        | (seg_map == RIGHT_EYEBROW_ID)
+        | (seg_map == LEFT_EYE_ID)
+        | (seg_map == RIGHT_EYE_ID)
+        | (seg_map == NOSE_ID)
+        | (seg_map == UPPER_LIP_ID)
+        | (seg_map == LOWER_LIP_ID)
+        | (seg_map == MOUTH_ID)
+    ).astype(np.uint8)
+
+    log_debug(
+        f"[USER MASK FACE-ONLY] detector={detector} faces={len(faces)} "
+        f"bbox={face_bbox} include_neck={include_neck} matting={effective_backend} "
+        f"trimap(erode={trimap_fg_erode_px}, dilate={trimap_unknown_dilate_px}) "
+        f"face_pixels={int(np.sum(face_keep))}"
+    )
+
+    if return_masks:
+        return output, face_keep.astype(np.uint8), facial_features_mask.astype(np.uint8)
     return output
 
 
@@ -2027,8 +3853,21 @@ def create_user_masked_image(image: np.ndarray, face_buffer_px: int = 25, sharpe
     """
     # Use raw mode by default - simple, accurate, no post-processing
     if use_raw:
-        # No buffer - just the face with nothing extra (hybrid approach)
-        return create_user_masked_image_raw(image, face_crop_region, return_masks, include_neck, gray_out_background)
+        # No buffer, face-only output using the same core path as kontext_result_mask_test.
+        detector = resolve_runtime_detector(KONTEXT_FACE_DETECTOR or "ultralight")
+        det_threshold = get_detector_default_threshold(detector)
+        backend = resolve_runtime_matting_backend(KONTEXT_MATTING_BACKEND)
+        return create_user_face_only_mask_from_kontext_pipeline(
+            image,
+            return_masks=return_masks,
+            include_neck=include_neck,
+            detector_type=detector,
+            detector_threshold=det_threshold,
+            pass_scales=KONTEXT_MULTI_PASS_SCALES,
+            matting_backend=backend,
+            edge_decontaminate=KONTEXT_EDGE_DECONTAMINATE,
+            edge_decontam_strength=KONTEXT_EDGE_DECONTAM_STRENGTH,
+        )
     
     # Legacy processed mode (kept for backward compatibility)
     log_debug(f"[USER MASK] Starting LEGACY mode - face_buffer={face_buffer_px}px, sharpen={sharpen}, multi_scale={use_multi_scale}, guided_filter={use_guided_filter}, include_neck={include_neck}")
@@ -2043,14 +3882,23 @@ def create_user_masked_image(image: np.ndarray, face_buffer_px: int = 25, sharpe
     
     original_h, original_w = image.shape[:2]
     log_debug(f"[USER MASK] Image size: {original_w}x{original_h}")
+
+    hair_class_id, neck_class_id = get_dynamic_hair_neck_ids_for_image(original_image, face_crop_region)
+    log_debug(f"[USER MASK] Resolved class IDs: hair={hair_class_id}, neck={neck_class_id}")
     
     if use_multi_scale:
         # Use focused segmentation if face crop region is available
         if face_crop_region is not None:
             log_debug(f"[USER MASK] Using face-focused segmentation with crop region: {face_crop_region}")
-            hair_mask, facial_features_mask = segment_hair_focused(image, face_crop_region, scales=[512, 768, 1024])
+            hair_mask, facial_features_mask = segment_hair_focused(
+                image, face_crop_region, scales=[512, 768, 1024],
+                hair_class_id=hair_class_id, neck_class_id=neck_class_id
+            )
         else:
-            hair_mask, facial_features_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+            hair_mask, facial_features_mask = multi_scale_segment_hair(
+                image, scales=[512, 768, 1024],
+                hair_class_id=hair_class_id, neck_class_id=neck_class_id
+            )
         
         # Apply guided filter to refine hair mask edges
         if use_guided_filter:
@@ -2081,7 +3929,7 @@ def create_user_masked_image(image: np.ndarray, face_buffer_px: int = 25, sharpe
         seg_map_full = cv2.resize(seg_map.astype(np.uint8), (original_w, original_h), 
                                    interpolation=cv2.INTER_NEAREST)
         
-        hair_mask = (seg_map_full == HAIR_CLASS_ID).astype(np.uint8)
+        hair_mask = (seg_map_full == hair_class_id).astype(np.uint8)
         skin_mask = (seg_map_full == SKIN_CLASS_ID).astype(np.uint8)
         seg_map = seg_map_full
         
@@ -2102,7 +3950,7 @@ def create_user_masked_image(image: np.ndarray, face_buffer_px: int = 25, sharpe
     log_debug(f"[USER MASK] Ear pixels detected: {ear_pixels}")
     
     # Get neck mask - will be limited to face bounds later
-    neck_mask_raw = (seg_map_full == NECK_ID).astype(np.uint8)
+    neck_mask_raw = (seg_map_full == neck_class_id).astype(np.uint8)
     neck_pixels_raw = np.sum(neck_mask_raw)
     log_debug(f"[USER MASK] Neck pixels detected (raw): {neck_pixels_raw}")
     
@@ -2328,7 +4176,21 @@ def create_hair_only_mask(image: np.ndarray, buffer_px: int = 25, sharpen: bool 
         If return_masks=True: (output, hair_mask, facial_mask) tuple
     """
     log_debug(f"[HAIR ONLY] Starting - buffer={buffer_px}px, sharpen={sharpen}, multi_scale={use_multi_scale}, guided_filter={use_guided_filter}")
+
+    # Use the raw dynamic pipeline as canonical implementation for hair-only masks.
+    # This avoids failures when model class maps differ from hardcoded IDs.
+    raw_output, raw_hair_mask, raw_facial_mask = create_hair_only_mask_raw(
+        image,
+        return_masks=True,
+        hair_buffer_px=max(0, int(buffer_px)),
+        sharpen=sharpen,
+        blot_eyes=True
+    )
+    if return_masks:
+        return raw_output, raw_hair_mask, raw_facial_mask
+    return raw_output
     
+    # Legacy path (kept for reference; currently bypassed by early return above)
     # Keep original for guided filter
     original_image = image.copy()
     
@@ -2339,10 +4201,16 @@ def create_hair_only_mask(image: np.ndarray, buffer_px: int = 25, sharpen: bool 
     
     original_h, original_w = image.shape[:2]
     log_debug(f"[HAIR ONLY] Image size: {original_w}x{original_h}")
+
+    hair_class_id, neck_class_id = get_dynamic_hair_neck_ids_for_image(original_image)
+    log_debug(f"[HAIR ONLY] Resolved class IDs: hair={hair_class_id}, neck={neck_class_id}")
     
     if use_multi_scale:
         # Use multi-scale segmentation for better hair detection
-        hair_mask, ms_facial_mask = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+        hair_mask, ms_facial_mask = multi_scale_segment_hair(
+            image, scales=[512, 768, 1024],
+            hair_class_id=hair_class_id, neck_class_id=neck_class_id
+        )
         
         hair_pixels_before_filter = np.sum(hair_mask)
         log_debug(f"[HAIR ONLY] Multi-scale raw hair pixels: {hair_pixels_before_filter}")
@@ -2389,22 +4257,21 @@ def create_hair_only_mask(image: np.ndarray, buffer_px: int = 25, sharpen: bool 
         # PRIMARY: Create hair mask with buffer
         # Note: BiSeNet sometimes classifies certain hairstyles (waves, locs, braids) as "hat" (class 18)
         # We use class 18 as fallback if no hair is detected in class 17
-        HAT_CLASS_ID = 18
-        
-        hair_mask = (seg_map_full == HAIR_CLASS_ID).astype(np.uint8)
+        hair_mask = (seg_map_full == hair_class_id).astype(np.uint8)
         hair_pixels = np.sum(hair_mask)
-        log_debug(f"[HAIR ONLY] Class 17 (hair) pixels: {hair_pixels}")
+        log_debug(f"[HAIR ONLY] Class {hair_class_id} (hair) pixels: {hair_pixels}")
         
-        # Fallback: If no hair detected, check class 18 (hat/cloth) which often catches waves/locs/braids
-        if hair_pixels < 1000:  # Threshold for "no meaningful hair detected"
-            hat_mask = (seg_map_full == HAT_CLASS_ID).astype(np.uint8)
-            hat_pixels = np.sum(hat_mask)
-            log_debug(f"[HAIR ONLY] Class 18 (hat fallback) pixels: {hat_pixels}")
-            
-            if hat_pixels > hair_pixels:
-                log_debug(f"[HAIR ONLY] Using class 18 as hair (waves/locs/braids detected)")
-                hair_mask = hat_mask
-                hair_pixels = hat_pixels
+        # Fallback: try alternate known hair ids if current class is weak
+        if hair_pixels < 1000:
+            for alt_id in [HAIR_CLASS_ID, 13]:
+                if alt_id == hair_class_id:
+                    continue
+                alt_mask = (seg_map_full == alt_id).astype(np.uint8)
+                alt_pixels = np.sum(alt_mask)
+                log_debug(f"[HAIR ONLY] Class {alt_id} fallback pixels: {alt_pixels}")
+                if alt_pixels > hair_pixels:
+                    hair_mask = alt_mask
+                    hair_pixels = alt_pixels
         
         log_debug(f"[HAIR ONLY] Final hair pixels: {hair_pixels}")
         
@@ -2424,7 +4291,7 @@ def create_hair_only_mask(image: np.ndarray, buffer_px: int = 25, sharpen: bool 
     # Include skin (class 1) which covers the face including beards/facial hair
     skin_mask = (seg_map_full == SKIN_CLASS_ID).astype(np.uint8)
     # Include neck (class 14) to blot out non-hair body parts
-    neck_mask = (seg_map_full == NECK_ID).astype(np.uint8)
+    neck_mask = (seg_map_full == neck_class_id).astype(np.uint8)
     
     # Combine all non-hair body parts to blot (face, skin, beard, neck, ears)
     all_facial_features = eye_mask | eyebrow_mask | nose_mask | ear_mask | lip_mask | skin_mask | neck_mask
@@ -2562,10 +4429,15 @@ def create_hair_with_skin_border_mask(image: np.ndarray, skin_border_px: int = 1
     log_debug(f"[HAIR+SKIN BORDER] Starting - skin_border={skin_border_px}px, multi_scale={use_multi_scale}")
     
     original_h, original_w = image.shape[:2]
+    hair_class_id, neck_class_id = get_dynamic_hair_neck_ids_for_image(image)
+    log_debug(f"[HAIR+SKIN BORDER] Resolved class IDs: hair={hair_class_id}, neck={neck_class_id}")
     
     # Get hair mask using multi-scale or single-scale
     if use_multi_scale:
-        hair_mask, _ = multi_scale_segment_hair(image, scales=[512, 768, 1024])
+        hair_mask, _ = multi_scale_segment_hair(
+            image, scales=[512, 768, 1024],
+            hair_class_id=hair_class_id, neck_class_id=neck_class_id
+        )
     else:
         session = get_session()
         resized = cv2.resize(image, (512, 512), interpolation=cv2.INTER_LINEAR)
@@ -2581,7 +4453,7 @@ def create_hair_with_skin_border_mask(image: np.ndarray, skin_border_px: int = 1
         seg_map = np.argmax(outputs[0], axis=1)[0]
         seg_map_full = cv2.resize(seg_map.astype(np.uint8), (original_w, original_h), 
                                    interpolation=cv2.INTER_NEAREST)
-        hair_mask = (seg_map_full == HAIR_CLASS_ID).astype(np.uint8)
+        hair_mask = (seg_map_full == hair_class_id).astype(np.uint8)
     
     hair_pixels = np.sum(hair_mask)
     log_debug(f"[HAIR+SKIN BORDER] Hair detected: {hair_pixels} pixels")
@@ -2607,180 +4479,193 @@ def create_hair_with_skin_border_mask(image: np.ndarray, skin_border_px: int = 1
     return output
 
 
-def create_facial_features_only_mask(image: np.ndarray, buffer_px: int = 5, return_masks: bool = False, gray_out_eyes: bool = False, face_border_px: int = 0):
+def create_facial_features_only_mask(
+    image: np.ndarray,
+    buffer_px: int = 5,
+    return_masks: bool = False,
+    gray_out_eyes: bool = False,
+    face_border_px: int = 0,
+    detector_type: str = None,
+    detector_threshold: float = None,
+    pass_scales: list = None,
+    trimap_fg_erode_px: int = None,
+    trimap_unknown_dilate_px: int = None,
+    matting_backend: str = None,
+    modnet_input_size: int = None,
+    edge_decontaminate: bool = None,
+    edge_decontam_strength: float = None
+):
     """
-    Create a mask showing hair (with 20px buffer) and full face (including facial features).
-    Optionally gray out the eyes for privacy/experimentation.
-    Optionally gray out the face interior, keeping only a border at the face edge.
-    
-    Logic:
-    1. Create a mask around the person's hair with a 20px buffer
-    2. Create a mask for skin, neck, and all facial features
-    3. Combine everything to show hair + complete face
-    4. If gray_out_eyes=True, replace eye regions with gray
-    5. If face_border_px>0, gray out face interior, keeping only border visible
-    
-    Result: Hair + full face visible. If gray_out_eyes=True, eyes are grayed out.
-            If face_border_px>0, only face border is visible, interior is gray.
-    
-    Args:
-        image: Input BGR image
-        buffer_px: Pixels to expand the face region (default 5)
-        return_masks: If True, return (output, face_mask) for validation
-        gray_out_eyes: If True, gray out the eye regions (default False)
-        face_border_px: If >0, only show this many pixels at the face edge (default 0 = show full face)
-    
-    Returns:
-        If return_masks=False: output image (np.ndarray)
-        If return_masks=True: (output, face_mask) tuple
+    Hair+face mask that follows the same detector + trimap/matting pipeline used by
+    create_kontext_result_mask_test, while preserving facial_features_only behavior.
     """
-    HAIR_BUFFER_PX = 20  # Fixed 20px buffer for hair
-    FACE_BUFFER_PX = 15  # Buffer around the face region (increased from 5px)
-    EYE_BUFFER_PX = 5    # Buffer around eyes when graying them out
-    log_debug(f"[HAIR+FACE MASK] Starting - hair buffer={HAIR_BUFFER_PX}px, face buffer={buffer_px}px, gray_out_eyes={gray_out_eyes}, face_border_px={face_border_px}")
-    
+    hair_buffer_px = 20
+    face_buffer_px = max(0, int(buffer_px if buffer_px is not None else 5))
+    eye_buffer_px = 5
+
+    detector = resolve_runtime_detector(detector_type or KONTEXT_FACE_DETECTOR or "ultralight")
+    effective_threshold = (
+        float(detector_threshold)
+        if detector_threshold is not None
+        else get_detector_default_threshold(detector)
+    )
+    effective_scales = pass_scales if pass_scales is not None else KONTEXT_MULTI_PASS_SCALES
+
+    faces = detect_faces_multipass(
+        image,
+        detector_type=detector,
+        confidence_threshold=effective_threshold,
+        pass_scales=effective_scales
+    )
+    face_bbox = faces[0]["bbox"] if faces else None
+    face_crop_region = build_face_crop_region_from_bbox(face_bbox, image.shape) if face_bbox is not None else None
+
+    # Reuse the same core hair/facial segmentation path used by kontext_result_mask_test.
+    _, hair_mask_raw, facial_mask_raw = create_hair_only_mask_raw(
+        image,
+        return_masks=True,
+        face_crop_region=face_crop_region,
+        hair_buffer_px=0,
+        sharpen=True,
+        blot_eyes=False,
+        face_bbox_override=face_bbox
+    )
+
     session = get_session()
-    original_h, original_w = image.shape[:2]
-    
-    # Preprocess for BiSeNet
-    resized = cv2.resize(image, (512, 512), interpolation=cv2.INTER_LINEAR)
-    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-    normalized = rgb.astype(np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    normalized = (normalized - mean) / std
-    batched = np.expand_dims(np.transpose(normalized, (2, 0, 1)), axis=0)
-    
-    # Run inference
-    input_name = session.get_inputs()[0].name
-    outputs = session.run(None, {input_name: batched})
-    seg_map = np.argmax(outputs[0], axis=1)[0]
-    
-    # Resize segmentation map to original dimensions
-    seg_map_full = cv2.resize(seg_map.astype(np.uint8), (original_w, original_h), 
-                               interpolation=cv2.INTER_NEAREST)
-    
-    # STEP 1: Create hair mask with 20px buffer
-    hair_mask = (seg_map_full == HAIR_CLASS_ID).astype(np.uint8)
-    hair_pixels = np.sum(hair_mask)
-    log_debug(f"[HAIR+FACE MASK] Hair detected: {hair_pixels} pixels")
-    
-    # Expand hair mask with 20px buffer
-    hair_kernel_size = HAIR_BUFFER_PX * 2 + 1
-    hair_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hair_kernel_size, hair_kernel_size))
-    hair_expanded = cv2.dilate(hair_mask, hair_kernel, iterations=1)
-    hair_expanded_pixels = np.sum(hair_expanded)
-    log_debug(f"[HAIR+FACE MASK] Hair after {HAIR_BUFFER_PX}px buffer: {hair_expanded_pixels} pixels")
-    
-    # STEP 2: Create complete face mask (skin + all facial features)
+    seg_map_full = segment_at_scale(image, 512, session)
+    _, neck_class_id = resolve_dynamic_hair_neck_class_ids(seg_map_full, face_bbox)
+
+    # Build full face region (skin + features + ears + neck).
     face_mask = (
-        (seg_map_full == SKIN_CLASS_ID) |
-        (seg_map_full == NECK_ID) |
-        (seg_map_full == LEFT_EYE_ID) |
-        (seg_map_full == RIGHT_EYE_ID) |
-        (seg_map_full == LEFT_EYEBROW_ID) |
-        (seg_map_full == RIGHT_EYEBROW_ID) |
-        (seg_map_full == NOSE_ID) |
+        facial_mask_raw > 0
+    ) | (
         (seg_map_full == UPPER_LIP_ID) |
         (seg_map_full == LOWER_LIP_ID) |
         (seg_map_full == MOUTH_ID) |
-        (seg_map_full == LEFT_EAR_ID) |
-        (seg_map_full == RIGHT_EAR_ID)
-    ).astype(np.uint8)
-    
-    face_pixels = np.sum(face_mask)
-    log_debug(f"[HAIR+FACE MASK] Face (skin + features) detected: {face_pixels} pixels")
-    
-    # Expand face mask with buffer for clean coverage
-    face_kernel_size = FACE_BUFFER_PX * 2 + 1
-    face_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (face_kernel_size, face_kernel_size))
-    face_expanded = cv2.dilate(face_mask, face_kernel, iterations=1)
-    
-    expanded_face_pixels = np.sum(face_expanded)
-    log_debug(f"[HAIR+FACE MASK] Face after {FACE_BUFFER_PX}px buffer: {expanded_face_pixels} pixels")
-    
-    # STEP 3: Create output - combine hair and face
-    # Start with gray background
-    output = np.full_like(image, GRAY_BG, dtype=np.uint8)
-    
-    # Show hair region (with buffer)
-    output[hair_expanded > 0] = image[hair_expanded > 0]
-    
-    # Show full face region (skin + all facial features)
-    output[face_expanded > 0] = image[face_expanded > 0]
-    
-    # STEP 4: Optionally gray out eyes and eyebrows
+        (seg_map_full == neck_class_id)
+    )
+    face_mask = face_mask.astype(np.uint8)
+    face_mask = cleanup_mask(face_mask)
+
+    # Expand hair and face regions for stable boundaries.
+    if hair_buffer_px > 0:
+        hk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (hair_buffer_px * 2 + 1, hair_buffer_px * 2 + 1))
+        hair_expanded = cv2.dilate(hair_mask_raw.astype(np.uint8), hk, iterations=1)
+    else:
+        hair_expanded = hair_mask_raw.astype(np.uint8)
+
+    if face_buffer_px > 0:
+        fk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (face_buffer_px * 2 + 1, face_buffer_px * 2 + 1))
+        face_expanded = cv2.dilate(face_mask, fk, iterations=1)
+    else:
+        face_expanded = face_mask.copy()
+
+    keep_mask = (hair_expanded > 0) | (face_expanded > 0)
+    keep_mask = keep_mask.astype(np.uint8)
+
+    eye_exclusion = np.zeros_like(keep_mask, dtype=np.uint8)
     if gray_out_eyes:
-        # Create eye mask
-        eye_mask = (
-            (seg_map_full == LEFT_EYE_ID) |
-            (seg_map_full == RIGHT_EYE_ID)
-        ).astype(np.uint8)
-        
-        eye_pixels = np.sum(eye_mask)
-        log_debug(f"[HAIR+FACE MASK] Eyes detected: {eye_pixels} pixels")
-        
-        # Create eyebrow mask
-        eyebrow_mask = (
-            (seg_map_full == LEFT_EYEBROW_ID) |
-            (seg_map_full == RIGHT_EYEBROW_ID)
-        ).astype(np.uint8)
-        
-        eyebrow_pixels = np.sum(eyebrow_mask)
-        log_debug(f"[HAIR+FACE MASK] Eyebrows detected: {eyebrow_pixels} pixels")
-        
-        # Expand eye mask with buffer
-        eye_kernel_size = EYE_BUFFER_PX * 2 + 1
-        eye_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (eye_kernel_size, eye_kernel_size))
-        eye_expanded = cv2.dilate(eye_mask, eye_kernel, iterations=1)
-        
-        # Expand eyebrow mask with smaller buffer (3px)
+        eye_mask = ((seg_map_full == LEFT_EYE_ID) | (seg_map_full == RIGHT_EYE_ID)).astype(np.uint8)
+        brow_mask = ((seg_map_full == LEFT_EYEBROW_ID) | (seg_map_full == RIGHT_EYEBROW_ID)).astype(np.uint8)
+
+        if eye_buffer_px > 0:
+            ek = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (eye_buffer_px * 2 + 1, eye_buffer_px * 2 + 1))
+            eye_mask = cv2.dilate(eye_mask, ek, iterations=1)
         eyebrow_buffer_px = 3
-        eyebrow_kernel_size = eyebrow_buffer_px * 2 + 1
-        eyebrow_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (eyebrow_kernel_size, eyebrow_kernel_size))
-        eyebrow_expanded = cv2.dilate(eyebrow_mask, eyebrow_kernel, iterations=1)
-        
-        expanded_eye_pixels = np.sum(eye_expanded)
-        expanded_eyebrow_pixels = np.sum(eyebrow_expanded)
-        log_debug(f"[HAIR+FACE MASK] Eyes after {EYE_BUFFER_PX}px buffer: {expanded_eye_pixels} pixels")
-        log_debug(f"[HAIR+FACE MASK] Eyebrows after {eyebrow_buffer_px}px buffer: {expanded_eyebrow_pixels} pixels")
-        
-        # Gray out the eyes and eyebrows
-        output[eye_expanded > 0] = GRAY_BG
-        output[eyebrow_expanded > 0] = GRAY_BG
-        log_debug(f"[HAIR+FACE MASK] Grayed out {expanded_eye_pixels} eye pixels + {expanded_eyebrow_pixels} eyebrow pixels")
-    
-    # STEP 5: If face_border_px > 0, gray out face interior, keeping only the border
+        bk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (eyebrow_buffer_px * 2 + 1, eyebrow_buffer_px * 2 + 1))
+        brow_mask = cv2.dilate(brow_mask, bk, iterations=1)
+
+        eye_exclusion = ((eye_mask > 0) | (brow_mask > 0)).astype(np.uint8)
+        keep_mask[eye_exclusion > 0] = 0
+
+    face_interior_no_hair = np.zeros_like(keep_mask, dtype=np.uint8)
     if face_border_px > 0:
-        log_debug(f"[HAIR+FACE MASK] Graying out face interior, keeping {face_border_px}px border")
-        
-        # Erode the face mask to get the interior (without the border)
         erode_kernel_size = face_border_px * 2 + 1
         erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_kernel_size, erode_kernel_size))
-        face_interior = cv2.erode(face_expanded, erode_kernel, iterations=1)
-        
-        # Make sure we don't gray out hair - the hair should always be visible
-        # Subtract hair from face interior
-        face_interior_no_hair = cv2.bitwise_and(face_interior, cv2.bitwise_not(hair_expanded))
-        
-        interior_pixels = np.sum(face_interior_no_hair)
-        log_debug(f"[HAIR+FACE MASK] Face interior (to be desaturated): {interior_pixels} pixels")
-        
-        # Desaturate the face interior (convert to grayscale but keep as 3-channel)
-        # This shows the face structure without the skin tones that the model might copy
-        face_interior_mask = face_interior_no_hair > 0
-        if np.any(face_interior_mask):
-            # Get the original face pixels
-            original_face = image[face_interior_mask]
-            # Convert to grayscale using luminance formula
-            gray_values = (0.299 * original_face[:, 2] + 0.587 * original_face[:, 1] + 0.114 * original_face[:, 0]).astype(np.uint8)
-            # Apply as 3-channel grayscale
-            output[face_interior_mask] = np.stack([gray_values, gray_values, gray_values], axis=1)
-        log_debug(f"[HAIR+FACE MASK] Desaturated face interior, keeping {face_border_px}px border in color")
-    
-    visible_pixels = np.sum(np.any(output != GRAY_BG, axis=2))
-    log_debug(f"[HAIR+FACE MASK] Complete - {visible_pixels} visible pixels (hair + face, eyes_grayed={gray_out_eyes}, face_border={face_border_px}px)")
-    
+        face_interior = cv2.erode(face_expanded.astype(np.uint8), erode_kernel, iterations=1)
+        face_interior_no_hair = cv2.bitwise_and(face_interior, cv2.bitwise_not(hair_expanded.astype(np.uint8)))
+        keep_mask[face_interior_no_hair > 0] = 0
+
+    keep_mask = cleanup_mask(keep_mask)
+
+    effective_span = max(hair_buffer_px, face_buffer_px)
+    if trimap_fg_erode_px is None:
+        trimap_fg_erode_px = max(1, min(12, int(round(max(6, effective_span) * 0.20))))
+    else:
+        trimap_fg_erode_px = max(0, int(trimap_fg_erode_px))
+    if trimap_unknown_dilate_px is None:
+        trimap_unknown_dilate_px = max(2, min(24, int(round(max(8, effective_span) * 0.35))))
+    else:
+        trimap_unknown_dilate_px = max(0, int(trimap_unknown_dilate_px))
+
+    exclusion_mask = eye_exclusion if gray_out_eyes else None
+    trimap, _, unknown_band = build_trimap_from_mask(
+        keep_mask,
+        exclusion_mask=exclusion_mask,
+        fg_erode_px=trimap_fg_erode_px,
+        unknown_dilate_px=trimap_unknown_dilate_px
+    )
+
+    requested_backend = (matting_backend or KONTEXT_MATTING_BACKEND or "trimap").strip().lower()
+    effective_backend = resolve_runtime_matting_backend(requested_backend)
+
+    alpha = None
+    if effective_backend == "modnet":
+        alpha = estimate_alpha_with_modnet(
+            image,
+            trimap=trimap,
+            keep_mask=keep_mask,
+            exclusion_mask=exclusion_mask,
+            target_size=modnet_input_size
+        )
+        if alpha is None:
+            effective_backend = "trimap"
+            log_info("[HAIR+FACE MASK] MODNet inference unavailable; using trimap alpha")
+
+    if alpha is None:
+        alpha = estimate_alpha_from_trimap(
+            image,
+            trimap,
+            guided_radius=max(6, trimap_unknown_dilate_px),
+            guided_eps=0.008
+        )
+
+    if np.any(face_interior_no_hair > 0):
+        alpha[face_interior_no_hair > 0] = 0.0
+    if np.any(eye_exclusion > 0):
+        alpha[eye_exclusion > 0] = 0.0
+
+    decontam_enabled = (
+        KONTEXT_EDGE_DECONTAMINATE if edge_decontaminate is None else bool(edge_decontaminate)
+    )
+    decontam_strength = (
+        KONTEXT_EDGE_DECONTAM_STRENGTH
+        if edge_decontam_strength is None
+        else float(edge_decontam_strength)
+    )
+    decontam_strength = float(np.clip(decontam_strength, 0.0, 1.0))
+
+    image_for_comp = image
+    if decontam_enabled and decontam_strength > 0.0:
+        image_for_comp = decontaminate_edge_colors(
+            image,
+            alpha,
+            unknown_band=unknown_band,
+            strength=decontam_strength
+        )
+
+    output = composite_with_alpha(image_for_comp, alpha, background=GRAY_BG)
+    if np.any(eye_exclusion > 0):
+        output[eye_exclusion > 0] = GRAY_BG
+
+    visible_pixels = int(np.sum(np.any(output != GRAY_BG, axis=2)))
+    log_debug(
+        f"[HAIR+FACE MASK] detector={detector} faces={len(faces)} "
+        f"hair_buffer={hair_buffer_px}px face_buffer={face_buffer_px}px "
+        f"gray_out_eyes={gray_out_eyes} face_border_px={face_border_px} "
+        f"matting={effective_backend} visible={visible_pixels}"
+    )
+
     if return_masks:
         return output, face_mask
     return output
@@ -2874,6 +4759,8 @@ def create_reference_image(image: np.ndarray, buffer_px: int = 10, sharpen: bool
     
     session = get_session()
     original_h, original_w = image.shape[:2]
+    hair_class_id, neck_class_id = get_dynamic_hair_neck_ids_for_image(image)
+    log_debug(f"[REF MASK] Resolved class IDs: hair={hair_class_id}, neck={neck_class_id}")
     
     # Preprocess for BiSeNet
     resized = cv2.resize(image, (512, 512), interpolation=cv2.INTER_LINEAR)
@@ -2894,7 +4781,7 @@ def create_reference_image(image: np.ndarray, buffer_px: int = 10, sharpen: bool
                                interpolation=cv2.INTER_NEAREST)
     
     # Create masks for different regions
-    hair_mask = (seg_map_full == HAIR_CLASS_ID).astype(np.uint8)
+    hair_mask = (seg_map_full == hair_class_id).astype(np.uint8)
     skin_mask = (seg_map_full == SKIN_CLASS_ID).astype(np.uint8)
     
     # Get eye positions - we'll gray out everything from the eyes down
@@ -3043,47 +4930,331 @@ def main():
                 "height": image.shape[0],
                 "validation": validation
             }
-        elif mode == "hair_only_kontext":
-            # Dedicated Kontext Stage 1 mask pipeline (hair-only + 30px buffer).
-            hair_only, hair_mask, facial_mask = create_hair_only_mask_kontext(image, return_masks=True, hair_buffer_px=30)
+        elif mode == "kontext_result_mask_test":
+            # Kontext Stage-1 mask test with configurable face detector comparison.
+            buffer_px = int(input_data.get("bufferPx", 30))
+            detector_type = str(input_data.get("detectorType", KONTEXT_FACE_DETECTOR)).strip().lower()
+            effective_detector_type = resolve_runtime_detector(detector_type)
+            requested_matting_backend = str(
+                input_data.get("mattingBackend", KONTEXT_MATTING_BACKEND)
+            ).strip().lower()
+            effective_matting_backend = resolve_runtime_matting_backend(requested_matting_backend)
 
-            validation = validate_hair_mask(hair_mask, facial_mask, image.shape)
-            log_debug(f"[HAIR ONLY KONTEXT] Validation: valid={validation['valid']}, score={validation['score']}, issues={validation['issues']}")
+            modnet_input_size = input_data.get("modnetInputSize", None)
+            if modnet_input_size is not None:
+                try:
+                    modnet_input_size = int(modnet_input_size)
+                except Exception:
+                    modnet_input_size = None
 
-            success, buffer = cv2.imencode('.png', hair_only)
-            if not success:
-                raise ValueError("Failed to encode hair-only kontext image")
-            hair_only_base64 = f"data:image/png;base64,{base64.b64encode(buffer).decode('utf-8')}"
+            edge_decontaminate = parse_boolish(
+                input_data.get("edgeDecontaminate", KONTEXT_EDGE_DECONTAMINATE),
+                default=KONTEXT_EDGE_DECONTAMINATE
+            )
+            edge_decontam_strength = input_data.get("edgeDecontamStrength", KONTEXT_EDGE_DECONTAM_STRENGTH)
+            try:
+                edge_decontam_strength = float(edge_decontam_strength)
+            except Exception:
+                edge_decontam_strength = KONTEXT_EDGE_DECONTAM_STRENGTH
+            edge_decontam_strength = float(np.clip(edge_decontam_strength, 0.0, 1.0))
 
-            output = {
-                "success": True,
-                "hairOnlyImage": hair_only_base64,
-                "width": image.shape[1],
-                "height": image.shape[0],
-                "validation": validation
-            }
-        elif mode == "kontext_face_hair":
-            # Kontext mask using user-mask hybrid segmentation, but with face + hair visible.
-            face_hair, hair_mask, facial_mask = create_kontext_face_hair_mask_user_style(
-                image,
-                return_masks=True,
-                include_neck=True
+            detector_threshold = input_data.get("detectorThreshold", None)
+            if detector_threshold is not None:
+                try:
+                    detector_threshold = float(detector_threshold)
+                except Exception:
+                    detector_threshold = None
+
+            pass_scales = input_data.get("detectorPassScales", None)
+            if isinstance(pass_scales, str):
+                pass_scales = parse_multipass_scales(pass_scales)
+            elif isinstance(pass_scales, list):
+                parsed = []
+                for s in pass_scales:
+                    try:
+                        v = float(s)
+                        if 0.6 <= v <= 2.0:
+                            parsed.append(v)
+                    except Exception:
+                        continue
+                pass_scales = parsed if parsed else KONTEXT_MULTI_PASS_SCALES
+            else:
+                pass_scales = KONTEXT_MULTI_PASS_SCALES
+
+            effective_detector_threshold = (
+                float(detector_threshold)
+                if detector_threshold is not None
+                else get_detector_default_threshold(effective_detector_type)
+            )
+            trimap_fg_erode_px = input_data.get("trimapFgErodePx", None)
+            if trimap_fg_erode_px is not None:
+                try:
+                    trimap_fg_erode_px = int(trimap_fg_erode_px)
+                except Exception:
+                    trimap_fg_erode_px = None
+            resolved_trimap_fg_erode_px = (
+                trimap_fg_erode_px
+                if trimap_fg_erode_px is not None
+                else max(1, min(12, int(round(max(6, buffer_px) * 0.20))))
             )
 
-            validation = validate_hair_mask(hair_mask, facial_mask, image.shape)
-            log_debug(f"[KONTEXT FACE+HAIR] Validation: valid={validation['valid']}, score={validation['score']}, issues={validation['issues']}")
+            trimap_unknown_dilate_px = input_data.get("trimapUnknownDilatePx", None)
+            if trimap_unknown_dilate_px is not None:
+                try:
+                    trimap_unknown_dilate_px = int(trimap_unknown_dilate_px)
+                except Exception:
+                    trimap_unknown_dilate_px = None
+            resolved_trimap_unknown_dilate_px = (
+                trimap_unknown_dilate_px
+                if trimap_unknown_dilate_px is not None
+                else max(2, min(24, int(round(max(8, buffer_px) * 0.35))))
+            )
 
-            success, buffer = cv2.imencode('.png', face_hair)
+            debug_result = create_kontext_result_mask_test(
+                image,
+                return_masks=True,
+                buffer_px=buffer_px,
+                detector_type=effective_detector_type,
+                detector_threshold=effective_detector_threshold,
+                pass_scales=pass_scales,
+                return_debug=True,
+                trimap_fg_erode_px=resolved_trimap_fg_erode_px,
+                trimap_unknown_dilate_px=resolved_trimap_unknown_dilate_px,
+                matting_backend=effective_matting_backend,
+                modnet_input_size=modnet_input_size,
+                edge_decontaminate=edge_decontaminate,
+                edge_decontam_strength=edge_decontam_strength
+            )
+            if len(debug_result) >= 6:
+                kontext_mask, hair_mask, facial_mask, trimap, alpha_matte, debug_meta = debug_result
+            else:
+                kontext_mask, hair_mask, facial_mask, trimap, alpha_matte = debug_result
+                debug_meta = {
+                    "mattingBackendRequested": requested_matting_backend,
+                    "mattingBackendUsed": effective_matting_backend,
+                    "edgeDecontaminate": bool(edge_decontaminate),
+                    "edgeDecontamStrength": float(edge_decontam_strength),
+                }
+
+            validation = validate_hair_mask(hair_mask, facial_mask, image.shape)
+            log_debug(f"[KONTEXT RESULT MASK TEST] Validation: valid={validation['valid']}, score={validation['score']}, issues={validation['issues']}")
+
+            success, buffer = cv2.imencode('.png', kontext_mask)
             if not success:
-                raise ValueError("Failed to encode kontext face+hair image")
-            face_hair_base64 = f"data:image/png;base64,{base64.b64encode(buffer).decode('utf-8')}"
+                raise ValueError("Failed to encode kontext result mask test image")
+            kontext_base64 = f"data:image/png;base64,{base64.b64encode(buffer).decode('utf-8')}"
+
+            success, trimap_buffer = cv2.imencode('.png', trimap)
+            if not success:
+                raise ValueError("Failed to encode kontext trimap image")
+            trimap_base64 = f"data:image/png;base64,{base64.b64encode(trimap_buffer).decode('utf-8')}"
+
+            success, alpha_buffer = cv2.imencode('.png', alpha_matte)
+            if not success:
+                raise ValueError("Failed to encode kontext alpha matte image")
+            alpha_base64 = f"data:image/png;base64,{base64.b64encode(alpha_buffer).decode('utf-8')}"
 
             output = {
                 "success": True,
-                "hairOnlyImage": face_hair_base64,
+                "hairOnlyImage": kontext_base64,
+                "trimapImage": trimap_base64,
+                "alphaMatte": alpha_base64,
                 "width": image.shape[1],
                 "height": image.shape[0],
-                "validation": validation
+                "validation": validation,
+                "trimapStats": {
+                    "foregroundPixels": int(np.sum(trimap == 255)),
+                    "unknownPixels": int(np.sum(trimap == 128)),
+                    "backgroundPixels": int(np.sum(trimap == 0))
+                },
+                "detector": {
+                    "type": effective_detector_type,
+                    "threshold": effective_detector_threshold,
+                    "passScales": pass_scales
+                },
+                "matting": {
+                    "requestedBackend": debug_meta.get("mattingBackendRequested", requested_matting_backend),
+                    "usedBackend": debug_meta.get("mattingBackendUsed", effective_matting_backend),
+                    "modnetModelPath": str(MODNET_MODEL_PATH),
+                    "modnetModelAvailable": bool(MODNET_MODEL_PATH.exists()),
+                    "modnetInputSize": int(modnet_input_size) if modnet_input_size is not None else int(MODNET_INPUT_SIZE),
+                    "edgeDecontaminate": bool(debug_meta.get("edgeDecontaminate", edge_decontaminate)),
+                    "edgeDecontamStrength": float(debug_meta.get("edgeDecontamStrength", edge_decontam_strength)),
+                },
+                "trimapParams": {
+                    "fgErodePx": int(resolved_trimap_fg_erode_px),
+                    "unknownDilatePx": int(resolved_trimap_unknown_dilate_px)
+                }
+            }
+        elif mode == "kontext_result_mask_test_v2":
+            # Kontext Stage-1 mask test V2: coarse mask -> ROI crop -> refined re-segmentation -> trimap/alpha.
+            buffer_px = int(input_data.get("bufferPx", 30))
+            detector_type = str(input_data.get("detectorType", KONTEXT_FACE_DETECTOR)).strip().lower()
+            effective_detector_type = resolve_runtime_detector(detector_type)
+            requested_matting_backend = str(
+                input_data.get("mattingBackend", KONTEXT_MATTING_BACKEND)
+            ).strip().lower()
+            effective_matting_backend = resolve_runtime_matting_backend(requested_matting_backend)
+            roi_dilate_px = input_data.get("roiDilatePx", 100)
+            try:
+                roi_dilate_px = int(roi_dilate_px)
+            except Exception:
+                roi_dilate_px = 100
+            roi_dilate_px = max(10, int(roi_dilate_px))
+
+            modnet_input_size = input_data.get("modnetInputSize", None)
+            if modnet_input_size is not None:
+                try:
+                    modnet_input_size = int(modnet_input_size)
+                except Exception:
+                    modnet_input_size = None
+
+            edge_decontaminate = parse_boolish(
+                input_data.get("edgeDecontaminate", KONTEXT_EDGE_DECONTAMINATE),
+                default=KONTEXT_EDGE_DECONTAMINATE
+            )
+            edge_decontam_strength = input_data.get("edgeDecontamStrength", KONTEXT_EDGE_DECONTAM_STRENGTH)
+            try:
+                edge_decontam_strength = float(edge_decontam_strength)
+            except Exception:
+                edge_decontam_strength = KONTEXT_EDGE_DECONTAM_STRENGTH
+            edge_decontam_strength = float(np.clip(edge_decontam_strength, 0.0, 1.0))
+
+            detector_threshold = input_data.get("detectorThreshold", None)
+            if detector_threshold is not None:
+                try:
+                    detector_threshold = float(detector_threshold)
+                except Exception:
+                    detector_threshold = None
+
+            pass_scales = input_data.get("detectorPassScales", None)
+            if isinstance(pass_scales, str):
+                pass_scales = parse_multipass_scales(pass_scales)
+            elif isinstance(pass_scales, list):
+                parsed = []
+                for s in pass_scales:
+                    try:
+                        v = float(s)
+                        if 0.6 <= v <= 2.0:
+                            parsed.append(v)
+                    except Exception:
+                        continue
+                pass_scales = parsed if parsed else KONTEXT_MULTI_PASS_SCALES
+            else:
+                pass_scales = KONTEXT_MULTI_PASS_SCALES
+
+            effective_detector_threshold = (
+                float(detector_threshold)
+                if detector_threshold is not None
+                else get_detector_default_threshold(effective_detector_type)
+            )
+            trimap_fg_erode_px = input_data.get("trimapFgErodePx", None)
+            if trimap_fg_erode_px is not None:
+                try:
+                    trimap_fg_erode_px = int(trimap_fg_erode_px)
+                except Exception:
+                    trimap_fg_erode_px = None
+            resolved_trimap_fg_erode_px = (
+                trimap_fg_erode_px
+                if trimap_fg_erode_px is not None
+                else max(1, min(12, int(round(max(6, buffer_px) * 0.20))))
+            )
+
+            trimap_unknown_dilate_px = input_data.get("trimapUnknownDilatePx", None)
+            if trimap_unknown_dilate_px is not None:
+                try:
+                    trimap_unknown_dilate_px = int(trimap_unknown_dilate_px)
+                except Exception:
+                    trimap_unknown_dilate_px = None
+            resolved_trimap_unknown_dilate_px = (
+                trimap_unknown_dilate_px
+                if trimap_unknown_dilate_px is not None
+                else max(2, min(24, int(round(max(8, buffer_px) * 0.35))))
+            )
+
+            debug_result = create_kontext_result_mask_test_v2(
+                image,
+                return_masks=True,
+                buffer_px=buffer_px,
+                detector_type=effective_detector_type,
+                detector_threshold=effective_detector_threshold,
+                pass_scales=pass_scales,
+                return_debug=True,
+                trimap_fg_erode_px=resolved_trimap_fg_erode_px,
+                trimap_unknown_dilate_px=resolved_trimap_unknown_dilate_px,
+                matting_backend=effective_matting_backend,
+                modnet_input_size=modnet_input_size,
+                edge_decontaminate=edge_decontaminate,
+                edge_decontam_strength=edge_decontam_strength,
+                roi_dilate_px=roi_dilate_px
+            )
+            if len(debug_result) >= 6:
+                kontext_mask, hair_mask, facial_mask, trimap, alpha_matte, debug_meta = debug_result
+            else:
+                kontext_mask, hair_mask, facial_mask, trimap, alpha_matte = debug_result
+                debug_meta = {
+                    "mattingBackendRequested": requested_matting_backend,
+                    "mattingBackendUsed": effective_matting_backend,
+                    "edgeDecontaminate": bool(edge_decontaminate),
+                    "edgeDecontamStrength": float(edge_decontam_strength),
+                    "roiDilatePx": int(roi_dilate_px),
+                }
+
+            validation = validate_hair_mask(hair_mask, facial_mask, image.shape)
+            log_debug(f"[KONTEXT RESULT MASK TEST V2] Validation: valid={validation['valid']}, score={validation['score']}, issues={validation['issues']}")
+
+            success, buffer = cv2.imencode('.png', kontext_mask)
+            if not success:
+                raise ValueError("Failed to encode kontext result mask test v2 image")
+            kontext_base64 = f"data:image/png;base64,{base64.b64encode(buffer).decode('utf-8')}"
+
+            success, trimap_buffer = cv2.imencode('.png', trimap)
+            if not success:
+                raise ValueError("Failed to encode kontext v2 trimap image")
+            trimap_base64 = f"data:image/png;base64,{base64.b64encode(trimap_buffer).decode('utf-8')}"
+
+            success, alpha_buffer = cv2.imencode('.png', alpha_matte)
+            if not success:
+                raise ValueError("Failed to encode kontext v2 alpha matte image")
+            alpha_base64 = f"data:image/png;base64,{base64.b64encode(alpha_buffer).decode('utf-8')}"
+
+            output = {
+                "success": True,
+                "hairOnlyImage": kontext_base64,
+                "trimapImage": trimap_base64,
+                "alphaMatte": alpha_base64,
+                "width": image.shape[1],
+                "height": image.shape[0],
+                "validation": validation,
+                "trimapStats": {
+                    "foregroundPixels": int(np.sum(trimap == 255)),
+                    "unknownPixels": int(np.sum(trimap == 128)),
+                    "backgroundPixels": int(np.sum(trimap == 0))
+                },
+                "detector": {
+                    "type": effective_detector_type,
+                    "threshold": effective_detector_threshold,
+                    "passScales": pass_scales
+                },
+                "matting": {
+                    "requestedBackend": debug_meta.get("mattingBackendRequested", requested_matting_backend),
+                    "usedBackend": debug_meta.get("mattingBackendUsed", effective_matting_backend),
+                    "modnetModelPath": str(MODNET_MODEL_PATH),
+                    "modnetModelAvailable": bool(MODNET_MODEL_PATH.exists()),
+                    "modnetInputSize": int(modnet_input_size) if modnet_input_size is not None else int(MODNET_INPUT_SIZE),
+                    "edgeDecontaminate": bool(debug_meta.get("edgeDecontaminate", edge_decontaminate)),
+                    "edgeDecontamStrength": float(debug_meta.get("edgeDecontamStrength", edge_decontam_strength)),
+                },
+                "trimapParams": {
+                    "fgErodePx": int(resolved_trimap_fg_erode_px),
+                    "unknownDilatePx": int(resolved_trimap_unknown_dilate_px)
+                },
+                "roi": {
+                    "dilatePx": int(debug_meta.get("roiDilatePx", roi_dilate_px)),
+                    "bbox": debug_meta.get("roiBBox"),
+                    "coarseHairPixels": int(debug_meta.get("coarseHairPixels", 0)),
+                    "refinedHairPixels": int(debug_meta.get("refinedHairPixels", 0)),
+                }
             }
         elif mode == "hair_only_simple":
             # SIMPLER hair-only mask: single-scale, no guided filter, but SAME buffer as advanced
@@ -3100,7 +5271,7 @@ def main():
             
             # Run validation on the mask
             validation = validate_hair_mask(hair_mask, facial_mask, image.shape)
-            print(f"[HAIR ONLY SIMPLE] Validation: valid={validation['valid']}, score={validation['score']}, issues={validation['issues']}")
+            log_debug(f"[HAIR ONLY SIMPLE] Validation: valid={validation['valid']}, score={validation['score']}, issues={validation['issues']}")
             
             # Encode as PNG for lossless output
             success, buffer = cv2.imencode('.png', hair_only)
@@ -3180,11 +5351,12 @@ def main():
                 "featurePixels": feature_pixels
             }
         elif mode == "user_mask":
-            # Create user masked image: everything visible EXCEPT hair (hair replaced with gray)
+            # Create user masked image using the facial_features_only pipeline
+            # (hair + full face visible, background grayed).
             buffer_px = input_data.get("bufferPx", 10)
             hairline_visible_px = input_data.get("hairlineVisiblePx", 20)  # Pixels of hair to show above hairline
             validate_quality = input_data.get("validateQuality", True)  # New flag for quality check
-            include_neck = input_data.get("includeNeck", True)  # Whether to include neck in visible area
+            include_neck = input_data.get("includeNeck", False)  # Face-only default (no neck)
             gray_out_background = input_data.get("grayOutBackground", True)  # Gray out background/clothes (default True)
             
             # STEP 1: Run EARLY validation (blur, lighting, size) BEFORE expensive BiSeNet
@@ -3222,13 +5394,31 @@ def main():
                 face_crop_region = face_check["crop_region"]
                 log_debug(f"[USER MASK] Using face-focused processing with crop region: {face_crop_region}")
             
-            # STEP 3: Run expensive BiSeNet processing (only after early checks pass)
-            # Enable multi-scale for better detection of close-cropped styles (waves, fades, etc.)
-            user_masked, face_mask, facial_features_mask = create_user_masked_image(
-                image, buffer_px, use_multi_scale=True, return_masks=True, 
-                hairline_visible_px=hairline_visible_px, face_crop_region=face_crop_region,
-                include_neck=include_neck, gray_out_background=gray_out_background
+            # STEP 3: Run facial_features_only pipeline for user mask output
+            # Keep eyes and full face visible by default so this matches the requested mode.
+            gray_out_eyes = parse_boolish(input_data.get("grayOutEyes", False), default=False)
+            face_border_px = int(input_data.get("faceBorderPx", 0))
+            user_masked, face_mask = create_facial_features_only_mask(
+                image,
+                buffer_px=buffer_px,
+                return_masks=True,
+                gray_out_eyes=gray_out_eyes,
+                face_border_px=face_border_px
             )
+
+            # Build an explicit facial features mask for validation metrics.
+            session = get_session()
+            seg_map_for_features = segment_at_scale(image, 512, session)
+            facial_features_mask = (
+                (seg_map_for_features == LEFT_EYEBROW_ID) |
+                (seg_map_for_features == RIGHT_EYEBROW_ID) |
+                (seg_map_for_features == LEFT_EYE_ID) |
+                (seg_map_for_features == RIGHT_EYE_ID) |
+                (seg_map_for_features == NOSE_ID) |
+                (seg_map_for_features == UPPER_LIP_ID) |
+                (seg_map_for_features == LOWER_LIP_ID) |
+                (seg_map_for_features == MOUTH_ID)
+            ).astype(np.uint8)
             
             # Run validation on the user mask
             # Pass ultralight_face_found=True if face detector found a face (more lenient validation)

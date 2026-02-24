@@ -838,15 +838,14 @@ export async function generateHairMaskReplicate(imageBase64: string, maxRetries:
 }
 
 /**
- * Create a user masked image showing EVERYTHING EXCEPT the hair
- * Result: Hair region replaced with gray (200,200,200), everything else shows original pixels
- * This tells FLUX which area to replace with the new hairstyle
+ * Create a user mask showing FACE ONLY (hair/background grayed).
+ * This tells FLUX which face/head identity to preserve.
  * Uses local Python BiSeNet pipeline with "user_mask" mode
  * 
  * @param bufferPx - Number of pixels to expand the face mask (default 10)
  * @param includeValidation - Whether to return validation data (default false)
  * @param hairlineVisiblePx - Pixels of hair to show above the hairline (default 5)
- * @param includeNeck - Whether to include neck in the visible area (default true)
+ * @param includeNeck - Whether to include neck in the visible area (default false)
  */
 export async function createUserMaskedImage(
   imageBase64: string, 
@@ -869,7 +868,7 @@ export async function createUserMaskedImage(
   bufferPx: number = 10,
   includeValidation: boolean = false,
   hairlineVisiblePx: number = 0,
-  includeNeck: boolean = true,
+  includeNeck: boolean = false,
   grayOutBackground: boolean = true
 ): Promise<string | null | MaskResult> {
   try {
@@ -1026,9 +1025,9 @@ export interface PhotoQualityValidation {
  */
 async function callBiSeNetPipeline(
   imageBase64: string,
-  mode: "hair_only" | "hair_only_simple" | "hair_only_ultra" | "hair_only_kontext" | "kontext_face_hair" | "reference" | "reference_face_masked" | "facial_features_only" | "hair_with_skin_border",
+  mode: "hair_only" | "hair_only_simple" | "hair_only_ultra" | "kontext_result_mask_test" | "kontext_result_mask_test_v2" | "reference" | "reference_face_masked" | "facial_features_only" | "hair_with_skin_border",
   bufferPx: number,
-  options?: { grayOutEyes?: boolean; skinBorderPx?: number; faceBorderPx?: number }
+  options?: { grayOutEyes?: boolean; skinBorderPx?: number; faceBorderPx?: number; roiDilatePx?: number }
 ): Promise<{ result: string | null; width: number; height: number; validation?: MaskValidation }> {
   // Ensure we have a proper data URI
   let inputImage = imageBase64;
@@ -1042,24 +1041,19 @@ async function callBiSeNetPipeline(
     }
   }
 
-  // Normalize EXIF orientation.
-  // IMPORTANT: hair_only_ultra already does its own internal sharpening/refinement in Python.
-  // Applying extra sharpening here can skew segmentation toward neck/skin on Kontext outputs.
+  // Normalize EXIF orientation and sharpen for better edge detection
   const rawBuffer = Buffer.from(
     inputImage.replace(/^data:image\/\w+;base64,/, ''),
     'base64'
   );
   
-  const baseProcessor = sharp(rawBuffer).rotate();
-  const shouldSharpenBeforeMask = mode !== "hair_only_ultra" && mode !== "hair_only_kontext" && mode !== "kontext_face_hair";
-  const normalizedBuffer = shouldSharpenBeforeMask
-    ? await baseProcessor
-        .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
-        .jpeg({ quality: 95 })
-        .toBuffer()
-    : await baseProcessor
-        .jpeg({ quality: 95 })
-        .toBuffer();
+  // Sharpen reference images before masking to improve hair edge detection
+  // Uses unsharp mask: sigma=1.0, flat=1.0, jagged=2.0 for balanced sharpening
+  const normalizedBuffer = await sharp(rawBuffer)
+    .rotate()
+    .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
+    .jpeg({ quality: 95 })
+    .toBuffer();
   
   const normalizedBase64 = `data:image/jpeg;base64,${normalizedBuffer.toString('base64')}`;
   
@@ -1073,7 +1067,7 @@ async function callBiSeNetPipeline(
     bufferPx: bufferPx,
     grayOutEyes: options?.grayOutEyes || false,
     faceBorderPx: options?.faceBorderPx || 0,
-    skinBorderPx: options?.skinBorderPx || 15
+    roiDilatePx: options?.roiDilatePx
   });
   
   const { result, validation } = await new Promise<{ result: string | null; validation?: MaskValidation }>((resolve) => {
@@ -1097,7 +1091,7 @@ async function callBiSeNetPipeline(
         if (output.success) {
           // Handle different output keys based on mode
           let resultKey = "referenceImage";
-          if (mode === "hair_only" || mode === "hair_only_simple" || mode === "hair_only_ultra" || mode === "hair_only_kontext" || mode === "kontext_face_hair") {
+          if (mode === "hair_only" || mode === "hair_only_simple" || mode === "hair_only_ultra" || mode === "kontext_result_mask_test" || mode === "kontext_result_mask_test_v2") {
             resultKey = "hairOnlyImage";
           } else if (mode === "reference_face_masked") {
             resultKey = "referenceFaceMaskedImage";
@@ -1241,48 +1235,54 @@ export async function createHairOnlyImageUltra(
 }
 
 /**
- * Creates a dedicated hair-only mask for Kontext Stage 1 results.
- * Uses specialized Python mode tuned for generated images.
- * Output: hair-only region with 30px buffer.
+ * Creates a standalone Kontext Stage-1 result mask using the hair_only pipeline.
+ * Output: hair-only mask with 30px buffer around detected hair (face excluded).
  */
-export async function createHairOnlyImageKontext(
-  imageBase64: string
+export async function createKontextResultMaskTest(
+  imageBase64: string,
+  bufferPx: number = 30
 ): Promise<string | null> {
   try {
-    console.log(`Creating dedicated Kontext hair-only mask (30px buffer)...`);
+    console.log(`Creating Kontext result mask test (${bufferPx}px buffer)...`);
 
-    const { result, width, height } = await callBiSeNetPipeline(imageBase64, "hair_only_kontext", 30);
+    // Use raw Stage-1 output for this test pipeline (no TS-side sharpening).
+    const { result, width, height } = await callBiSeNetPipeline(imageBase64, "kontext_result_mask_test", bufferPx);
 
     if (result) {
-      console.log(`✓ Dedicated Kontext hair mask created at ${width}x${height} (30px buffer)`);
+      console.log(`✓ Kontext result mask test created at ${width}x${height} (${bufferPx}px buffer)`);
     }
-
     return result;
   } catch (error: any) {
-    console.error("Error creating dedicated Kontext hair mask:", error);
+    console.error("Error creating Kontext result mask test:", error);
     return null;
   }
 }
 
 /**
- * Creates a Kontext mask using the same hybrid segmentation approach as user mask,
- * but keeps face + hair visible and grays everything else.
+ * Creates Kontext Stage-1 result mask test V2:
+ * coarse high-recall mask -> ROI dilate -> refine on original ROI pixels -> trimap/alpha.
  */
-export async function createKontextFaceHairMask(
-  imageBase64: string
+export async function createKontextResultMaskTestV2(
+  imageBase64: string,
+  bufferPx: number = 30,
+  roiDilatePx: number = 100
 ): Promise<string | null> {
   try {
-    console.log(`Creating Kontext face+hair mask (user-mask-style hybrid segmentation)...`);
+    console.log(`Creating Kontext result mask test V2 (${bufferPx}px buffer, ROI +${roiDilatePx}px)...`);
 
-    const { result, width, height } = await callBiSeNetPipeline(imageBase64, "kontext_face_hair", 0);
+    const { result, width, height } = await callBiSeNetPipeline(
+      imageBase64,
+      "kontext_result_mask_test_v2",
+      bufferPx,
+      { roiDilatePx }
+    );
 
     if (result) {
-      console.log(`✓ Kontext face+hair mask created at ${width}x${height}`);
+      console.log(`✓ Kontext result mask test V2 created at ${width}x${height}`);
     }
-
     return result;
   } catch (error: any) {
-    console.error("Error creating Kontext face+hair mask:", error);
+    console.error("Error creating Kontext result mask test V2:", error);
     return null;
   }
 }
