@@ -5,6 +5,17 @@ import { setupAuth as setupGoogleAuth } from "./googleAuth";
 function registerDisabledAuthRoutes(app: Express, reason: string) {
   console.warn(`[AUTH] Disabled: ${reason}`);
 
+  // Ensure downstream routes can safely call req.isAuthenticated() when auth is disabled.
+  app.use((req: any, _res, next) => {
+    if (typeof req.isAuthenticated !== "function") {
+      req.isAuthenticated = () => false;
+    }
+    if (!req.user) {
+      req.user = null;
+    }
+    next();
+  });
+
   app.get("/api/login", (_req, res) => {
     res.status(503).json({ message: "Authentication is not configured" });
   });
@@ -44,4 +55,3 @@ export async function setupAuth(app: Express) {
 
   registerDisabledAuthRoutes(app, "AUTH_PROVIDER is not set to google or replit");
 }
-

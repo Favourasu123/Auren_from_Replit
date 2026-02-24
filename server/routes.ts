@@ -4433,7 +4433,7 @@ async function generateWithPrecomputedMasks(
 
 // Helper function to get user ID from session
 function getUserId(req: any): string | null {
-  if (!req.isAuthenticated()) return null;
+  if (typeof req.isAuthenticated !== "function" || !req.isAuthenticated()) return null;
   return req.user?.claims?.sub || null;
 }
 
