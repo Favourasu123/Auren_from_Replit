@@ -562,8 +562,8 @@ type FaceAngle = "front" | "three_quarter" | "side" | "tilted" | "unknown";
 
 // Detect face angle in a reference image using GPT-4o-mini vision
 async function detectFaceAngle(base64Image: string): Promise<FaceAngle> {
-  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey) {
     return "unknown";
@@ -1115,8 +1115,8 @@ interface UserPhotoAnalysis {
 // Analyze user photo using GPT-4o-mini vision model
 async function analyzeUserPhoto(photoUrl: string): Promise<UserPhotoAnalysis | null> {
   // Use GPT-4o-mini via Replit AI Integrations for face analysis
-  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey) {
     console.error("OpenAI AI Integrations not configured for vision analysis");
@@ -1332,12 +1332,69 @@ interface CombinedAnalysisResult {
   hairstyleInterpretation: string;
 }
 
+async function interpretHairstylePromptWithGPT(hairstylePrompt: string): Promise<string> {
+  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
+  const fallback = hairstylePrompt.trim();
+
+  if (!openaiApiKey) {
+    console.warn("[PROMPT INTERPRET] OpenAI API key missing, using raw prompt");
+    return fallback;
+  }
+
+  try {
+    console.log(`[PROMPT INTERPRET] Interpreting prompt with GPT-4o-mini: "${fallback.substring(0, 80)}..."`);
+    const response = await fetch(`${openaiBaseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${openaiApiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content: "Rewrite hairstyle requests into a short, precise hairstyle phrase. Return only the phrase."
+          },
+          {
+            role: "user",
+            content: `User hairstyle request: "${fallback}"\nReturn a concise hairstyle phrase (3-15 words), no quotes.`
+          }
+        ],
+        max_tokens: 60,
+        temperature: 0.1,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.warn(`[PROMPT INTERPRET] GPT error ${response.status}, using raw prompt: ${errorText}`);
+      return fallback;
+    }
+
+    const data = await response.json();
+    const interpreted = data.choices?.[0]?.message?.content?.trim();
+    if (!interpreted) {
+      console.warn("[PROMPT INTERPRET] Empty GPT response, using raw prompt");
+      return fallback;
+    }
+
+    const cleaned = interpreted.replace(/^["'\s]+|["'\s]+$/g, "");
+    console.log(`[PROMPT INTERPRET] Interpreted prompt: "${cleaned}"`);
+    return cleaned || fallback;
+  } catch (error) {
+    console.warn("[PROMPT INTERPRET] GPT call failed, using raw prompt:", error);
+    return fallback;
+  }
+}
+
 async function analyzeUserPhotoWithPrompt(
   photoUrl: string,
   hairstylePrompt: string
 ): Promise<CombinedAnalysisResult | null> {
-  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey) {
     console.error("OpenAI API key not configured for combined analysis");
@@ -1566,8 +1623,8 @@ async function analyzeReferenceImages(
   referenceImageBase64s: string[],
   userPrompt: string
 ): Promise<string> {
-  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey || referenceImageBase64s.length === 0) {
     return userPrompt;
@@ -1812,8 +1869,8 @@ async function selectTopReferencesWithVision(
   topN: number = 100,  // Rank all candidates, no artificial limit
   hairstyleDescription: string = ""  // Vision model's interpretation of the hairstyle
 ): Promise<VisionSelectionResult> {
-  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   // Config for GPT-4o-mini only selection (no Gemini pre-filter)
   // Max candidates to send to GPT for ranking (default 20)
@@ -2518,8 +2575,8 @@ interface DualImageResult {
 
 // Use vision model to describe hairstyle in reference image
 async function describeHairstyleFromReference(referenceImageUrl: string): Promise<string | null> {
-  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
   
   if (!openaiApiKey) {
     console.error("OpenAI API key not configured for hairstyle description");
@@ -2586,8 +2643,8 @@ async function generateHairstyleWithChatGPT(
   hairstylePrompt: string
 ): Promise<string | null> {
   try {
-    const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-    const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+    const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+    const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
     
     if (!openaiApiKey) {
       console.error("AI_INTEGRATIONS_OPENAI_API_KEY not configured, skipping ChatGPT generation");
@@ -2954,7 +3011,8 @@ async function generateWithKontextRefined(
   referenceBase64: string,
   maskedUserPhoto: string,
   userRace: string = "person",
-  userGender: string = ""
+  userGender: string = "",
+  options?: { promptOnlyMode?: boolean }
 ): Promise<string | null> {
   try {
     if (!BFL_API_KEY) {
@@ -3003,18 +3061,24 @@ async function generateWithKontextRefined(
     console.log(`   - referenceBase64 preview: ${referenceBase64.substring(0, 100)}...`);
     console.log(`   - maskedUserPhoto (for Stage 2): ${maskedUserPhoto?.substring(0, 60) || 'N/A'}...`);
     
+    const promptOnlyMode = options?.promptOnlyMode === true;
+    const stage1Template = promptOnlyMode
+      ? GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE
+      : GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT;
     const kontextPrompt = buildGenerationPrompt(
-      GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT,
+      stage1Template,
       hairstylePrompt,
       userRace,
       userGender
     );
     console.log(`📝 Prompt: ${kontextPrompt}`);
+
+    const stage1InputImage = promptOnlyMode ? normalizedPhotoUrl : referenceBase64;
     
-    // Build Kontext Pro request (SINGLE image: reference only - no user mask)
+    // Build Kontext Pro request.
     const kontextRequestBody: any = {
       prompt: kontextPrompt,
-      input_image: referenceBase64,    // Single image: Reference hairstyle photo (no sharpening)
+      input_image: stage1InputImage,
       width: outputWidth,
       height: outputHeight,
       guidance: GENERATION_CONFIG.KONTEXT_STAGE1_GUIDANCE,
@@ -3023,19 +3087,19 @@ async function generateWithKontextRefined(
     };
     
     console.log(`📦 Kontext request keys: ${Object.keys(kontextRequestBody).join(", ")}`);
-    console.log(`  📤 input_image (reference - single image): ${referenceBase64.length} chars`);
+    console.log(`  📤 input_image (${promptOnlyMode ? "user image" : "reference image"}): ${stage1InputImage.length} chars`);
     
     // DEBUG: Save Stage 1 input for verification (only reference image now)
     const fsDebugInputs = await import("fs/promises");
     try {
-      // Save reference input (single image)
-      if (referenceBase64.startsWith('data:')) {
+      // Save Stage 1 input image
+      if (stage1InputImage.startsWith('data:')) {
         const refInputBuffer = Buffer.from(
-          referenceBase64.replace(/^data:image\/\w+;base64,/, ''),
+          stage1InputImage.replace(/^data:image\/\w+;base64,/, ''),
           'base64'
         );
         await fsDebugInputs.writeFile("/tmp/debug_kontext_stage1_input_ref.jpg", refInputBuffer);
-        console.log(`   ✓ Saved Stage 1 reference to /tmp/debug_kontext_stage1_input_ref.jpg`);
+        console.log(`   ✓ Saved Stage 1 input to /tmp/debug_kontext_stage1_input_ref.jpg`);
       }
     } catch (e) {
       console.warn("Could not save Stage 1 input debug image:", e);
@@ -6691,6 +6755,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const CANDIDATES_TO_ANALYZE = GENERATION_CONFIG.TEXT_MODE_CANDIDATES_TO_ANALYZE;
       const PREFILTER_TOP_N = GENERATION_CONFIG.TEXT_MODE_PREFILTER_TOP_N || 16;
       const USE_VISION_SELECTION = GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION;
+      const USE_DIRECT_KONTEXT_TEXT_MODE = GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT;
       
       // Store pre-fetched references: { base64: string, url: string, source: string }[]
       let prefetchedRefs: { base64: string; url: string; source: string }[] = [];
@@ -6699,10 +6764,49 @@ export async function registerRoutes(app: Express): Promise<Server> {
       let storedSearchQuery: string = ""; // Store search query for auto-refresh
       
       if (textModeVariants.length > 0) {
-        console.log(`[REFS] Pre-fetching for ${textModeVariants.length} text variants (vision: ${USE_VISION_SELECTION ? 'on' : 'off'}, candidates: ${CANDIDATES_TO_ANALYZE})`);
-        
-        try {
-          const firstVariantPrompt = textModeVariants[0].customPrompt!;
+        const firstVariantPrompt = textModeVariants[0].customPrompt!;
+
+        if (USE_DIRECT_KONTEXT_TEXT_MODE) {
+          console.log(`[TEXT MODE] Direct Kontext pipeline enabled (no web reference search)`);
+          visionHairstyleDescription = await interpretHairstylePromptWithGPT(firstVariantPrompt);
+
+          // Load existing user analysis if available; this only helps Stage 2 ethnicity replacement.
+          const cacheKey = generateCacheKey(session.photoUrl);
+          const cached = await preprocessCache.get(cacheKey);
+          if (cached?.userAnalysis) {
+            userAnalysis = cached.userAnalysis;
+          } else if (session.facialFeatures) {
+            try {
+              const f = JSON.parse(session.facialFeatures);
+              userAnalysis = {
+                skinTone: f.skinTone || "medium",
+                skinToneConfidence: 0.5,
+                faceShape: f.faceShape || "oval",
+                faceShapeConfidence: 0.5,
+                gender: f.gender || "female",
+                raceEthnicity: f.raceEthnicity || "natural",
+                raceEthnicityConfidence: 0.5,
+                hairTexture: f.hairTexture || null,
+                currentHairLength: f.currentHairLength || null,
+                faceAngle: f.faceAngle || "front",
+                faceAngleConfidence: 0.5,
+              };
+            } catch {
+              // Ignore malformed stored features.
+            }
+          }
+
+          await storage.updateUserSession(sessionId, {
+            hairstyleDescription: visionHairstyleDescription || firstVariantPrompt,
+            customPrompt: firstVariantPrompt,
+            rankedReferences: null,
+            seenReferenceUrls: [],
+            originalSearchQuery: null,
+          });
+        } else {
+          console.log(`[REFS] Pre-fetching for ${textModeVariants.length} text variants (vision: ${USE_VISION_SELECTION ? 'on' : 'off'}, candidates: ${CANDIDATES_TO_ANALYZE})`);
+
+          try {
           let optimizedSearchQuery = firstVariantPrompt; // Default to raw prompt
           
           // Check for cached preprocess data first
@@ -6953,22 +7057,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
           } else {
             console.warn("[REFS] No reference images found from web search");
           }
-        } catch (refError) {
-          console.warn("[REFS] Pre-fetch failed:", refError);
-        }
-        
-        // Store ranked references in session for generate-more feature
-        if (prefetchedRefs.length > 0) {
-          const firstVariantPrompt = textModeVariants[0].customPrompt!;
-          const seenUrls = prefetchedRefs.map(r => r.url);
-          await storage.updateUserSession(sessionId, {
-            rankedReferences: prefetchedRefs.map(r => ({ url: r.url, source: r.source })),
-            hairstyleDescription: visionHairstyleDescription || firstVariantPrompt,
-            customPrompt: firstVariantPrompt,
-            seenReferenceUrls: seenUrls,
-            originalSearchQuery: storedSearchQuery, // Store for future refresh searches
-          });
-          console.log(`[REFS] Stored ${prefetchedRefs.length} ranked references to session (${seenUrls.length} URLs tracked)`);
+          } catch (refError) {
+            console.warn("[REFS] Pre-fetch failed:", refError);
+          }
+
+          // Store ranked references in session for generate-more feature
+          if (prefetchedRefs.length > 0) {
+            const seenUrls = prefetchedRefs.map(r => r.url);
+            await storage.updateUserSession(sessionId, {
+              rankedReferences: prefetchedRefs.map(r => ({ url: r.url, source: r.source })),
+              hairstyleDescription: visionHairstyleDescription || firstVariantPrompt,
+              customPrompt: firstVariantPrompt,
+              seenReferenceUrls: seenUrls,
+              originalSearchQuery: storedSearchQuery, // Store for future refresh searches
+            });
+            console.log(`[REFS] Stored ${prefetchedRefs.length} ranked references to session (${seenUrls.length} URLs tracked)`);
+          }
         }
       }
 
@@ -7223,6 +7327,42 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 });
                 console.log(`✓ Saved masked user photo to cache (key: ${maskCacheKey.substring(0, 40)}...)`);
               }
+            }
+
+            // Direct text-mode pipeline: GPT prompt interpretation -> Kontext(user image) -> mask -> FLUX
+            if (GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT) {
+              const interpretedPrompt = visionHairstyleDescription || variant.customPrompt!;
+              console.log(`📦 Pipeline: kontext_refined_direct (no web references)`);
+              console.log(`📝 Interpreted prompt: "${interpretedPrompt}"`);
+              const frontImageUrl = await generateWithKontextRefined(
+                session.photoUrl,
+                interpretedPrompt,
+                session.photoUrl,
+                maskedUserPhoto!,
+                userAnalysis?.raceEthnicity || "natural",
+                userAnalysis?.gender || "",
+                { promptOnlyMode: true }
+              );
+
+              if (frontImageUrl) {
+                generationSucceeded = true;
+                await storage.updateGeneratedVariant(variant.id, {
+                  generatedImageUrl: frontImageUrl,
+                  sideImageUrl: null,
+                  webReferenceImageUrl: null,
+                  webReferenceSource: null,
+                  renderType: "ai",
+                  variantIndex: 0,
+                  referenceIndex: 0,
+                  status: "completed",
+                });
+                console.log(`✓ Text mode complete: direct Kontext pipeline`);
+              } else {
+                await storage.updateGeneratedVariant(variant.id, {
+                  status: "failed",
+                });
+              }
+              continue;
             }
             
             // Generate using references with TWO-PHASE approach:
@@ -7762,8 +7902,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       console.log(`[REFINE] 📝 User's refinement request: "${refinementPrompt}"`);
       
       let refinementFullPrompt: string;
-      const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
-      const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || "https://openai.replit.dev/v1";
+      const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
+      const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
       
       if (openaiApiKey && variant.generatedImageUrl) {
         try {
@@ -8947,6 +9087,105 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           await storage.updateGeneratedVariant(newVariant.id, { status: "failed" });
           return res.status(500).json({ error: "Generation failed" });
         }
+      }
+
+      // TEXT MODE: Direct Kontext (no references)
+      if (GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT) {
+        // Use cached masked user photo if available, otherwise create it
+        let maskedUserPhoto: string | null = null;
+        const maskCacheKey = generateCacheKey(sourceSession.photoUrl);
+        const cachedPreprocess = await preprocessCache.get(maskCacheKey);
+        
+        if (cachedPreprocess?.maskedImage && Date.now() - cachedPreprocess.timestamp < 30 * 60 * 1000) {
+          console.log(`🎭 [Generate More] Using CACHED masked user photo`);
+          maskedUserPhoto = cachedPreprocess.maskedImage;
+        } else {
+          console.log(`🎭 [Generate More] Creating masked user photo (cache miss)...`);
+          const userPhotoResponse = await fetch(sourceSession.photoUrl);
+          const userPhotoBuffer = Buffer.from(await userPhotoResponse.arrayBuffer());
+          const userPhotoBase64 = `data:image/jpeg;base64,${userPhotoBuffer.toString('base64')}`;
+          maskedUserPhoto = await createUserMaskedImage(userPhotoBase64, 10);
+          
+          if (maskedUserPhoto) {
+            await preprocessCache.set(maskCacheKey, {
+              ...cachedPreprocess,
+              maskedUserPhoto,
+              maskedImage: maskedUserPhoto,
+              timestamp: Date.now(),
+            });
+          }
+        }
+
+        if (!maskedUserPhoto) {
+          return res.status(500).json({ error: "Failed to create user mask" });
+        }
+
+        const rootSessionId = sourceSession.rootSessionId || sourceSessionId;
+        const deviceId = sourceSession.deviceId || getOrCreateDeviceId(req, res);
+        const basePrompt = sourceSession.customPrompt || sourceVariant.customPrompt || sourceSession.hairstyleDescription || "";
+        const interpretedPrompt = await interpretHairstylePromptWithGPT(basePrompt);
+
+        const newSession = await storage.createUserSession({
+          photoUrl: sourceSession.photoUrl,
+          customPrompt: sourceSession.customPrompt,
+          hairstyleDescription: interpretedPrompt,
+          facialFeatures: sourceSession.facialFeatures,
+          rankedReferences: null,
+          usedReferenceIndex: 0,
+          rootSessionId,
+          deviceId,
+        });
+
+        const newVariant = await storage.createGeneratedVariant({
+          sessionId: newSession.id,
+          hairstyleId: null,
+          customPrompt: sourceSession.customPrompt,
+          inspirationPhotoUrl: null,
+          styleType: "hairstyle",
+          generatedImageUrl: null,
+          status: "processing",
+          referenceIndex: 0,
+        });
+
+        const kontextResult = await generateWithKontextRefined(
+          sourceSession.photoUrl,
+          interpretedPrompt,
+          sourceSession.photoUrl,
+          maskedUserPhoto,
+          userRace,
+          userGender,
+          { promptOnlyMode: true }
+        );
+
+        if (!kontextResult) {
+          await storage.updateGeneratedVariant(newVariant.id, { status: "failed" });
+          return res.status(500).json({ error: "Generation failed" });
+        }
+
+        if (userId) {
+          await storage.deductCredits(userId, creditsNeeded);
+        } else if (!GENERATION_CONFIG.UNLIMITED_CREDITS_DEV) {
+          const currentUsed = getAnonymousCreditsUsed(req);
+          setAnonymousCreditsUsed(res, currentUsed + creditsNeeded, req);
+        }
+
+        await storage.updateGeneratedVariant(newVariant.id, {
+          generatedImageUrl: kontextResult,
+          sideImageUrl: null,
+          webReferenceImageUrl: null,
+          webReferenceSource: null,
+          status: "completed",
+        });
+
+        console.log(`✅ [Generate More] Completed in direct Kontext mode: new session ${newSession.id}`);
+        return res.json({
+          success: true,
+          newSessionId: newSession.id,
+          referenceIndex: 0,
+          remainingReferences: -1,
+          isInspirationMode: false,
+          directKontextMode: true,
+        });
       }
 
       // TEXT MODE: Use ranked references
