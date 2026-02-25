@@ -5351,13 +5351,14 @@ def main():
                 "featurePixels": feature_pixels
             }
         elif mode == "user_mask":
-            # Create user masked image using the facial_features_only pipeline
-            # (hair + full face visible, background grayed).
+            # Create user masked image using strict face-only pipeline
+            # (face visible, hair/neck/background grayed).
             buffer_px = input_data.get("bufferPx", 10)
             hairline_visible_px = input_data.get("hairlineVisiblePx", 20)  # Pixels of hair to show above hairline
             validate_quality = input_data.get("validateQuality", True)  # New flag for quality check
-            include_neck = input_data.get("includeNeck", False)  # Face-only default (no neck)
-            gray_out_background = input_data.get("grayOutBackground", True)  # Gray out background/clothes (default True)
+            # Force face-only behavior for user mask regardless of caller input.
+            include_neck = False
+            gray_out_background = True
             
             # STEP 1: Run EARLY validation (blur, lighting, size) BEFORE expensive BiSeNet
             # This allows fast rejection of obviously bad photos
@@ -5394,31 +5395,12 @@ def main():
                 face_crop_region = face_check["crop_region"]
                 log_debug(f"[USER MASK] Using face-focused processing with crop region: {face_crop_region}")
             
-            # STEP 3: Run facial_features_only pipeline for user mask output
-            # Keep eyes and full face visible by default so this matches the requested mode.
-            gray_out_eyes = parse_boolish(input_data.get("grayOutEyes", False), default=False)
-            face_border_px = int(input_data.get("faceBorderPx", 0))
-            user_masked, face_mask = create_facial_features_only_mask(
+            # STEP 3: Run face-only pipeline for user mask output
+            user_masked, face_mask, facial_features_mask = create_user_face_only_mask_from_kontext_pipeline(
                 image,
-                buffer_px=buffer_px,
                 return_masks=True,
-                gray_out_eyes=gray_out_eyes,
-                face_border_px=face_border_px
+                include_neck=False
             )
-
-            # Build an explicit facial features mask for validation metrics.
-            session = get_session()
-            seg_map_for_features = segment_at_scale(image, 512, session)
-            facial_features_mask = (
-                (seg_map_for_features == LEFT_EYEBROW_ID) |
-                (seg_map_for_features == RIGHT_EYEBROW_ID) |
-                (seg_map_for_features == LEFT_EYE_ID) |
-                (seg_map_for_features == RIGHT_EYE_ID) |
-                (seg_map_for_features == NOSE_ID) |
-                (seg_map_for_features == UPPER_LIP_ID) |
-                (seg_map_for_features == LOWER_LIP_ID) |
-                (seg_map_for_features == MOUTH_ID)
-            ).astype(np.uint8)
             
             # Run validation on the user mask
             # Pass ultralight_face_found=True if face detector found a face (more lenient validation)
