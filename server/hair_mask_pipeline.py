@@ -3702,8 +3702,12 @@ def create_user_face_only_mask_from_kontext_pipeline(
     edge_decontam_strength: float = None,
 ):
     """
-    Face-only user mask using the SAME detector/segmentation/matting path as
-    create_kontext_result_mask_test, but keeping only facial region (no buffer).
+    User mask using the SAME detector/segmentation/matting path as
+    create_kontext_result_mask_test, while keeping:
+      - face
+      - ears
+      - neck (optional)
+      - hair
     """
     detector = resolve_runtime_detector(detector_type or KONTEXT_FACE_DETECTOR or "ultralight")
     faces = detect_faces_multipass(
@@ -3730,8 +3734,7 @@ def create_user_face_only_mask_from_kontext_pipeline(
     seg_map = segment_at_scale(image, 512, session)
     _, neck_class_id = resolve_dynamic_hair_neck_class_ids(seg_map, face_bbox)
 
-    # Build face-only keep mask (explicitly excludes hair and neck).
-    # Keep full facial region so the user mask visibly preserves the whole face.
+    # Build face keep mask (full facial region + ears + optional neck).
     ear_keep = (
         (seg_map == LEFT_EAR_ID)
         | (seg_map == RIGHT_EAR_ID)
@@ -3759,6 +3762,12 @@ def create_user_face_only_mask_from_kontext_pipeline(
 
     face_keep = cleanup_mask(face_keep)
 
+    # Visible user-mask region should include hair + face/ears/neck.
+    # Keep a separate face-only mask for validation metrics.
+    visible_keep = (face_keep > 0) | (hair_mask > 0)
+    visible_keep = visible_keep.astype(np.uint8)
+    visible_keep = cleanup_mask(visible_keep)
+
     if trimap_fg_erode_px is None:
         trimap_fg_erode_px = 1
     else:
@@ -3770,8 +3779,8 @@ def create_user_face_only_mask_from_kontext_pipeline(
         trimap_unknown_dilate_px = max(0, int(trimap_unknown_dilate_px))
 
     trimap, _, unknown_band = build_trimap_from_mask(
-        face_keep,
-        exclusion_mask=hair_mask,
+        visible_keep,
+        exclusion_mask=None,
         fg_erode_px=trimap_fg_erode_px,
         unknown_dilate_px=trimap_unknown_dilate_px,
     )
@@ -3784,13 +3793,13 @@ def create_user_face_only_mask_from_kontext_pipeline(
         alpha = estimate_alpha_with_modnet(
             image,
             trimap=trimap,
-            keep_mask=face_keep,
-            exclusion_mask=hair_mask,
+            keep_mask=visible_keep,
+            exclusion_mask=None,
             target_size=modnet_input_size,
         )
         if alpha is None:
             effective_backend = "trimap"
-            log_info("[USER MASK FACE-ONLY] MODNet inference unavailable; using trimap alpha")
+            log_info("[USER MASK FACE+HAIR] MODNet inference unavailable; using trimap alpha")
 
     if alpha is None:
         alpha = estimate_alpha_from_trimap(
@@ -3830,10 +3839,10 @@ def create_user_face_only_mask_from_kontext_pipeline(
     ).astype(np.uint8)
 
     log_debug(
-        f"[USER MASK FACE-ONLY] detector={detector} faces={len(faces)} "
+        f"[USER MASK FACE+HAIR] detector={detector} faces={len(faces)} "
         f"bbox={face_bbox} include_neck={include_neck} matting={effective_backend} "
         f"trimap(erode={trimap_fg_erode_px}, dilate={trimap_unknown_dilate_px}) "
-        f"face_pixels={int(np.sum(face_keep))}"
+        f"face_pixels={int(np.sum(face_keep))} visible_pixels={int(np.sum(visible_keep))}"
     )
 
     if return_masks:
@@ -3847,8 +3856,8 @@ def create_user_masked_image(image: np.ndarray, face_buffer_px: int = 25, sharpe
                               face_crop_region: tuple = None, include_neck: bool = True,
                               use_raw: bool = True, gray_out_background: bool = True):
     """
-    Create a user masked image showing the face with hair grayed out.
-    This is input_image_2 for FLUX - shows FLUX what face to preserve.
+    Create a user masked image showing face + hair with background grayed out.
+    This is input_image_1 for FLUX - shows FLUX what identity/head region to preserve.
     
     Args:
         image: Input BGR image
@@ -3869,7 +3878,7 @@ def create_user_masked_image(image: np.ndarray, face_buffer_px: int = 25, sharpe
     """
     # Use raw mode by default - simple, accurate, no post-processing
     if use_raw:
-        # No buffer, face-only output using the same core path as kontext_result_mask_test.
+        # No buffer, face+hair output using the same core path as kontext_result_mask_test.
         detector = resolve_runtime_detector(KONTEXT_FACE_DETECTOR or "ultralight")
         det_threshold = get_detector_default_threshold(detector)
         backend = resolve_runtime_matting_backend(KONTEXT_MATTING_BACKEND)
@@ -5381,8 +5390,8 @@ def main():
                 "featurePixels": feature_pixels
             }
         elif mode == "user_mask":
-            # Create user masked image using strict face-only pipeline
-            # (face visible, hair/neck/background grayed).
+            # Create user masked image using face+hair pipeline
+            # (face, ears, neck, and hair visible; background/clothes grayed).
             buffer_px = input_data.get("bufferPx", 10)
             hairline_visible_px = input_data.get("hairlineVisiblePx", 20)  # Pixels of hair to show above hairline
             validate_quality = input_data.get("validateQuality", True)  # New flag for quality check
