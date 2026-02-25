@@ -704,6 +704,38 @@ async function normalizeImageOrientation(base64DataUri: string): Promise<string>
   }
 }
 
+type ChatGPTImageSize = "1024x1024" | "1024x1536" | "1536x1024";
+type ChatGPTImageQuality = "low" | "medium" | "high";
+
+function selectChatGPTImageSize(width: number, height: number): ChatGPTImageSize {
+  const ratio = width / Math.max(1, height);
+  if (ratio > 1.15) return "1536x1024";
+  if (ratio < 0.87) return "1024x1536";
+  return "1024x1024";
+}
+
+async function resizeImageToDimensions(imageDataOrUrl: string, width: number, height: number): Promise<string | null> {
+  try {
+    let base64Image = imageDataOrUrl;
+    if (!base64Image.startsWith("data:")) {
+      const fetched = await fetchImageAsBase64(base64Image);
+      if (!fetched) return null;
+      base64Image = fetched;
+    }
+
+    const rawBase64 = base64Image.includes(",") ? base64Image.split(",")[1] : base64Image;
+    const rawBuffer = Buffer.from(rawBase64, "base64");
+    const resized = await sharp(rawBuffer)
+      .resize(width, height, { fit: "cover", position: "center" })
+      .jpeg({ quality: 95 })
+      .toBuffer();
+    return `data:image/jpeg;base64,${resized.toString("base64")}`;
+  } catch (error) {
+    console.warn(`[STAGE1 RESIZE] Failed to resize image to ${width}x${height}:`, error);
+    return null;
+  }
+}
+
 // Calculate valid FLUX dimensions that preserve aspect ratio
 // FLUX requires: multiples of 16, range 256-1440, max ~2MP (official BFL spec)
 function calculateFluxDimensions(originalWidth: number, originalHeight: number): { width: number; height: number } {
@@ -1330,63 +1362,6 @@ interface CombinedAnalysisResult {
   userAnalysis: UserPhotoAnalysis;
   searchQuery: string;
   hairstyleInterpretation: string;
-}
-
-async function interpretHairstylePromptWithGPT(hairstylePrompt: string): Promise<string> {
-  const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
-  const fallback = hairstylePrompt.trim();
-
-  if (!openaiApiKey) {
-    console.warn("[PROMPT INTERPRET] OpenAI API key missing, using raw prompt");
-    return fallback;
-  }
-
-  try {
-    console.log(`[PROMPT INTERPRET] Interpreting prompt with GPT-4o-mini: "${fallback.substring(0, 80)}..."`);
-    const response = await fetch(`${openaiBaseUrl}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${openaiApiKey}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: "Rewrite hairstyle requests into a short, precise hairstyle phrase. Return only the phrase."
-          },
-          {
-            role: "user",
-            content: `User hairstyle request: "${fallback}"\nReturn a concise hairstyle phrase (3-15 words), no quotes.`
-          }
-        ],
-        max_tokens: 60,
-        temperature: 0.1,
-      }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.warn(`[PROMPT INTERPRET] GPT error ${response.status}, using raw prompt: ${errorText}`);
-      return fallback;
-    }
-
-    const data = await response.json();
-    const interpreted = data.choices?.[0]?.message?.content?.trim();
-    if (!interpreted) {
-      console.warn("[PROMPT INTERPRET] Empty GPT response, using raw prompt");
-      return fallback;
-    }
-
-    const cleaned = interpreted.replace(/^["'\s]+|["'\s]+$/g, "");
-    console.log(`[PROMPT INTERPRET] Interpreted prompt: "${cleaned}"`);
-    return cleaned || fallback;
-  } catch (error) {
-    console.warn("[PROMPT INTERPRET] GPT call failed, using raw prompt:", error);
-    return fallback;
-  }
 }
 
 async function analyzeUserPhotoWithPrompt(
@@ -2640,7 +2615,12 @@ Respond with ONLY a concise description of the hairstyle, no other text. Example
 // Simple pipeline: user photo + text prompt → gpt-image-1 → result (no masks, no references)
 async function generateHairstyleWithChatGPT(
   photoUrl: string,
-  hairstylePrompt: string
+  hairstylePrompt: string,
+  options?: {
+    promptTemplate?: string;
+    imageSize?: ChatGPTImageSize;
+    quality?: ChatGPTImageQuality;
+  }
 ): Promise<string | null> {
   try {
     const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
@@ -2660,11 +2640,15 @@ async function generateHairstyleWithChatGPT(
     console.log("=== ChatGPT gpt-image-1 Generation ===");
     console.log("Photo:", photoUrl.substring(0, 50) + "...");
     console.log("Hairstyle prompt:", hairstylePrompt);
+    const promptTemplate = options?.promptTemplate || GENERATION_CONFIG.CHATGPT_DESCRIBE_PROMPT_TEMPLATE;
+    const imageSize = options?.imageSize || GENERATION_CONFIG.CHATGPT_IMAGE_SIZE;
+    const quality = options?.quality || GENERATION_CONFIG.CHATGPT_IMAGE_QUALITY;
     console.log(`Model: ${GENERATION_CONFIG.CHATGPT_MODEL}`);
-    console.log(`Size: ${GENERATION_CONFIG.CHATGPT_IMAGE_SIZE}`);
+    console.log(`Size: ${imageSize}`);
+    console.log(`Quality: ${quality}`);
 
     // Build the prompt from template
-    const prompt = GENERATION_CONFIG.CHATGPT_DESCRIBE_PROMPT_TEMPLATE.replace("{hairstyle}", hairstylePrompt);
+    const prompt = promptTemplate.replace("{hairstyle}", hairstylePrompt);
     console.log("Full prompt:", prompt);
 
     // Get image as buffer for multipart form upload
@@ -2698,7 +2682,8 @@ async function generateHairstyleWithChatGPT(
       image: imageFile,
       prompt: prompt,
       n: 1,
-      size: GENERATION_CONFIG.CHATGPT_IMAGE_SIZE,
+      size: imageSize,
+      quality,
     });
 
     console.log("OpenAI images.edit response received");
@@ -3012,7 +2997,7 @@ async function generateWithKontextRefined(
   maskedUserPhoto: string,
   userRace: string = "person",
   userGender: string = "",
-  options?: { promptOnlyMode?: boolean }
+  options?: { promptOnlyMode?: boolean; stage1Provider?: "kontext" | "gpt_image" }
 ): Promise<string | null> {
   try {
     if (!BFL_API_KEY) {
@@ -3039,9 +3024,13 @@ async function generateWithKontextRefined(
     // Extract dimensions for output
     let outputWidth = 1024;
     let outputHeight = 1024;
+    let sourceWidth = outputWidth;
+    let sourceHeight = outputHeight;
     if (normalizedPhotoUrl.startsWith("data:")) {
       const inputDims = await getImageDimensions(normalizedPhotoUrl);
       if (inputDims) {
+        sourceWidth = inputDims.width;
+        sourceHeight = inputDims.height;
         const fluxDims = calculateFluxDimensions(inputDims.width, inputDims.height);
         outputWidth = fluxDims.width;
         outputHeight = fluxDims.height;
@@ -3049,10 +3038,27 @@ async function generateWithKontextRefined(
     }
     console.log(`📐 Output dimensions: ${outputWidth}×${outputHeight}`);
     
+    const promptOnlyMode = options?.promptOnlyMode === true;
+    const stage1Provider = options?.stage1Provider === "gpt_image" ? "gpt_image" : "kontext";
+    const stage1Template = stage1Provider === "gpt_image"
+      ? GENERATION_CONFIG.CHATGPT_STAGE1_PROMPT_TEMPLATE
+      : (promptOnlyMode ? GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE : GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT);
+    const stage1Prompt = buildGenerationPrompt(
+      stage1Template,
+      hairstylePrompt,
+      userRace,
+      userGender
+    );
+    console.log(`📝 Prompt: ${stage1Prompt}`);
+
+    const stage1InputImage = (stage1Provider === "gpt_image" || promptOnlyMode)
+      ? normalizedPhotoUrl
+      : referenceBase64;
+
     // ============================================
-    // STAGE 1: FLUX Kontext Pro
+    // STAGE 1: Provider-selected generation (Kontext or GPT Image)
     // ============================================
-    console.log(`\n━━━ STAGE 1: FLUX Kontext Pro ━━━`);
+    console.log(`\n━━━ STAGE 1: ${stage1Provider === "gpt_image" ? `GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})` : "FLUX Kontext Pro"} ━━━`);
     
     console.log(`📸 Input validation:`);
     console.log(`   - photoUrl type: ${photoUrl.startsWith('data:') ? 'base64' : 'URL'}`);
@@ -3061,33 +3067,7 @@ async function generateWithKontextRefined(
     console.log(`   - referenceBase64 preview: ${referenceBase64.substring(0, 100)}...`);
     console.log(`   - maskedUserPhoto (for Stage 2): ${maskedUserPhoto?.substring(0, 60) || 'N/A'}...`);
     
-    const promptOnlyMode = options?.promptOnlyMode === true;
-    const stage1Template = promptOnlyMode
-      ? GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE
-      : GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT;
-    const kontextPrompt = buildGenerationPrompt(
-      stage1Template,
-      hairstylePrompt,
-      userRace,
-      userGender
-    );
-    console.log(`📝 Prompt: ${kontextPrompt}`);
-
-    const stage1InputImage = promptOnlyMode ? normalizedPhotoUrl : referenceBase64;
-    
-    // Build Kontext Pro request.
-    const kontextRequestBody: any = {
-      prompt: kontextPrompt,
-      input_image: stage1InputImage,
-      width: outputWidth,
-      height: outputHeight,
-      guidance: GENERATION_CONFIG.KONTEXT_STAGE1_GUIDANCE,
-      safety_tolerance: 0,
-      prompt_upsampling: false,
-    };
-    
-    console.log(`📦 Kontext request keys: ${Object.keys(kontextRequestBody).join(", ")}`);
-    console.log(`  📤 input_image (${promptOnlyMode ? "user image" : "reference image"}): ${stage1InputImage.length} chars`);
+    console.log(`  📤 input_image (${stage1Provider === "gpt_image" || promptOnlyMode ? "user image" : "reference image"}): ${stage1InputImage.length} chars`);
     
     // DEBUG: Save Stage 1 input for verification (only reference image now)
     const fsDebugInputs = await import("fs/promises");
@@ -3105,72 +3085,109 @@ async function generateWithKontextRefined(
       console.warn("Could not save Stage 1 input debug image:", e);
     }
     
-    // Submit Stage 1
-    const kontextSubmitResponse = await fetch(BFL_KONTEXT_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-key": BFL_API_KEY!,
-      },
-      body: JSON.stringify(kontextRequestBody),
-    });
-
-    if (!kontextSubmitResponse.ok) {
-      const errorText = await kontextSubmitResponse.text();
-      console.error(`[KONTEXT] Stage 1 submission error: ${kontextSubmitResponse.status} - ${errorText}`);
-      return null;
-    }
-
-    const kontextSubmitData = await kontextSubmitResponse.json();
-    console.log(`🎫 Kontext submission ID: ${kontextSubmitData.id}`);
-
-    const kontextPollingUrl = kontextSubmitData.polling_url;
-    if (!kontextPollingUrl) {
-      console.error("[KONTEXT] No polling URL returned");
-      return null;
-    }
-
-    // Poll Stage 1
     let kontextResultUrl: string | null = null;
     const maxAttempts = GENERATION_TIMEOUT_SECONDS;
-    let attempts = 0;
     const startTime = Date.now();
-    let lastLogTime = 0;
+    if (stage1Provider === "gpt_image") {
+      const stage1Size = selectChatGPTImageSize(sourceWidth, sourceHeight);
+      const stage1Quality = GENERATION_CONFIG.CHATGPT_IMAGE_QUALITY;
+      console.log(`📦 Stage 1 provider: ${GENERATION_CONFIG.CHATGPT_MODEL}`);
+      console.log(`📦 Stage 1 image options: size=${stage1Size}, quality=${stage1Quality}`);
+      kontextResultUrl = await generateHairstyleWithChatGPT(stage1InputImage, stage1Prompt, {
+        promptTemplate: "{hairstyle}",
+        imageSize: stage1Size,
+        quality: stage1Quality,
+      });
+      if (!kontextResultUrl) {
+        console.error("[GPT STAGE 1] Failed to generate stage 1 image");
+        return null;
+      }
 
-    while (attempts < maxAttempts) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Force exact user-photo dimensions for downstream masking quality.
+      const resizedStage1 = await resizeImageToDimensions(kontextResultUrl, sourceWidth, sourceHeight);
+      if (resizedStage1) {
+        kontextResultUrl = resizedStage1;
+        console.log(`   ✓ Stage 1 resized to user dimensions: ${sourceWidth}x${sourceHeight}`);
+      } else {
+        console.warn("[GPT STAGE 1] Could not enforce exact user dimensions; using original GPT image");
+      }
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      console.log(`   ✓ Stage 1 complete (${elapsed}s)`);
+    } else {
+      const kontextRequestBody: any = {
+        prompt: stage1Prompt,
+        input_image: stage1InputImage,
+        width: outputWidth,
+        height: outputHeight,
+        guidance: GENERATION_CONFIG.KONTEXT_STAGE1_GUIDANCE,
+        safety_tolerance: 0,
+        prompt_upsampling: false,
+      };
+      
+      console.log(`📦 Kontext request keys: ${Object.keys(kontextRequestBody).join(", ")}`);
 
-      const pollResponse = await fetch(kontextPollingUrl, {
-        headers: { "x-key": BFL_API_KEY! },
+      // Submit Stage 1
+      const kontextSubmitResponse = await fetch(BFL_KONTEXT_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-key": BFL_API_KEY!,
+        },
+        body: JSON.stringify(kontextRequestBody),
       });
 
-      if (!pollResponse.ok) {
-        attempts++;
-        continue;
+      if (!kontextSubmitResponse.ok) {
+        const errorText = await kontextSubmitResponse.text();
+        console.error(`[KONTEXT] Stage 1 submission error: ${kontextSubmitResponse.status} - ${errorText}`);
+        return null;
       }
 
-      const result = await pollResponse.json();
-      
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      if (elapsed - lastLogTime >= 10) {
-        console.log(`   ⏳ Stage 1 generating... ${elapsed}s (${result.status})`);
-        lastLogTime = elapsed;
+      const kontextSubmitData = await kontextSubmitResponse.json();
+      console.log(`🎫 Kontext submission ID: ${kontextSubmitData.id}`);
+
+      const kontextPollingUrl = kontextSubmitData.polling_url;
+      if (!kontextPollingUrl) {
+        console.error("[KONTEXT] No polling URL returned");
+        return null;
       }
 
-      if (result.status === "Ready" || result.status === "succeeded") {
-        kontextResultUrl = result.result?.sample || null;
-        if (kontextResultUrl) {
-          console.log(`   ✓ Stage 1 complete (${elapsed}s)`);
-          break;
+      let attempts = 0;
+      let lastLogTime = 0;
+      while (attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        const pollResponse = await fetch(kontextPollingUrl, {
+          headers: { "x-key": BFL_API_KEY! },
+        });
+
+        if (!pollResponse.ok) {
+          attempts++;
+          continue;
         }
-        console.error("   ✗ Stage 1 failed: no image URL");
-        return null;
-      } else if (result.status === "Error" || result.status === "Failed" || result.status === "error" || result.status === "failed") {
-        console.error(`   ✗ Stage 1 failed: ${result.status}`);
-        return null;
-      }
 
-      attempts++;
+        const result = await pollResponse.json();
+        
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        if (elapsed - lastLogTime >= 10) {
+          console.log(`   ⏳ Stage 1 generating... ${elapsed}s (${result.status})`);
+          lastLogTime = elapsed;
+        }
+
+        if (result.status === "Ready" || result.status === "succeeded") {
+          kontextResultUrl = result.result?.sample || null;
+          if (kontextResultUrl) {
+            console.log(`   ✓ Stage 1 complete (${elapsed}s)`);
+            break;
+          }
+          console.error("   ✗ Stage 1 failed: no image URL");
+          return null;
+        } else if (result.status === "Error" || result.status === "Failed" || result.status === "error" || result.status === "failed") {
+          console.error(`   ✗ Stage 1 failed: ${result.status}`);
+          return null;
+        }
+
+        attempts++;
+      }
     }
 
     if (!kontextResultUrl) {
@@ -3481,8 +3498,19 @@ async function generateWithKontextRefined(
             console.log(`⚠ Failed to save Stage 2 result for debug:`, e);
           }
           
+          // Force final output back to exact user-photo dimensions.
+          // FLUX can quantize dimensions to valid multiples, so we normalize here.
+          let sizedFinal = finalImageUrl;
+          const resizedFinal = await resizeImageToDimensions(finalImageUrl, sourceWidth, sourceHeight);
+          if (resizedFinal) {
+            sizedFinal = resizedFinal;
+            console.log(`📐 Final output resized to user dimensions: ${sourceWidth}x${sourceHeight}`);
+          } else {
+            console.warn("[KONTEXT REFINED] Could not enforce final user dimensions; returning FLUX dimensions");
+          }
+
           // Apply subtle watermark to final result
-          const watermarkedResult = await addWatermark(finalImageUrl);
+          const watermarkedResult = await addWatermark(sizedFinal);
           console.log(`🖼️ Added watermark to generated image`);
           return watermarkedResult;
         }
@@ -6756,6 +6784,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const PREFILTER_TOP_N = GENERATION_CONFIG.TEXT_MODE_PREFILTER_TOP_N || 16;
       const USE_VISION_SELECTION = GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION;
       const USE_DIRECT_KONTEXT_TEXT_MODE = GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT;
+      const TEXT_MODE_STAGE1_PROVIDER = GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER === "kontext" ? "kontext" : "gpt_image";
       
       // Store pre-fetched references: { base64: string, url: string, source: string }[]
       let prefetchedRefs: { base64: string; url: string; source: string }[] = [];
@@ -6768,7 +6797,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         if (USE_DIRECT_KONTEXT_TEXT_MODE) {
           console.log(`[TEXT MODE] Direct Kontext pipeline enabled (no web reference search)`);
-          visionHairstyleDescription = await interpretHairstylePromptWithGPT(firstVariantPrompt);
+          visionHairstyleDescription = firstVariantPrompt;
 
           // Load existing user analysis if available; this only helps Stage 2 ethnicity replacement.
           const cacheKey = generateCacheKey(session.photoUrl);
@@ -7341,7 +7370,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 maskedUserPhoto!,
                 userAnalysis?.raceEthnicity || "natural",
                 userAnalysis?.gender || "",
-                { promptOnlyMode: true }
+                { promptOnlyMode: true, stage1Provider: TEXT_MODE_STAGE1_PROVIDER }
               );
 
               if (frontImageUrl) {
@@ -9123,7 +9152,8 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
         const rootSessionId = sourceSession.rootSessionId || sourceSessionId;
         const deviceId = sourceSession.deviceId || getOrCreateDeviceId(req, res);
         const basePrompt = sourceSession.customPrompt || sourceVariant.customPrompt || sourceSession.hairstyleDescription || "";
-        const interpretedPrompt = await interpretHairstylePromptWithGPT(basePrompt);
+        const interpretedPrompt = basePrompt;
+        const textModeStage1Provider = GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER === "kontext" ? "kontext" : "gpt_image";
 
         const newSession = await storage.createUserSession({
           photoUrl: sourceSession.photoUrl,
@@ -9154,7 +9184,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           maskedUserPhoto,
           userRace,
           userGender,
-          { promptOnlyMode: true }
+          { promptOnlyMode: true, stage1Provider: textModeStage1Provider }
         );
 
         if (!kontextResult) {

@@ -46,9 +46,11 @@ export const GENERATION_CONFIG = {
   // CHATGPT MODE: Use OpenAI's gpt-image-1 for describe mode (no masks, no references)
   // This is a simpler pipeline: user photo + text prompt → gpt-image-1 → result
   CHATGPT_DESCRIBE_MODE: process.env.CHATGPT_DESCRIBE_MODE === "true", // Default: false (use BFL pipeline)
-  CHATGPT_MODEL: "gpt-image-1", // OpenAI's best image generation model
-  CHATGPT_IMAGE_SIZE: "1024x1024" as "1024x1024" | "512x512" | "256x256", // Supported sizes
+  CHATGPT_MODEL: process.env.CHATGPT_MODEL || "gpt-image-1.5",
+  CHATGPT_IMAGE_SIZE: (process.env.CHATGPT_IMAGE_SIZE || "1024x1536") as "1024x1024" | "1024x1536" | "1536x1024",
+  CHATGPT_IMAGE_QUALITY: (process.env.CHATGPT_IMAGE_QUALITY || "low") as "low" | "medium" | "high",
   CHATGPT_DESCRIBE_PROMPT_TEMPLATE: "Transform this person's hairstyle to: {hairstyle}. Keep the same person, same face, same features, same clothing, same background. Only change the hairstyle to match the description. Photorealistic, natural lighting, professional portrait quality.",
+  CHATGPT_STAGE1_PROMPT_TEMPLATE: "Interpret the user's hairstyle request and apply it to this exact same person: \"{hairstyle}\". Preserve identity, face geometry, skin tone, and pose. Change only the hair. Bright frontal studio lighting, sharp photorealistic quality.",
   
   // BFL FLUX 2 Pro prompt template (used by AI Polish and fallback features)
   TEXT_MODE_FRONT_PROMPT_TEMPLATE: "Apply image 1's exact face and head with the hair from image 2. Place them in the exact background in image 3. Preserve the person's head shape and dimensions. Use the hairtype in image 2. Smooth natural photorealistic lighting.",
@@ -57,6 +59,7 @@ export const GENERATION_CONFIG = {
   // Stage 1: FLUX Kontext Pro (reference image ONLY → generate person with that hairstyle)
   // Stage 2: FLUX 2 Pro (user mask + hair-only mask from Kontext + full user photo → refined result)
   TEXT_MODE_DIRECT_KONTEXT: process.env.TEXT_MODE_DIRECT_KONTEXT !== "false", // Default true: no web refs in text mode
+  TEXT_MODE_STAGE1_PROVIDER: (process.env.TEXT_MODE_STAGE1_PROVIDER || "gpt_image").trim().toLowerCase(), // gpt_image | kontext
   KONTEXT_STAGE1_ONLY: false, // Continue to Stage 2 with FLUX 2 Pro
   KONTEXT_STAGE1_PROMPT: "Make the person front-facing, centered, looking directly at the camera. Preserve the exact hairstyle. The person is wearing a clean white shirt. Bright, centered, symmetrical, frontal lighting aligned with the camera axis, producing flat, even illumination across the entire subject. The full hairstyle is visible with at least 15–20% of the image height as empty space above the highest hair point. Plain studio background in neutral light gray (hex #D0D0D0), evenly lit, no texture or objects. Professional photorealistic studio portrait. Shot in a bright professional studio using a Phase One XF IQ4 medium format camera, ultra-sharp focus, high clarity, high dynamic range, no depth-of-field blur, and no cinematic softness.",
   KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE: "Give the person a {hairstyle} hairstyle while preserving the person. Use bright, frontal lighting aligned with the camera axis, producing flat, even illumination across the entire subject. Professional photorealistic studio portrait. Shot in a bright professional studio using a Phase One XF IQ4 medium format camera, ultra-sharp focus, high clarity, high dynamic range, no depth-of-field blur, and no cinematic softness.",
@@ -120,13 +123,15 @@ export function buildGenerationPrompt(
 export function logConfig() {
   console.log("=== Auren Generation Config ===");
   if (GENERATION_CONFIG.CHATGPT_DESCRIBE_MODE) {
-    console.log("Describe Mode: ChatGPT (gpt-image-1)");
+    console.log("Describe Mode: ChatGPT Image Edit");
     console.log(`  - Model: ${GENERATION_CONFIG.CHATGPT_MODEL}`);
     console.log(`  - Size: ${GENERATION_CONFIG.CHATGPT_IMAGE_SIZE}`);
+    console.log(`  - Quality: ${GENERATION_CONFIG.CHATGPT_IMAGE_QUALITY}`);
     console.log(`  - No masks or references needed`);
   } else {
     console.log("Pipeline: Kontext Refined (Kontext Pro → FLUX 2 Pro)");
     console.log(`  - Text Mode Direct Kontext: ${GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT ? "enabled" : "disabled"}`);
+    console.log(`  - Text Mode Stage 1 Provider: ${GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER}`);
     console.log(`  - Stage 1 (Kontext): ${GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT.substring(0, 60)}...`);
     console.log(`  - Stage 2 (FLUX 2): ${GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.substring(0, 60)}...`);
     console.log(`  - Vision Selection: ${GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION ? "enabled" : "disabled"}`);
