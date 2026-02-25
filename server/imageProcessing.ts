@@ -1,5 +1,6 @@
 import sharp from "sharp";
 import { spawn } from "child_process";
+import { createHash } from "crypto";
 import Replicate from "replicate";
 import { GENERATION_CONFIG } from "./config";
 
@@ -78,6 +79,27 @@ export async function addWatermark(imageData: string): Promise<string> {
 
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 const FAL_KEY = process.env.FAL_KEY;
+const USER_MASK_MAX_CONCURRENCY = Math.max(1, parseInt(process.env.USER_MASK_MAX_CONCURRENCY || "1", 10) || 1);
+let activeUserMaskJobs = 0;
+const userMaskWaiters: Array<() => void> = [];
+const userMaskInFlight = new Map<string, Promise<MaskResult>>();
+
+async function acquireUserMaskSlot(): Promise<void> {
+  if (activeUserMaskJobs < USER_MASK_MAX_CONCURRENCY) {
+    activeUserMaskJobs += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => userMaskWaiters.push(resolve));
+}
+
+function releaseUserMaskSlot(): void {
+  const next = userMaskWaiters.shift();
+  if (next) {
+    next();
+    return;
+  }
+  activeUserMaskJobs = Math.max(0, activeUserMaskJobs - 1);
+}
 
 interface ProcessedImages {
   userImageBase64: string;
@@ -900,63 +922,105 @@ export async function createUserMaskedImage(
     // Get original dimensions
     const meta = await sharp(normalizedBuffer).metadata();
     
-    // Call Python BiSeNet pipeline in "user_mask" mode with quality validation
-    const pythonInput = JSON.stringify({
-      imageUrl: normalizedBase64,
-      mode: "user_mask",
-      bufferPx: bufferPx,
-      hairlineVisiblePx: hairlineVisiblePx,
-      includeNeck: includeNeck,
-      grayOutBackground: grayOutBackground,
-      validateQuality: true  // Enable photo quality validation
-    });
-    
-    const { result, validation, photoQuality } = await new Promise<{ result: string | null; validation?: MaskValidation; photoQuality?: PhotoQualityValidation }>((resolve) => {
-      const python = spawn('python3', ['server/hair_mask_pipeline.py']);
-      let stdout = '';
-      let stderr = '';
-      
-      python.stdout.on('data', (data) => { stdout += data.toString(); });
-      python.stderr.on('data', (data) => { stderr += data.toString(); });
-      
-      python.on('close', (code) => {
-        if (code !== 0) {
-          console.error("User mask creation failed");
-          if (stderr.trim()) console.error(stderr);
-          resolve({ result: null });
-          return;
-        }
-        
+    const jobKey = createHash("sha1")
+      .update(normalizedBase64)
+      .update(`|${bufferPx}|${hairlineVisiblePx}|${includeNeck}|${grayOutBackground}`)
+      .digest("hex");
+
+    let inFlight = userMaskInFlight.get(jobKey);
+    if (!inFlight) {
+      inFlight = (async (): Promise<MaskResult> => {
+        await acquireUserMaskSlot();
         try {
-          const output = JSON.parse(stdout);
-          if (output.success && output.userMaskedImage) {
-            const validation = output.validation as MaskValidation | undefined;
-            const photoQuality = output.photoQuality as PhotoQualityValidation | undefined;
-            
-            // Only log issues if there are problems
-            if (validation && !validation.valid) {
-              console.log(`   ⚠️ User mask issues: ${validation.issues.join(', ')}`);
-            }
-            if (photoQuality && !photoQuality.valid) {
-              console.log(`   ⚠️ Photo quality issues: ${photoQuality.issues.join(', ')}`);
-            }
-            
-            resolve({ result: output.userMaskedImage, validation, photoQuality });
-          } else {
-            console.error("User mask creation error:", output.error);
-            resolve({ result: null });
-          }
-        } catch (e) {
-          console.error("Failed to parse mask output:", e);
-          resolve({ result: null });
+          // Call Python BiSeNet pipeline in "user_mask" mode with quality validation
+          const pythonInput = JSON.stringify({
+            imageUrl: normalizedBase64,
+            mode: "user_mask",
+            bufferPx: bufferPx,
+            hairlineVisiblePx: hairlineVisiblePx,
+            includeNeck: includeNeck,
+            grayOutBackground: grayOutBackground,
+            validateQuality: true
+          });
+
+          const maskResult = await new Promise<MaskResult>((resolve) => {
+            const python = spawn("python3", ["server/hair_mask_pipeline.py"], {
+              env: {
+                ...process.env,
+                ORT_LOG_SEVERITY_LEVEL: process.env.ORT_LOG_SEVERITY_LEVEL || "3",
+                ORT_LOG_VERBOSITY_LEVEL: process.env.ORT_LOG_VERBOSITY_LEVEL || "0",
+              },
+            });
+            let stdout = "";
+            let stderr = "";
+
+            python.stdout.on("data", (data) => { stdout += data.toString(); });
+            python.stderr.on("data", (data) => { stderr += data.toString(); });
+
+            python.on("close", (code) => {
+              if (code !== 0) {
+                const stderrTail = stderr.trim().split("\n").slice(-40).join("\n");
+                console.error(`User mask creation failed (exit ${code})`);
+                if (stderrTail) console.error(stderrTail);
+                resolve({ image: null, width: meta.width || 0, height: meta.height || 0 });
+                return;
+              }
+
+              try {
+                const output = JSON.parse(stdout);
+                if (output.success && output.userMaskedImage) {
+                  const validation = output.validation as MaskValidation | undefined;
+                  const photoQuality = output.photoQuality as PhotoQualityValidation | undefined;
+
+                  if (validation && !validation.valid) {
+                    console.log(`   ⚠️ User mask issues: ${validation.issues.join(", ")}`);
+                  }
+                  if (photoQuality && !photoQuality.valid) {
+                    console.log(`   ⚠️ Photo quality issues: ${photoQuality.issues.join(", ")}`);
+                  }
+
+                  resolve({
+                    image: output.userMaskedImage,
+                    validation,
+                    photoQuality,
+                    width: meta.width || 0,
+                    height: meta.height || 0,
+                  });
+                } else {
+                  console.error("User mask creation error:", output.error);
+                  resolve({ image: null, width: meta.width || 0, height: meta.height || 0 });
+                }
+              } catch (e) {
+                console.error("Failed to parse mask output:", e);
+                resolve({ image: null, width: meta.width || 0, height: meta.height || 0 });
+              }
+            });
+
+            python.stdin.write(pythonInput);
+            python.stdin.end();
+          });
+
+          return maskResult;
+        } finally {
+          releaseUserMaskSlot();
         }
-      });
-      
-      python.stdin.write(pythonInput);
-      python.stdin.end();
-    });
-    
-    if (!result) {
+      })();
+      userMaskInFlight.set(jobKey, inFlight);
+    } else {
+      console.log(`↻ Reusing in-flight user mask job (${jobKey.slice(0, 10)})`);
+    }
+
+    let computed: MaskResult;
+    try {
+      computed = await inFlight;
+    } finally {
+      const current = userMaskInFlight.get(jobKey);
+      if (current === inFlight) {
+        userMaskInFlight.delete(jobKey);
+      }
+    }
+
+    if (!computed.image) {
       if (includeValidation) {
         return { image: null, width: 0, height: 0 };
       }
@@ -964,17 +1028,17 @@ export async function createUserMaskedImage(
     }
     
     // Only log success if photo quality validation passed (or wasn't requested)
-    const qualityPassed = !photoQuality || photoQuality.valid;
-    const maskPassed = !validation || validation.valid;
+    const qualityPassed = !computed.photoQuality || computed.photoQuality.valid;
+    const maskPassed = !computed.validation || computed.validation.valid;
     
     if (qualityPassed && maskPassed) {
       console.log(`✓ User masked image created at ${meta.width}x${meta.height} with ${bufferPx}px buffer (hair removed)`);
     }
     
     if (includeValidation) {
-      return { image: result, validation, photoQuality, width: meta.width || 0, height: meta.height || 0 };
+      return computed;
     }
-    return result;
+    return computed.image;
   } catch (error: any) {
     console.error("Error creating user masked image:", error);
     if (includeValidation) {
