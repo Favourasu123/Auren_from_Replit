@@ -3731,13 +3731,29 @@ def create_user_face_only_mask_from_kontext_pipeline(
     _, neck_class_id = resolve_dynamic_hair_neck_class_ids(seg_map, face_bbox)
 
     # Build face-only keep mask (explicitly excludes hair and neck).
-    lip_mask = (
-        (seg_map == UPPER_LIP_ID)
+    # Keep full facial region so the user mask visibly preserves the whole face.
+    ear_keep = (
+        (seg_map == LEFT_EAR_ID)
+        | (seg_map == RIGHT_EAR_ID)
+    ).astype(np.uint8)
+
+    facial_feature_keep = (
+        (seg_map == LEFT_EYEBROW_ID)
+        | (seg_map == RIGHT_EYEBROW_ID)
+        | (seg_map == LEFT_EYE_ID)
+        | (seg_map == RIGHT_EYE_ID)
+        | (seg_map == NOSE_ID)
+        | (seg_map == UPPER_LIP_ID)
         | (seg_map == LOWER_LIP_ID)
         | (seg_map == MOUTH_ID)
     ).astype(np.uint8)
-    face_keep = facial_mask.astype(np.uint8) | lip_mask
-    face_keep[hair_mask > 0] = 0
+    face_keep = facial_mask.astype(np.uint8) | facial_feature_keep | ear_keep
+    # Keep detected ears even if they overlap hair; subtract hair from the rest of face.
+    face_keep[(hair_mask > 0) & (ear_keep == 0)] = 0
+    # Re-assert ear regions after hair exclusion.
+    face_keep[ear_keep > 0] = 1
+    if include_neck:
+        face_keep[seg_map == neck_class_id] = 1
     if not include_neck:
         face_keep[seg_map == neck_class_id] = 0
 
@@ -5370,8 +5386,8 @@ def main():
             buffer_px = input_data.get("bufferPx", 10)
             hairline_visible_px = input_data.get("hairlineVisiblePx", 20)  # Pixels of hair to show above hairline
             validate_quality = input_data.get("validateQuality", True)  # New flag for quality check
-            # Force face-only behavior for user mask regardless of caller input.
-            include_neck = False
+            # User mask keeps face + neck by default.
+            include_neck = bool(input_data.get("includeNeck", True))
             gray_out_background = True
             
             # STEP 1: Run EARLY validation (blur, lighting, size) BEFORE expensive BiSeNet
@@ -5413,7 +5429,7 @@ def main():
             user_masked, face_mask, facial_features_mask = create_user_face_only_mask_from_kontext_pipeline(
                 image,
                 return_masks=True,
-                include_neck=False
+                include_neck=include_neck
             )
             
             # Run validation on the user mask

@@ -3421,8 +3421,10 @@ async function generateWithKontextRefined(
     }
     
     // Create hair-only mask from Stage 1 result using kontext_result_mask_test pipeline.
-    console.log(`🎭 Creating Stage 1 hair-only mask (pipeline: kontext_result_mask_test, buffer: 30px)...`);
-    const kontextHairMask = await createKontextResultMaskTest(kontextBase64, 30);
+    // GPT Stage-1 outputs use a tighter 5px buffer; Kontext Stage-1 keeps 30px.
+    const stage1HairMaskBufferPx = stage1Provider === "gpt_image" ? 5 : 30;
+    console.log(`🎭 Creating Stage 1 hair-only mask (pipeline: kontext_result_mask_test, buffer: ${stage1HairMaskBufferPx}px)...`);
+    const kontextHairMask = await createKontextResultMaskTest(kontextBase64, stage1HairMaskBufferPx);
     if (!kontextHairMask) {
       console.error("[STAGE 2] Failed to create hair-only mask from Stage 1 output");
       return null;

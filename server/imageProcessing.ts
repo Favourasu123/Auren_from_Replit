@@ -890,7 +890,7 @@ export async function createUserMaskedImage(
   bufferPx: number = 10,
   includeValidation: boolean = false,
   hairlineVisiblePx: number = 0,
-  includeNeck: boolean = false,
+  includeNeck: boolean = true,
   grayOutBackground: boolean = true
 ): Promise<string | null | MaskResult> {
   try {
