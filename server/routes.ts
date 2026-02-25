@@ -2926,12 +2926,18 @@ async function generateHairstyleSingleView(
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     console.log(`📦 Building ${useStage2Image3 ? "3-image" : "2-image"} pipeline for FLUX 2 Pro...`);
     
-    // Override input_image with user mask (image 1 = face to preserve)
-    if (maskedUserPhoto) {
-      requestBody.input_image = maskedUserPhoto;
-      console.log(`  📤 input_image (user mask): ${maskedUserPhoto.length} chars`);
+    // In 2-image mode, use full user photo as image 1.
+    // In 3-image mode, use user mask as image 1 and keep full user as image 3.
+    if (useStage2Image3) {
+      if (maskedUserPhoto) {
+        requestBody.input_image = maskedUserPhoto;
+        console.log(`  📤 input_image (user mask): ${maskedUserPhoto.length} chars`);
+      } else {
+        console.warn("  ⚠️ No user mask available");
+      }
     } else {
-      console.warn("  ⚠️ No user mask available");
+      requestBody.input_image = normalizedPhotoUrl;
+      console.log(`  📤 input_image (full user photo): ${normalizedPhotoUrl.length} chars`);
     }
 
     // Add hair-only reference mask as input_image_2
@@ -3453,9 +3459,11 @@ async function generateWithKontextRefined(
     console.log(`📝 Stage 2 Prompt: ${stage2Prompt}`);
     
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
+    const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedPhotoUrl;
+    const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
-      input_image: maskedUserPhoto,           // Image 1: User mask
+      input_image: stage2InputImage,          // Image 1: User mask (3-image) OR full user photo (2-image)
       input_image_2: kontextHairMask,         // Image 2: Hair-only mask from Stage 1
       width: outputWidth,
       height: outputHeight,
@@ -3466,7 +3474,7 @@ async function generateWithKontextRefined(
     }
     
     console.log(`📦 Stage 2 request keys: ${Object.keys(stage2RequestBody).join(", ")}`);
-    console.log(`  📤 input_image (user mask): ${maskedUserPhoto.length} chars`);
+    console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
     console.log(`  📤 input_image_2 (hair-only from Stage 1): ${kontextHairMask.length} chars`);
     if (useStage2Image3) {
       console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
@@ -3565,21 +3573,10 @@ async function generateWithKontextRefined(
             console.log(`⚠ Failed to save Stage 2 result for debug:`, e);
           }
           
-          // Force final output back to exact user-photo dimensions.
-          // FLUX can quantize dimensions to valid multiples, so we normalize here.
-          let sizedFinal = finalImageUrl;
-          const resizedFinal = await resizeImageToDimensions(finalImageUrl, sourceWidth, sourceHeight);
-          if (resizedFinal) {
-            sizedFinal = resizedFinal;
-            console.log(`📐 Final output resized to user dimensions: ${sourceWidth}x${sourceHeight}`);
-          } else {
-            console.warn("[KONTEXT REFINED] Could not enforce final user dimensions; returning FLUX dimensions");
-          }
-
-          // Apply subtle watermark to final result
-          const watermarkedResult = await addWatermark(sizedFinal);
-          console.log(`🖼️ Added watermark to generated image`);
-          return watermarkedResult;
+          // Keep native FLUX quality: return raw Stage 2 output with no post-processing.
+          // No resize and no watermark to avoid any re-encoding quality loss.
+          console.log("🖼️ Returning native FLUX Stage 2 output (no resize, no watermark)");
+          return finalImageUrl;
         }
         console.error("   ✗ Stage 2 failed: no image URL");
         return null;
@@ -4313,9 +4310,11 @@ async function generateStyleFromInspirationDual(
     console.log(`📝 Stage 2 Prompt: ${stage2Prompt}`);
     
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
+    const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedUserPhoto;
+    const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
-      input_image: maskedUserPhoto,           // Image 1: User mask
+      input_image: stage2InputImage,          // Image 1: User mask (3-image) OR full user photo (2-image)
       input_image_2: kontextHairMask,         // Image 2: Hair mask from Kontext Stage 1
       width: outputWidth,
       height: outputHeight,
@@ -4325,8 +4324,8 @@ async function generateStyleFromInspirationDual(
       stage2RequestBody.input_image_3 = normalizedUserPhoto; // Image 3: Full user photo
     }
     
-    console.log(`📦 Stage 2 request: user mask + hair mask${useStage2Image3 ? " + full user photo" : ""}`);
-    console.log(`  📤 input_image (user mask): ${maskedUserPhoto?.length || 0} chars`);
+    console.log(`📦 Stage 2 request: ${useStage2Image3 ? "user mask" : "full user photo"} + hair mask${useStage2Image3 ? " + full user photo" : ""}`);
+    console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
     console.log(`  📤 input_image_2 (hair mask from Stage 1): ${kontextHairMask.length} chars`);
     if (useStage2Image3) {
       console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
@@ -4496,10 +4495,12 @@ async function generateWithPrecomputedMasks(
     // Build 2 or 3 image request with pre-computed masks
     // Note: FLUX.2 Pro API only supports: prompt, input_image*, seed, width, height, safety_tolerance, output_format
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
+    const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedUserPhoto;
+    const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
     console.log(`📦 Building ${useStage2Image3 ? "3-image" : "2-image"} pipeline with pre-computed masks...`);
     const requestBody: any = {
       prompt: prompt,
-      input_image: maskedUserPhoto,  // Image 1: masked user (pre-computed)
+      input_image: stage2InputImage, // Image 1: masked user (3-image) OR full user photo (2-image)
       input_image_2: hairOnlyMask,   // Image 2: hair-only (pre-computed)
       width: outputWidth,
       height: outputHeight,
@@ -4509,7 +4510,7 @@ async function generateWithPrecomputedMasks(
       requestBody.input_image_3 = normalizedUserPhoto; // Image 3: full user photo
     }
     
-    console.log(`  📤 input_image (user mask): ${maskedUserPhoto.length} chars`);
+    console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
     console.log(`  📤 input_image_2 (hair mask): ${hairOnlyMask.length} chars`);
     if (useStage2Image3) {
       console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);

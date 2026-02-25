@@ -53,7 +53,7 @@ export const GENERATION_CONFIG = {
   CHATGPT_STAGE1_PROMPT_TEMPLATE: "Interpret the user's hairstyle request and apply it to this exact same person: \"{hairstyle}\". Preserve identity, face geometry, skin tone, and pose. Change only the hair. Bright frontal studio lighting, sharp photorealistic quality.",
   
   // BFL FLUX 2 Pro prompt template (used by AI Polish and fallback features)
-  TEXT_MODE_FRONT_PROMPT_TEMPLATE: "Apply image 1's exact face and head with the hair from image 2. Place them in the exact background in image 3. Preserve the person's head shape and dimensions. Use the hairtype in image 2. Smooth natural photorealistic lighting.",
+  TEXT_MODE_FRONT_PROMPT_TEMPLATE: "Apply Image 1's exact face with the hair from image 2 while preserving the exact person in image 1. Smooth natural photorealistic lighting.",
   
   // KONTEXT REFINED PIPELINE: Two-stage generation (Kontext Pro → FLUX 2 Pro)
   // Stage 1: FLUX Kontext Pro (reference image ONLY → generate person with that hairstyle)
@@ -64,7 +64,7 @@ export const GENERATION_CONFIG = {
   KONTEXT_STAGE1_PROMPT: "Make the person front-facing, centered, looking directly at the camera. Preserve the exact hairstyle. The person is wearing a clean white shirt. Bright, centered, symmetrical, frontal lighting aligned with the camera axis, producing flat, even illumination across the entire subject. The full hairstyle is visible with at least 15–20% of the image height as empty space above the highest hair point. Plain studio background in neutral light gray (hex #D0D0D0), evenly lit, no texture or objects. Professional photorealistic studio portrait. Shot in a bright professional studio using a Phase One XF IQ4 medium format camera, ultra-sharp focus, high clarity, high dynamic range, no depth-of-field blur, and no cinematic softness.",
   KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE: "Give the person a {hairstyle} hairstyle while preserving the person. Use bright, frontal lighting aligned with the camera axis, producing flat, even illumination across the entire subject. Professional photorealistic studio portrait. Shot in a bright professional studio using a Phase One XF IQ4 medium format camera, ultra-sharp focus, high clarity, high dynamic range, no depth-of-field blur, and no cinematic softness.",
   KONTEXT_STAGE1_GUIDANCE: 15, // Guidance for Kontext Stage 1
-  KONTEXT_STAGE2_PROMPT: process.env.KONTEXT_STAGE2_PROMPT || "Apply image 1's exact face and head with the hair from image 2. Place them in the exact background in image 3. Preserve the person's head shape and dimensions. Use the hairtype in image 2. Smooth natural photorealistic lighting.",
+  KONTEXT_STAGE2_PROMPT: process.env.KONTEXT_STAGE2_PROMPT || "Apply Image 1's exact face with the hair from image 2 while preserving the exact person in image 1. Smooth natural photorealistic lighting.",
   KONTEXT_STAGE2_SAFETY_TOLERANCE: 0, // Safety tolerance for FLUX 2 Pro Stage 2
   KONTEXT_STAGE2_USE_IMAGE3: process.env.KONTEXT_STAGE2_USE_IMAGE3 === "true", // Default false: send only 2 images to FLUX Stage 2
   KONTEXT_STAGE2_FACE_OUTLINE_PX: 10, // Pixels of face outline to show in hair mask
@@ -77,7 +77,7 @@ export const GENERATION_CONFIG = {
   TEXT_MODE_SAFETY_TOLERANCE: 0,
   
   // BFL FLUX 2 Pro inspiration mode settings (used by AI Polish feature)
-  INSPIRATION_FRONT_PROMPT_TEMPLATE: "Apply image 1's exact face and head with the hair from image 2. Place them in the exact background in image 3. Preserve the person's head shape and dimensions. Use the hairtype in image 2. Smooth natural photorealistic lighting.",
+  INSPIRATION_FRONT_PROMPT_TEMPLATE: "Apply Image 1's exact face with the hair from image 2 while preserving the exact person in image 1. Smooth natural photorealistic lighting.",
   INSPIRATION_GUIDANCE: 1,
   INSPIRATION_SAFETY_TOLERANCE: 0,
   INSPIRATION_DEFAULT_NUM_IMAGES: 1,
