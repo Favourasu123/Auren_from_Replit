@@ -66,6 +66,7 @@ export const GENERATION_CONFIG = {
   KONTEXT_STAGE1_GUIDANCE: 15, // Guidance for Kontext Stage 1
   KONTEXT_STAGE2_PROMPT: process.env.KONTEXT_STAGE2_PROMPT || "Apply image 1's exact face and head with the hair from image 2. Place them in the exact background in image 3. Preserve the person's head shape and dimensions. Use the hairtype in image 2. Smooth natural photorealistic lighting.",
   KONTEXT_STAGE2_SAFETY_TOLERANCE: 0, // Safety tolerance for FLUX 2 Pro Stage 2
+  KONTEXT_STAGE2_USE_IMAGE3: process.env.KONTEXT_STAGE2_USE_IMAGE3 === "true", // Default false: send only 2 images to FLUX Stage 2
   KONTEXT_STAGE2_FACE_OUTLINE_PX: 10, // Pixels of face outline to show in hair mask
   TEXT_MODE_VISION_SELECTION: true, // Use vision model to select best reference from candidates
   TEXT_MODE_CANDIDATES_TO_ANALYZE: 40, // Number of candidates to fetch from web search (SerpAPI)
@@ -129,14 +130,31 @@ export function logConfig() {
     console.log(`  - Quality: ${GENERATION_CONFIG.CHATGPT_IMAGE_QUALITY}`);
     console.log(`  - No masks or references needed`);
   } else {
-    console.log("Pipeline: Kontext Refined (Kontext Pro → FLUX 2 Pro)");
-    console.log(`  - Text Mode Direct Kontext: ${GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT ? "enabled" : "disabled"}`);
-    console.log(`  - Text Mode Stage 1 Provider: ${GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER}`);
-    console.log(`  - Stage 1 (Kontext): ${GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT.substring(0, 60)}...`);
-    console.log(`  - Stage 2 (FLUX 2): ${GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.substring(0, 60)}...`);
-    console.log(`  - Vision Selection: ${GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION ? "enabled" : "disabled"}`);
-    if (GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION) {
-      console.log(`  - Candidates to Analyze: ${GENERATION_CONFIG.TEXT_MODE_CANDIDATES_TO_ANALYZE}`);
+    const textModeStage1Provider = GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER === "gpt_image" ? "gpt_image" : "kontext";
+    const textModeStage1Label = textModeStage1Provider === "gpt_image"
+      ? `GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})`
+      : "FLUX Kontext Pro";
+    const stage1PromptTemplate = textModeStage1Provider === "gpt_image"
+      ? GENERATION_CONFIG.CHATGPT_STAGE1_PROMPT_TEMPLATE
+      : (GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT
+        ? GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE
+        : GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT);
+    const webReferenceSearchEnabled = !GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT;
+
+    console.log(`Pipeline: Kontext Refined (${textModeStage1Label} → FLUX 2 Pro)`);
+    console.log(`  - Text Mode: ${GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT ? "direct (no web references)" : "reference-guided (web references)"}`);
+    console.log(`  - Stage 1 Provider: ${textModeStage1Label}`);
+    console.log(`  - Stage 1 Prompt: ${stage1PromptTemplate.substring(0, 60)}...`);
+    console.log(`  - Stage 2 Prompt: ${GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.substring(0, 60)}...`);
+    console.log(`  - Stage 2 Inputs: ${GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3 ? "3 images (img1+img2+img3)" : "2 images (img1+img2)"}`);
+    console.log(`  - Web Reference Search: ${webReferenceSearchEnabled ? "enabled" : "disabled"}`);
+    if (webReferenceSearchEnabled) {
+      console.log(`  - Vision Selection: ${GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION ? "enabled" : "disabled"}`);
+      if (GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION) {
+        console.log(`  - Candidates to Analyze: ${GENERATION_CONFIG.TEXT_MODE_CANDIDATES_TO_ANALYZE}`);
+      }
+    } else {
+      console.log(`  - Vision Selection: skipped (no web references in direct mode)`);
     }
   }
   console.log("Inspiration Mode: Kontext Refined (same 2-stage pipeline)");

@@ -2923,7 +2923,8 @@ async function generateHairstyleSingleView(
     // input_image_2 (2) = hair-only reference mask (shows hair, facial features blotted)
     // input_image_3 (3) = original user photo (full reference for background)
     
-    console.log("📦 Building 3-image pipeline for FLUX 2 Pro...");
+    const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
+    console.log(`📦 Building ${useStage2Image3 ? "3-image" : "2-image"} pipeline for FLUX 2 Pro...`);
     
     // Override input_image with user mask (image 1 = face to preserve)
     if (maskedUserPhoto) {
@@ -2941,11 +2942,15 @@ async function generateHairstyleSingleView(
       console.warn("  ⚠️ No reference image available");
     }
     
-    // Add original user photo as input_image_3 (full reference for background)
-    requestBody.input_image_3 = normalizedPhotoUrl;
-    console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
+    // Optionally add original user photo as input_image_3 (full reference for background)
+    if (useStage2Image3) {
+      requestBody.input_image_3 = normalizedPhotoUrl;
+      console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
+    } else {
+      console.log("  🚫 input_image_3 disabled (2-image mode)");
+    }
     
-    console.log(`✓ 3-image pipeline ready`);
+    console.log(`✓ ${useStage2Image3 ? "3-image" : "2-image"} pipeline ready`);
     console.log("Request keys:", Object.keys(requestBody));
 
     // Submit the generation request
@@ -3443,24 +3448,31 @@ async function generateWithKontextRefined(
       console.warn("Could not save hair-only mask debug image:", e);
     }
     
-    // Build Stage 2 request (3 images: user mask + Stage 1 hair-only mask + full user photo)
+    // Build Stage 2 request (2 or 3 images based on config flag)
     const stage2Prompt = GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.replace('{ethnicity}', getRegionBasedEthnicity(userRace));
     console.log(`📝 Stage 2 Prompt: ${stage2Prompt}`);
     
+    const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
       input_image: maskedUserPhoto,           // Image 1: User mask
       input_image_2: kontextHairMask,         // Image 2: Hair-only mask from Stage 1
-      input_image_3: normalizedPhotoUrl,      // Image 3: Full user photo
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
     };
+    if (useStage2Image3) {
+      stage2RequestBody.input_image_3 = normalizedPhotoUrl; // Image 3: Full user photo
+    }
     
     console.log(`📦 Stage 2 request keys: ${Object.keys(stage2RequestBody).join(", ")}`);
     console.log(`  📤 input_image (user mask): ${maskedUserPhoto.length} chars`);
     console.log(`  📤 input_image_2 (hair-only from Stage 1): ${kontextHairMask.length} chars`);
-    console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
+    if (useStage2Image3) {
+      console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
+    } else {
+      console.log("  🚫 input_image_3 disabled (2-image mode)");
+    }
     
     // Save debug files for debug overview page
     try {
@@ -4296,24 +4308,31 @@ async function generateStyleFromInspirationDual(
       console.warn("Could not save hair mask debug image:", e);
     }
     
-    // Build Stage 2 request (3 images: user mask + hair mask from Stage 1 + full user photo)
+    // Build Stage 2 request (2 or 3 images based on config flag)
     const stage2Prompt = GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.replace('{ethnicity}', getRegionBasedEthnicity(userRace));
     console.log(`📝 Stage 2 Prompt: ${stage2Prompt}`);
     
+    const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
       input_image: maskedUserPhoto,           // Image 1: User mask
       input_image_2: kontextHairMask,         // Image 2: Hair mask from Kontext Stage 1
-      input_image_3: normalizedUserPhoto,     // Image 3: Full user photo
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
     };
+    if (useStage2Image3) {
+      stage2RequestBody.input_image_3 = normalizedUserPhoto; // Image 3: Full user photo
+    }
     
-    console.log(`📦 Stage 2 request: user mask + hair mask + full user photo`);
+    console.log(`📦 Stage 2 request: user mask + hair mask${useStage2Image3 ? " + full user photo" : ""}`);
     console.log(`  📤 input_image (user mask): ${maskedUserPhoto?.length || 0} chars`);
     console.log(`  📤 input_image_2 (hair mask from Stage 1): ${kontextHairMask.length} chars`);
-    console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
+    if (useStage2Image3) {
+      console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
+    } else {
+      console.log("  🚫 input_image_3 disabled (2-image mode)");
+    }
     
     // Save debug files
     try {
@@ -4474,23 +4493,30 @@ async function generateWithPrecomputedMasks(
     }
     console.log(`Output dimensions: ${outputWidth}×${outputHeight}`);
 
-    // Build 3-image request with pre-computed masks
+    // Build 2 or 3 image request with pre-computed masks
     // Note: FLUX.2 Pro API only supports: prompt, input_image*, seed, width, height, safety_tolerance, output_format
-    console.log("📦 Building 3-image pipeline with pre-computed masks...");
+    const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
+    console.log(`📦 Building ${useStage2Image3 ? "3-image" : "2-image"} pipeline with pre-computed masks...`);
     const requestBody: any = {
       prompt: prompt,
       input_image: maskedUserPhoto,  // Image 1: masked user (pre-computed)
       input_image_2: hairOnlyMask,   // Image 2: hair-only (pre-computed)
-      input_image_3: normalizedUserPhoto, // Image 3: full user photo
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.INSPIRATION_SAFETY_TOLERANCE,
     };
+    if (useStage2Image3) {
+      requestBody.input_image_3 = normalizedUserPhoto; // Image 3: full user photo
+    }
     
     console.log(`  📤 input_image (user mask): ${maskedUserPhoto.length} chars`);
     console.log(`  📤 input_image_2 (hair mask): ${hairOnlyMask.length} chars`);
-    console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
-    console.log("✓ 3-image pipeline ready (using cached masks)");
+    if (useStage2Image3) {
+      console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
+    } else {
+      console.log("  🚫 input_image_3 disabled (2-image mode)");
+    }
+    console.log(`✓ ${useStage2Image3 ? "3-image" : "2-image"} pipeline ready (using cached masks)`);
 
     // Submit the generation request
     const submitResponse = await fetch(BFL_API_URL, {
