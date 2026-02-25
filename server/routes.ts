@@ -11,7 +11,7 @@ import { getUncachableStripeClient, getStripePublishableKey } from "./stripeClie
 import { GENERATION_CONFIG, logConfig, buildGenerationPrompt, getRegionBasedEthnicity } from "./config";
 import sharp from "sharp";
 import { runHybridPipeline, isHybridModeEnabled } from "./hybridService";
-import { generateHairMask, generateHairMaskWithOverlay, generateHairMaskReplicate, isReplicateConfigured, createHairOnlyImage, createHairOnlyImageSimple, createKontextResultMaskTest, createUserMaskedImage, createFacialFeaturesOnlyImage, createHairWithSkinBorderImage, createHairAndFaceImage, addWatermark } from "./imageProcessing";
+import { generateHairMask, generateHairMaskWithOverlay, generateHairMaskReplicate, isReplicateConfigured, createHairOnlyImage, createKontextResultMaskTest, createUserMaskedImage, addWatermark } from "./imageProcessing";
 import Replicate from "replicate";
 import * as fs from "fs";
 import * as crypto from "crypto";
@@ -856,6 +856,50 @@ const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN; // For PuLID and Ha
 
 // Generation timeout - if BFL/Kontext takes longer than this, abort and prompt user to retry
 const GENERATION_TIMEOUT_SECONDS = 65;
+
+const MODEL_ID_FLUX_STAGE2 = "flux-2-pro";
+const MODEL_ID_KONTEXT_STAGE1 = "flux-kontext-pro";
+const MODEL_ID_MASK_PIPELINE = "kontext_result_mask_test";
+
+type ModelDebugInfo = {
+  pipeline: string;
+  stage1Provider?: "gpt_image" | "kontext";
+  stage1Model?: string;
+  stage2Model?: string;
+  stage2PromptSource?: string;
+  maskPipeline?: string;
+  generatedAt: string;
+};
+
+function mergeCompositeData(existing: string | null | undefined, patch: Record<string, unknown>): string {
+  let base: Record<string, unknown> = {};
+  if (existing) {
+    try {
+      const parsed = JSON.parse(existing);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        base = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Ignore malformed legacy payloads and overwrite with new object.
+    }
+  }
+  return JSON.stringify({ ...base, ...patch });
+}
+
+function buildKontextRefinedModelDebug(
+  stage1Provider: "gpt_image" | "kontext",
+  promptSource: string = "KONTEXT_STAGE2_PROMPT"
+): ModelDebugInfo {
+  return {
+    pipeline: "kontext_refined",
+    stage1Provider,
+    stage1Model: stage1Provider === "gpt_image" ? GENERATION_CONFIG.CHATGPT_MODEL : MODEL_ID_KONTEXT_STAGE1,
+    stage2Model: MODEL_ID_FLUX_STAGE2,
+    stage2PromptSource: promptSource,
+    maskPipeline: MODEL_ID_MASK_PIPELINE,
+    generatedAt: new Date().toISOString(),
+  };
+}
 
 // Maximum generations per session (beta limit)
 const MAX_GENERATIONS_PER_SESSION = 15;
@@ -2637,7 +2681,7 @@ async function generateHairstyleWithChatGPT(
       return "https://via.placeholder.com/1024x1024?text=ChatGPT+Generated";
     }
 
-    console.log("=== ChatGPT gpt-image-1 Generation ===");
+    console.log(`=== ChatGPT Image Generation (${GENERATION_CONFIG.CHATGPT_MODEL}) ===`);
     console.log("Photo:", photoUrl.substring(0, 50) + "...");
     console.log("Hairstyle prompt:", hairstylePrompt);
     const promptTemplate = options?.promptTemplate || GENERATION_CONFIG.CHATGPT_DESCRIBE_PROMPT_TEMPLATE;
@@ -2675,7 +2719,7 @@ async function generateHairstyleWithChatGPT(
     // Convert buffer to File-like object for OpenAI SDK using toFile helper
     const imageFile = await toFile(imageBuffer, "photo.png", { type: "image/png" });
 
-    console.log("Calling OpenAI images.edit with gpt-image-1...");
+    console.log(`Calling OpenAI images.edit with ${GENERATION_CONFIG.CHATGPT_MODEL}...`);
     
     const response = await openai.images.edit({
       model: GENERATION_CONFIG.CHATGPT_MODEL,
@@ -2987,8 +3031,8 @@ async function generateHairstyleSingleView(
 
 // ============================================
 // KONTEXT REFINED PIPELINE: Two-stage generation
-// Stage 1: FLUX Kontext Pro (unmasked user + unmasked ref → initial hairstyle)
-// Stage 2: FLUX 2 Pro (user mask + hair-only mask from Kontext + full user photo → refined result)
+// Stage 1: Provider-selected generation (GPT Image edit or FLUX Kontext Pro)
+// Stage 2: FLUX 2 Pro (user mask + hair-only mask from Stage 1 + full user photo)
 // ============================================
 async function generateWithKontextRefined(
   photoUrl: string,
@@ -3049,7 +3093,15 @@ async function generateWithKontextRefined(
       userRace,
       userGender
     );
-    console.log(`📝 Prompt: ${stage1Prompt}`);
+    const stage1ProviderLabel = stage1Provider === "gpt_image"
+      ? `GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})`
+      : "FLUX Kontext Pro";
+    const stage1InputLabel = (stage1Provider === "gpt_image" || promptOnlyMode)
+      ? "user image"
+      : "reference image";
+
+    console.log(`🧭 Stage 1 provider: ${stage1ProviderLabel}`);
+    console.log(`📝 Stage 1 prompt: ${stage1Prompt}`);
 
     const stage1InputImage = (stage1Provider === "gpt_image" || promptOnlyMode)
       ? normalizedPhotoUrl
@@ -3058,16 +3110,16 @@ async function generateWithKontextRefined(
     // ============================================
     // STAGE 1: Provider-selected generation (Kontext or GPT Image)
     // ============================================
-    console.log(`\n━━━ STAGE 1: ${stage1Provider === "gpt_image" ? `GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})` : "FLUX Kontext Pro"} ━━━`);
+    console.log(`\n━━━ STAGE 1: ${stage1ProviderLabel} ━━━`);
     
-    console.log(`📸 Input validation:`);
-    console.log(`   - photoUrl type: ${photoUrl.startsWith('data:') ? 'base64' : 'URL'}`);
-    console.log(`   - photoUrl preview: ${photoUrl.substring(0, 100)}...`);
-    console.log(`   - referenceBase64 type: ${referenceBase64.startsWith('data:') ? 'base64' : 'URL'}`);
-    console.log(`   - referenceBase64 preview: ${referenceBase64.substring(0, 100)}...`);
-    console.log(`   - maskedUserPhoto (for Stage 2): ${maskedUserPhoto?.substring(0, 60) || 'N/A'}...`);
+    console.log(`📸 Stage 1 input summary:`);
+    console.log(`   - selected input: ${stage1InputLabel}`);
+    console.log(`   - user photo provided: ${photoUrl.startsWith('data:') ? 'base64' : 'URL'}`);
+    console.log(`   - reference image provided: ${referenceBase64.startsWith('data:') ? 'base64' : 'URL'}`);
+    console.log(`   - stage2 user mask provided: ${maskedUserPhoto ? 'yes' : 'no'}`);
+    console.log(`   - selected input preview: ${stage1InputImage.substring(0, 100)}...`);
     
-    console.log(`  📤 input_image (${stage1Provider === "gpt_image" || promptOnlyMode ? "user image" : "reference image"}): ${stage1InputImage.length} chars`);
+    console.log(`  📤 input_image (${stage1InputLabel}): ${stage1InputImage.length} chars`);
     
     // DEBUG: Save Stage 1 input for verification (only reference image now)
     const fsDebugInputs = await import("fs/promises");
@@ -3093,7 +3145,7 @@ async function generateWithKontextRefined(
     if (stage1Provider === "gpt_image") {
       const stage1Size = selectChatGPTImageSize(sourceWidth, sourceHeight);
       const stage1Quality = GENERATION_CONFIG.CHATGPT_IMAGE_QUALITY;
-      console.log(`📦 Stage 1 provider: ${GENERATION_CONFIG.CHATGPT_MODEL}`);
+      console.log(`📦 Stage 1 model: ${GENERATION_CONFIG.CHATGPT_MODEL}`);
       console.log(`📦 Stage 1 image options: size=${stage1Size}, quality=${stage1Quality}`);
       kontextResultUrl = await generateHairstyleWithChatGPT(stage1InputImage, stage1Prompt, {
         promptTemplate: "{hairstyle}",
@@ -3126,7 +3178,7 @@ async function generateWithKontextRefined(
         prompt_upsampling: false,
       };
       
-      console.log(`📦 Kontext request keys: ${Object.keys(kontextRequestBody).join(", ")}`);
+      console.log(`📦 Stage 1 request keys (Kontext): ${Object.keys(kontextRequestBody).join(", ")}`);
 
       // Submit Stage 1
       const kontextSubmitResponse = await fetch(BFL_KONTEXT_API_URL, {
@@ -3193,7 +3245,7 @@ async function generateWithKontextRefined(
     }
 
     if (!kontextResultUrl) {
-      console.error(`[KONTEXT] Stage 1 timeout after ${GENERATION_TIMEOUT_SECONDS}s`);
+      console.error(`[STAGE 1] ${stage1ProviderLabel} timeout after ${GENERATION_TIMEOUT_SECONDS}s`);
       generationMetrics.timeouts++;
       return null;
     }
@@ -3339,20 +3391,20 @@ async function generateWithKontextRefined(
     }
     
     // ============================================
-    // STAGE 2: Create HAIR-ONLY mask from Kontext result, then FLUX 2 Pro
+    // STAGE 2: Create hair-only mask from Stage 1 result, then call FLUX 2 Pro
     // ============================================
     console.log(`\n━━━ STAGE 2: FLUX 2 Pro (with hair-only mask from Stage 1) ━━━`);
     
-    // Convert Kontext result URL to base64
-    console.log(`🔄 Converting Stage 1 result to base64...`);
+    // Convert Stage 1 result URL to base64
+    console.log(`🔄 Converting Stage 1 output to base64...`);
     let kontextBase64 = await fetchImageAsBase64(kontextResultUrl);
     if (!kontextBase64) {
-      console.error("[KONTEXT] Failed to fetch Stage 1 result as base64");
+      console.error("[STAGE 2] Failed to fetch Stage 1 output as base64");
       return null;
     }
     
-    // Sharpen Kontext result before masking for better hair edge detection
-    console.log(`✨ Sharpening Stage 1 result for better mask accuracy...`);
+    // Sharpen Stage 1 result before masking for better hair edge detection
+    console.log(`✨ Sharpening Stage 1 output for mask accuracy...`);
     try {
       const kontextBuffer = Buffer.from(
         kontextBase64.replace(/^data:image\/\w+;base64,/, ''),
@@ -3368,11 +3420,11 @@ async function generateWithKontextRefined(
       console.log(`   ⚠ Sharpening failed, using original: ${(e as Error).message}`);
     }
     
-    // Create HAIR-ONLY mask from Kontext result using test pipeline.
-    console.log(`🎭 Creating Kontext HAIR-ONLY test mask from Stage 1 result...`);
+    // Create hair-only mask from Stage 1 result using kontext_result_mask_test pipeline.
+    console.log(`🎭 Creating Stage 1 hair-only mask (pipeline: kontext_result_mask_test, buffer: 30px)...`);
     const kontextHairMask = await createKontextResultMaskTest(kontextBase64, 30);
     if (!kontextHairMask) {
-      console.error("[KONTEXT] Failed to create hair-only mask from Stage 1");
+      console.error("[STAGE 2] Failed to create hair-only mask from Stage 1 output");
       return null;
     }
     console.log(`   ✓ Hair-only mask created: ${kontextHairMask.length} chars`);
@@ -3396,7 +3448,7 @@ async function generateWithKontextRefined(
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
       input_image: maskedUserPhoto,           // Image 1: User mask
-      input_image_2: kontextHairMask,         // Image 2: Hair-only mask from Kontext
+      input_image_2: kontextHairMask,         // Image 2: Hair-only mask from Stage 1
       input_image_3: normalizedPhotoUrl,      // Image 3: Full user photo
       width: outputWidth,
       height: outputHeight,
@@ -3405,7 +3457,7 @@ async function generateWithKontextRefined(
     
     console.log(`📦 Stage 2 request keys: ${Object.keys(stage2RequestBody).join(", ")}`);
     console.log(`  📤 input_image (user mask): ${maskedUserPhoto.length} chars`);
-    console.log(`  📤 input_image_2 (hair-only from Kontext): ${kontextHairMask.length} chars`);
+    console.log(`  📤 input_image_2 (hair-only from Stage 1): ${kontextHairMask.length} chars`);
     console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
     
     // Save debug files for debug overview page
@@ -3441,7 +3493,7 @@ async function generateWithKontextRefined(
 
     if (!stage2SubmitResponse.ok) {
       const errorText = await stage2SubmitResponse.text();
-      console.error(`[KONTEXT] Stage 2 submission error: ${stage2SubmitResponse.status} - ${errorText}`);
+      console.error(`[FLUX STAGE 2] Submission error: ${stage2SubmitResponse.status} - ${errorText}`);
       return null;
     }
 
@@ -3450,7 +3502,7 @@ async function generateWithKontextRefined(
 
     const stage2PollingUrl = stage2SubmitData.polling_url;
     if (!stage2PollingUrl) {
-      console.error("[KONTEXT] Stage 2: No polling URL returned");
+      console.error("[FLUX STAGE 2] No polling URL returned");
       return null;
     }
 
@@ -3484,7 +3536,7 @@ async function generateWithKontextRefined(
         if (finalImageUrl) {
           const totalTime = Math.floor((Date.now() - startTime) / 1000);
           console.log(`   ✓ Stage 2 complete (${elapsed}s)`);
-          console.log(`\n✅ KONTEXT REFINED COMPLETE - Total time: ${totalTime}s`);
+          console.log(`\n✅ REFINED PIPELINE COMPLETE - Total time: ${totalTime}s`);
           console.log(`============================================================\n`);
           
           // Save FLUX Stage 2 result for debug page
@@ -3525,7 +3577,7 @@ async function generateWithKontextRefined(
       attempts++;
     }
 
-    console.error(`[KONTEXT] Stage 2 timeout after ${GENERATION_TIMEOUT_SECONDS}s`);
+    console.error(`[FLUX STAGE 2] Timeout after ${GENERATION_TIMEOUT_SECONDS}s`);
     generationMetrics.timeouts++;
     return null;
   } catch (error) {
@@ -6785,7 +6837,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const PREFILTER_TOP_N = GENERATION_CONFIG.TEXT_MODE_PREFILTER_TOP_N || 16;
       const USE_VISION_SELECTION = GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION;
       const USE_DIRECT_KONTEXT_TEXT_MODE = GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT;
-      const TEXT_MODE_STAGE1_PROVIDER = GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER === "kontext" ? "kontext" : "gpt_image";
+      const TEXT_MODE_STAGE1_PROVIDER: "gpt_image" = "gpt_image";
       
       // Store pre-fetched references: { base64: string, url: string, source: string }[]
       let prefetchedRefs: { base64: string; url: string; source: string }[] = [];
@@ -6797,7 +6849,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const firstVariantPrompt = textModeVariants[0].customPrompt!;
 
         if (USE_DIRECT_KONTEXT_TEXT_MODE) {
-          console.log(`[TEXT MODE] Direct Kontext pipeline enabled (no web reference search)`);
+          console.log(`[TEXT MODE] Direct pipeline enabled: GPT Stage 1 -> kontext_result_mask_test -> FLUX 2 Pro (web reference search disabled)`);
           visionHairstyleDescription = firstVariantPrompt;
 
           // Load existing user analysis if available; this only helps Stage 2 ethnicity replacement.
@@ -7165,13 +7217,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
                   
                   if (dualResult.frontImageUrl) {
                     generationSucceeded = true;
+                    const modelDebug = buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT");
                     // Save debug data (masks) to compositeData for debug page
-                    const compositeData = dualResult.debugData ? JSON.stringify({
+                    const compositeDataBase = dualResult.debugData ? {
                       userMaskUrl: dualResult.debugData.userMaskUrl,
                       refHairMaskUrl: dualResult.debugData.refHairMaskUrl,
                       userRace: dualResult.debugData.userRace,
                       userGender: dualResult.debugData.userGender
-                    }) : null;
+                    } : {};
+                    const compositeData = mergeCompositeData(
+                      variant.compositeData,
+                      { ...compositeDataBase, modelDebug }
+                    );
                     await storage.updateGeneratedVariant(variant.id, {
                       generatedImageUrl: dualResult.frontImageUrl,
                       sideImageUrl: dualResult.sideImageUrl,
@@ -7197,15 +7254,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
                   (variant.styleType || "hairstyle") as StyleType
                 );
                 
-                if (dualResult.frontImageUrl) {
-                  generationSucceeded = true;
+                  if (dualResult.frontImageUrl) {
+                    generationSucceeded = true;
+                  const modelDebug = buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT");
                   // Save debug data (masks) to compositeData for debug page
-                  const compositeData = dualResult.debugData ? JSON.stringify({
+                  const compositeDataBase = dualResult.debugData ? {
                     userMaskUrl: dualResult.debugData.userMaskUrl,
                     refHairMaskUrl: dualResult.debugData.refHairMaskUrl,
                     userRace: dualResult.debugData.userRace,
                     userGender: dualResult.debugData.userGender
-                  }) : null;
+                  } : {};
+                  const compositeData = mergeCompositeData(
+                    variant.compositeData,
+                    { ...compositeDataBase, modelDebug }
+                  );
                   // Reset renderType to "ai" for fallback results
                   await storage.updateGeneratedVariant(variant.id, {
                     generatedImageUrl: dualResult.frontImageUrl,
@@ -7234,14 +7296,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
               
               if (dualResult.frontImageUrl) {
                 generationSucceeded = true;
+                const modelDebug = buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT");
                 
                 // Save debug data (masks) to compositeData for debug page
-                const compositeData = dualResult.debugData ? JSON.stringify({
+                const compositeDataBase = dualResult.debugData ? {
                   userMaskUrl: dualResult.debugData.userMaskUrl,
                   refHairMaskUrl: dualResult.debugData.refHairMaskUrl,
                   userRace: dualResult.debugData.userRace,
                   userGender: dualResult.debugData.userGender
-                }) : null;
+                } : {};
+                const compositeData = mergeCompositeData(
+                  variant.compositeData,
+                  { ...compositeDataBase, modelDebug }
+                );
                 
                 await storage.updateGeneratedVariant(variant.id, {
                   generatedImageUrl: dualResult.frontImageUrl,
@@ -7306,12 +7373,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
               // Ignore cleanup errors
             }
             
-            console.log(`📦 Pipeline: kontext_refined`);
-            console.log(`📚 Available references: ${prefetchedRefs.length}`);
-            if (prefetchedRefs.length > 0) {
-              console.log(`\n🎯 USING REFERENCE #1 (TOP RANKED):`);
-              console.log(`   Source: "${prefetchedRefs[0].source}"`);
-              console.log(`   URL: ${prefetchedRefs[0].url.substring(0, 60)}...`);
+            if (GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT) {
+              console.log(`📦 Pipeline: kontext_refined_direct (GPT Stage 1 -> kontext_result_mask_test -> FLUX 2 Pro)`);
+              console.log(`📚 Web reference search: skipped (TEXT_MODE_DIRECT_KONTEXT=true)`);
+            } else {
+              console.log(`📦 Pipeline: kontext_refined (reference-guided)`);
+              console.log(`📚 Available references: ${prefetchedRefs.length}`);
+              if (prefetchedRefs.length > 0) {
+                console.log(`\n🎯 USING REFERENCE #1 (TOP RANKED):`);
+                console.log(`   Source: "${prefetchedRefs[0].source}"`);
+                console.log(`   URL: ${prefetchedRefs[0].url.substring(0, 60)}...`);
+              }
             }
             
             // Use cached masked user photo if available, otherwise create it
@@ -7359,11 +7431,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
               }
             }
 
-            // Direct text-mode pipeline: GPT prompt interpretation -> Kontext(user image) -> mask -> FLUX
+            // Direct text-mode pipeline (enforced):
+            // GPT Stage 1 on user image -> mask GPT result -> FLUX 2 Pro (user mask + GPT mask + full user photo)
             if (GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT) {
               const interpretedPrompt = visionHairstyleDescription || variant.customPrompt!;
-              console.log(`📦 Pipeline: kontext_refined_direct (no web references)`);
               console.log(`📝 Interpreted prompt: "${interpretedPrompt}"`);
+              console.log(`🧭 Stage 1 provider (forced): GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})`);
               const frontImageUrl = await generateWithKontextRefined(
                 session.photoUrl,
                 interpretedPrompt,
@@ -7371,22 +7444,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 maskedUserPhoto!,
                 userAnalysis?.raceEthnicity || "natural",
                 userAnalysis?.gender || "",
-                { promptOnlyMode: true, stage1Provider: TEXT_MODE_STAGE1_PROVIDER }
+                  { promptOnlyMode: true, stage1Provider: "gpt_image" }
               );
 
               if (frontImageUrl) {
                 generationSucceeded = true;
+                const modelDebug = buildKontextRefinedModelDebug(TEXT_MODE_STAGE1_PROVIDER, "KONTEXT_STAGE2_PROMPT");
+                const compositeData = mergeCompositeData(variant.compositeData, { modelDebug });
                 await storage.updateGeneratedVariant(variant.id, {
                   generatedImageUrl: frontImageUrl,
                   sideImageUrl: null,
                   webReferenceImageUrl: null,
                   webReferenceSource: null,
+                  compositeData,
                   renderType: "ai",
                   variantIndex: 0,
                   referenceIndex: 0,
                   status: "completed",
                 });
-                console.log(`✓ Text mode complete: direct Kontext pipeline`);
+                console.log(`[MODEL DEBUG] Variant ${variant.id}: ${JSON.stringify(modelDebug)}`);
+                console.log(`✓ Text mode complete: direct GPT Stage 1 + FLUX Stage 2 pipeline`);
               } else {
                 await storage.updateGeneratedVariant(variant.id, {
                   status: "failed",
@@ -7481,6 +7558,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             // Store results: first one updates the original variant, others create new variants
             if (generatedResults.length > 0) {
               generationSucceeded = true;
+              const modelDebug = buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT");
               
               // Get the ACTUAL reference index that was used (may not be 0 if earlier refs failed)
               const actualRefIndex = generatedResults[0].refIndex;
@@ -7491,11 +7569,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 sideImageUrl: null,
                 webReferenceImageUrl: generatedResults[0].refUrl,
                 webReferenceSource: generatedResults[0].refSource,
+                compositeData: mergeCompositeData(variant.compositeData, { modelDebug }),
                 renderType: "ai",
                 variantIndex: 0,
                 referenceIndex: actualRefIndex,
                 status: "completed",
               });
+              console.log(`[MODEL DEBUG] Variant ${variant.id}: ${JSON.stringify(modelDebug)}`);
               
               // Update session's usedReferenceIndex to track which ref was actually used
               await storage.updateUserSession(sessionId, {
@@ -7516,6 +7596,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                   generatedImageUrl: result.url,
                   webReferenceImageUrl: result.refUrl,
                   webReferenceSource: result.refSource,
+                  compositeData: mergeCompositeData(null, { modelDebug }),
                   renderType: "ai",
                   variantIndex: i,
                   status: "completed",
@@ -8534,11 +8615,15 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
       }
 
       if (generationResult?.frontImageUrl) {
+        const modelDebug = buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT");
+        const compositeData = mergeCompositeData(variant.compositeData, { modelDebug });
         await storage.updateGeneratedVariant(variant.id, {
           generatedImageUrl: generationResult.frontImageUrl,
           sideImageUrl: generationResult.sideImageUrl || null,
+          compositeData,
           status: "completed",
         });
+        console.log(`[MODEL DEBUG] Variant ${variant.id}: ${JSON.stringify(modelDebug)}`);
 
         // Update cookie for anonymous users
         if (isAnonymous && !GENERATION_CONFIG.UNLIMITED_CREDITS_DEV) {
@@ -8776,6 +8861,18 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
       const deviceId = getOrCreateDeviceId(req, res);
       
       const variantsWithUserStatus = variants.map(variant => {
+        let modelDebug: unknown = null;
+        if (variant.compositeData) {
+          try {
+            const parsed = JSON.parse(variant.compositeData);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "modelDebug" in parsed) {
+              modelDebug = (parsed as any).modelDebug;
+            }
+          } catch {
+            // Ignore malformed compositeData
+          }
+        }
+
         // Check if THIS device favorited the variant (using device-based tracking only)
         const isFavoritedByCurrentDevice = deviceId && variant.favoritedByDeviceId === deviceId;
         
@@ -8784,6 +8881,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
         
         return {
           ...variant,
+          modelDebug,
           // Override isFavorited to reflect current device's status
           isFavorited: isFavoritedByCurrentDevice,
           // Override isDisliked to reflect current device's status
@@ -8917,6 +9015,16 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
             variantCount: completedVariants.length,
             previewImage: completedVariants[0]?.generatedImageUrl,
             prompt: completedVariants[0]?.customPrompt,
+            modelDebug: (() => {
+              try {
+                const raw = completedVariants[0]?.compositeData;
+                if (!raw) return null;
+                const parsed = JSON.parse(raw);
+                return parsed?.modelDebug || null;
+              } catch {
+                return null;
+              }
+            })(),
           };
         })
       );
@@ -9089,12 +9197,17 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           }
 
           // Save debug data (masks) to compositeData for debug page
-          const compositeData = dualResult.debugData ? JSON.stringify({
+          const modelDebug = buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT");
+          const compositeDataBase = dualResult.debugData ? {
             userMaskUrl: dualResult.debugData.userMaskUrl,
             refHairMaskUrl: dualResult.debugData.refHairMaskUrl,
             userRace: dualResult.debugData.userRace,
             userGender: dualResult.debugData.userGender
-          }) : null;
+          } : {};
+          const compositeData = mergeCompositeData(
+            newVariant.compositeData,
+            { ...compositeDataBase, modelDebug }
+          );
 
           await storage.updateGeneratedVariant(newVariant.id, {
             generatedImageUrl: dualResult.frontImageUrl,
@@ -9154,7 +9267,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
         const deviceId = sourceSession.deviceId || getOrCreateDeviceId(req, res);
         const basePrompt = sourceSession.customPrompt || sourceVariant.customPrompt || sourceSession.hairstyleDescription || "";
         const interpretedPrompt = basePrompt;
-        const textModeStage1Provider = GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER === "kontext" ? "kontext" : "gpt_image";
+        const textModeStage1Provider: "gpt_image" = "gpt_image";
 
         const newSession = await storage.createUserSession({
           photoUrl: sourceSession.photoUrl,
@@ -9185,7 +9298,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           maskedUserPhoto,
           userRace,
           userGender,
-          { promptOnlyMode: true, stage1Provider: textModeStage1Provider }
+          { promptOnlyMode: true, stage1Provider: "gpt_image" }
         );
 
         if (!kontextResult) {
@@ -9205,10 +9318,14 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           sideImageUrl: null,
           webReferenceImageUrl: null,
           webReferenceSource: null,
+          compositeData: mergeCompositeData(
+            newVariant.compositeData,
+            { modelDebug: buildKontextRefinedModelDebug(textModeStage1Provider, "KONTEXT_STAGE2_PROMPT") }
+          ),
           status: "completed",
         });
 
-        console.log(`✅ [Generate More] Completed in direct Kontext mode: new session ${newSession.id}`);
+        console.log(`✅ [Generate More] Completed in direct GPT Stage 1 + FLUX Stage 2 mode: new session ${newSession.id}`);
         return res.json({
           success: true,
           newSessionId: newSession.id,
@@ -9435,6 +9552,10 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
             sideImageUrl: result.sideImageUrl,
             webReferenceImageUrl: currentRefUrl,
             webReferenceSource: currentRefSource,
+            compositeData: mergeCompositeData(
+              newVariant.compositeData,
+              { modelDebug: buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT") }
+            ),
             status: "completed",
           });
 

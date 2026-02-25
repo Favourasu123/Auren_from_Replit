@@ -4863,8 +4863,22 @@ def main():
         if image is None:
             raise ValueError("Failed to decode image")
         
-        # Check for mode: "mask" (default), "reference", or "user_mask"
+        # Keep a minimal active masking surface.
+        # Legacy modes are normalized to the active hair pipeline for compatibility.
         mode = input_data.get("mode", "mask")
+        legacy_hair_modes = {
+            "reference",
+            "hair_only",
+            "hair_only_ultra",
+            "hair_only_simple",
+            "kontext_result_mask_test_v2",
+            "hair_with_skin_border",
+            "reference_face_masked",
+            "facial_features_only",
+        }
+        if mode in legacy_hair_modes:
+            log_debug(f"[MODE] '{mode}' is deprecated; routing to 'kontext_result_mask_test'")
+            mode = "kontext_result_mask_test"
         
         if mode == "reference":
             # Create reference image: hair + face visible, but features blotted out
