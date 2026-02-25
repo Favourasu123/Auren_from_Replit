@@ -2926,8 +2926,10 @@ async function generateHairstyleSingleView(
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     console.log(`📦 Building ${useStage2Image3 ? "3-image" : "2-image"} pipeline for FLUX 2 Pro...`);
     
-    // In 2-image mode, use full user photo as image 1.
-    // In 3-image mode, use user mask as image 1 and keep full user as image 3.
+    // In 3-image mode, use:
+    // img1=user mask, img2=full user photo, img3=hair-only reference.
+    // In 2-image mode, use:
+    // img1=full user photo, img2=hair-only reference.
     if (useStage2Image3) {
       if (maskedUserPhoto) {
         requestBody.input_image = maskedUserPhoto;
@@ -2935,23 +2937,26 @@ async function generateHairstyleSingleView(
       } else {
         console.warn("  ⚠️ No user mask available");
       }
+      requestBody.input_image_2 = normalizedPhotoUrl;
+      console.log(`  📤 input_image_2 (full user photo): ${normalizedPhotoUrl.length} chars`);
     } else {
       requestBody.input_image = normalizedPhotoUrl;
       console.log(`  📤 input_image (full user photo): ${normalizedPhotoUrl.length} chars`);
+      requestBody.input_image_2 = validRefs.length > 0 ? validRefs[0] : undefined;
+      if (validRefs.length > 0) {
+        console.log(`  📤 input_image_2 (hair-only ref): ${validRefs[0].length} chars`);
+      }
     }
-
-    // Add hair-only reference mask as input_image_2
-    if (validRefs.length > 0) {
-      requestBody.input_image_2 = validRefs[0];
-      console.log(`  📤 input_image_2 (hair-only ref): ${validRefs[0].length} chars`);
-    } else {
+    if (validRefs.length === 0) {
       console.warn("  ⚠️ No reference image available");
     }
     
-    // Optionally add original user photo as input_image_3 (full reference for background)
+    // In 3-image mode, image 3 is the hair-only reference mask.
     if (useStage2Image3) {
-      requestBody.input_image_3 = normalizedPhotoUrl;
-      console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
+      if (validRefs.length > 0) {
+        requestBody.input_image_3 = validRefs[0];
+        console.log(`  📤 input_image_3 (hair-only ref): ${validRefs[0].length} chars`);
+      }
     } else {
       console.log("  🚫 input_image_3 disabled (2-image mode)");
     }
@@ -3461,23 +3466,25 @@ async function generateWithKontextRefined(
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedPhotoUrl;
     const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
+    const stage2InputImage2 = useStage2Image3 ? normalizedPhotoUrl : kontextHairMask;
+    const stage2InputImage2Label = useStage2Image3 ? "full user photo" : "hair-only from Stage 1";
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
       input_image: stage2InputImage,          // Image 1: User mask (3-image) OR full user photo (2-image)
-      input_image_2: kontextHairMask,         // Image 2: Hair-only mask from Stage 1
+      input_image_2: stage2InputImage2,       // Image 2: Full user photo (3-image) OR hair-only mask (2-image)
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
     };
     if (useStage2Image3) {
-      stage2RequestBody.input_image_3 = normalizedPhotoUrl; // Image 3: Full user photo
+      stage2RequestBody.input_image_3 = kontextHairMask;    // Image 3: Hair-only mask from Stage 1
     }
     
     console.log(`📦 Stage 2 request keys: ${Object.keys(stage2RequestBody).join(", ")}`);
     console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
-    console.log(`  📤 input_image_2 (hair-only from Stage 1): ${kontextHairMask.length} chars`);
+    console.log(`  📤 input_image_2 (${stage2InputImage2Label}): ${stage2InputImage2.length} chars`);
     if (useStage2Image3) {
-      console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
+      console.log(`  📤 input_image_3 (hair-only from Stage 1): ${kontextHairMask.length} chars`);
     } else {
       console.log("  🚫 input_image_3 disabled (2-image mode)");
     }
@@ -4312,23 +4319,25 @@ async function generateStyleFromInspirationDual(
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedUserPhoto;
     const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
+    const stage2InputImage2 = useStage2Image3 ? normalizedUserPhoto : kontextHairMask;
+    const stage2InputImage2Label = useStage2Image3 ? "full user photo" : "hair mask from Stage 1";
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
       input_image: stage2InputImage,          // Image 1: User mask (3-image) OR full user photo (2-image)
-      input_image_2: kontextHairMask,         // Image 2: Hair mask from Kontext Stage 1
+      input_image_2: stage2InputImage2,       // Image 2: Full user photo (3-image) OR hair mask (2-image)
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
     };
     if (useStage2Image3) {
-      stage2RequestBody.input_image_3 = normalizedUserPhoto; // Image 3: Full user photo
+      stage2RequestBody.input_image_3 = kontextHairMask;     // Image 3: Hair mask from Kontext Stage 1
     }
     
-    console.log(`📦 Stage 2 request: ${useStage2Image3 ? "user mask" : "full user photo"} + hair mask${useStage2Image3 ? " + full user photo" : ""}`);
+    console.log(`📦 Stage 2 request: ${useStage2Image3 ? "img1 user mask + img2 full user + img3 hair mask" : "full user photo + hair mask"}`);
     console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
-    console.log(`  📤 input_image_2 (hair mask from Stage 1): ${kontextHairMask.length} chars`);
+    console.log(`  📤 input_image_2 (${stage2InputImage2Label}): ${stage2InputImage2.length} chars`);
     if (useStage2Image3) {
-      console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
+      console.log(`  📤 input_image_3 (hair mask from Stage 1): ${kontextHairMask.length} chars`);
     } else {
       console.log("  🚫 input_image_3 disabled (2-image mode)");
     }
@@ -4497,23 +4506,25 @@ async function generateWithPrecomputedMasks(
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedUserPhoto;
     const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
+    const stage2InputImage2 = useStage2Image3 ? normalizedUserPhoto : hairOnlyMask;
+    const stage2InputImage2Label = useStage2Image3 ? "full user photo" : "hair mask";
     console.log(`📦 Building ${useStage2Image3 ? "3-image" : "2-image"} pipeline with pre-computed masks...`);
     const requestBody: any = {
       prompt: prompt,
       input_image: stage2InputImage, // Image 1: masked user (3-image) OR full user photo (2-image)
-      input_image_2: hairOnlyMask,   // Image 2: hair-only (pre-computed)
+      input_image_2: stage2InputImage2, // Image 2: full user photo (3-image) OR hair-only (2-image)
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.INSPIRATION_SAFETY_TOLERANCE,
     };
     if (useStage2Image3) {
-      requestBody.input_image_3 = normalizedUserPhoto; // Image 3: full user photo
+      requestBody.input_image_3 = hairOnlyMask; // Image 3: hair-only (pre-computed)
     }
     
     console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
-    console.log(`  📤 input_image_2 (hair mask): ${hairOnlyMask.length} chars`);
+    console.log(`  📤 input_image_2 (${stage2InputImage2Label}): ${stage2InputImage2.length} chars`);
     if (useStage2Image3) {
-      console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
+      console.log(`  📤 input_image_3 (hair mask): ${hairOnlyMask.length} chars`);
     } else {
       console.log("  🚫 input_image_3 disabled (2-image mode)");
     }
