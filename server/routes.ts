@@ -3087,6 +3087,8 @@ async function generateWithKontextRefined(
     
     let kontextResultUrl: string | null = null;
     const maxAttempts = GENERATION_TIMEOUT_SECONDS;
+    let attempts = 0;
+    let lastLogTime = 0;
     const startTime = Date.now();
     if (stage1Provider === "gpt_image") {
       const stage1Size = selectChatGPTImageSize(sourceWidth, sourceHeight);
@@ -3151,8 +3153,8 @@ async function generateWithKontextRefined(
         return null;
       }
 
-      let attempts = 0;
-      let lastLogTime = 0;
+      attempts = 0;
+      lastLogTime = 0;
       while (attempts < maxAttempts) {
         await new Promise(resolve => setTimeout(resolve, 1000));
 
@@ -3249,23 +3251,22 @@ async function generateWithKontextRefined(
       }
       
       // ============================================
-      // FLUX 2 Pro: 3 images (user photo, hair mask, user mask)
+      // FLUX 2 Pro: 2 images (full user photo + hair mask)
       // ============================================
-      console.log(`\n━━━ FLUX 2 Pro: Three-Image Pipeline ━━━`);
+      console.log(`\n━━━ FLUX 2 Pro: Two-Image Pipeline ━━━`);
       const stage2Prompt = GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.replace('{ethnicity}', getRegionBasedEthnicity(userRace));
       console.log(`📝 Prompt: ${stage2Prompt}`);
       
       const fluxRequestBody: any = {
         prompt: stage2Prompt,
         input_image: normalizedPhotoUrl,        // Image 1: Full user photo
-        input_image_2: stage1HairOnlyMask,      // Image 2: Hair-only mask from Kontext (face grayed with outline)
-        input_image_3: maskedUserPhoto,         // Image 3: User mask (background removed)
+        input_image_2: stage1HairOnlyMask,      // Image 2: Hair-only mask from Stage 1
         width: outputWidth,
         height: outputHeight,
         safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
       };
       
-      console.log(`📦 FLUX request: user photo (img1) + hair mask (img2) + user mask (img3)`);
+      console.log(`📦 FLUX request: full user photo (img1) + hair mask (img2)`);
       
       const fluxSubmitResponse = await fetch(BFL_API_URL, {
         method: "POST",
@@ -3388,15 +3389,15 @@ async function generateWithKontextRefined(
       console.warn("Could not save hair-only mask debug image:", e);
     }
     
-    // Build Stage 2 request (3 images: user mask, kontext hair-only mask, full user photo)
+    // Build Stage 2 request (3 images: user mask + Stage 1 hair-only mask + full user photo)
     const stage2Prompt = GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.replace('{ethnicity}', getRegionBasedEthnicity(userRace));
     console.log(`📝 Stage 2 Prompt: ${stage2Prompt}`);
     
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
-      input_image: maskedUserPhoto,           // Image 1: User mask (face/head isolated)
+      input_image: maskedUserPhoto,           // Image 1: User mask
       input_image_2: kontextHairMask,         // Image 2: Hair-only mask from Kontext
-      input_image_3: normalizedPhotoUrl,      // Image 3: Full user photo (for background/setting)
+      input_image_3: normalizedPhotoUrl,      // Image 3: Full user photo
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
@@ -4241,13 +4242,13 @@ async function generateStyleFromInspirationDual(
       console.warn("Could not save hair mask debug image:", e);
     }
     
-    // Build Stage 2 request (3 images: user mask, hair mask from Stage 1, full user photo)
+    // Build Stage 2 request (3 images: user mask + hair mask from Stage 1 + full user photo)
     const stage2Prompt = GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.replace('{ethnicity}', getRegionBasedEthnicity(userRace));
     console.log(`📝 Stage 2 Prompt: ${stage2Prompt}`);
     
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
-      input_image: maskedUserPhoto,           // Image 1: User mask (face visible, hair grayed)
+      input_image: maskedUserPhoto,           // Image 1: User mask
       input_image_2: kontextHairMask,         // Image 2: Hair mask from Kontext Stage 1
       input_image_3: normalizedUserPhoto,     // Image 3: Full user photo
       width: outputWidth,
