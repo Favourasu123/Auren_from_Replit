@@ -2927,11 +2927,7 @@ async function generateHairstyleSingleView(
     console.log(`📦 Building ${useStage2Image3 ? "3-image" : "2-image"} pipeline for FLUX 2 Pro...`);
     
     // In 3-image mode, use:
-<<<<<<< HEAD
-    // img1=user mask, img2=full user photo, img3=hair-only reference.
-=======
     // img1=user mask, img2=hair-only reference, img3=full user photo.
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     // In 2-image mode, use:
     // img1=full user photo, img2=hair-only reference.
     if (useStage2Image3) {
@@ -2941,15 +2937,10 @@ async function generateHairstyleSingleView(
       } else {
         console.warn("  ⚠️ No user mask available");
       }
-<<<<<<< HEAD
-      requestBody.input_image_2 = normalizedPhotoUrl;
-      console.log(`  📤 input_image_2 (full user photo): ${normalizedPhotoUrl.length} chars`);
-=======
       if (validRefs.length > 0) {
         requestBody.input_image_2 = validRefs[0];
         console.log(`  📤 input_image_2 (hair-only ref): ${validRefs[0].length} chars`);
       }
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     } else {
       requestBody.input_image = normalizedPhotoUrl;
       console.log(`  📤 input_image (full user photo): ${normalizedPhotoUrl.length} chars`);
@@ -2962,19 +2953,10 @@ async function generateHairstyleSingleView(
       console.warn("  ⚠️ No reference image available");
     }
     
-<<<<<<< HEAD
-    // In 3-image mode, image 3 is the hair-only reference mask.
-    if (useStage2Image3) {
-      if (validRefs.length > 0) {
-        requestBody.input_image_3 = validRefs[0];
-        console.log(`  📤 input_image_3 (hair-only ref): ${validRefs[0].length} chars`);
-      }
-=======
     // In 3-image mode, image 3 is the full user photo.
     if (useStage2Image3) {
       requestBody.input_image_3 = normalizedPhotoUrl;
       console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     } else {
       console.log("  🚫 input_image_3 disabled (2-image mode)");
     }
@@ -3455,13 +3437,8 @@ async function generateWithKontextRefined(
     }
     
     // Create hair-only mask from Stage 1 result using kontext_result_mask_test pipeline.
-<<<<<<< HEAD
-    // GPT Stage-1 outputs use a tighter 5px buffer; Kontext Stage-1 keeps 30px.
-    const stage1HairMaskBufferPx = stage1Provider === "gpt_image" ? 5 : 30;
-=======
     // Buffer is disabled (0px).
     const stage1HairMaskBufferPx = 0;
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     console.log(`🎭 Creating Stage 1 hair-only mask (pipeline: kontext_result_mask_test, buffer: ${stage1HairMaskBufferPx}px)...`);
     const kontextHairMask = await createKontextResultMaskTest(kontextBase64, stage1HairMaskBufferPx);
     if (!kontextHairMask) {
@@ -3489,42 +3466,25 @@ async function generateWithKontextRefined(
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedPhotoUrl;
     const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
-<<<<<<< HEAD
-    const stage2InputImage2 = useStage2Image3 ? normalizedPhotoUrl : kontextHairMask;
-    const stage2InputImage2Label = useStage2Image3 ? "full user photo" : "hair-only from Stage 1";
-    const stage2RequestBody: any = {
-      prompt: stage2Prompt,
-      input_image: stage2InputImage,          // Image 1: User mask (3-image) OR full user photo (2-image)
-      input_image_2: stage2InputImage2,       // Image 2: Full user photo (3-image) OR hair-only mask (2-image)
-=======
     const stage2InputImage2 = kontextHairMask;
     const stage2InputImage2Label = "hair-only from Stage 1";
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
       input_image: stage2InputImage,          // Image 1: User mask (3-image) OR full user photo (2-image)
       input_image_2: stage2InputImage2,       // Image 2: Hair-only mask from Stage 1
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
     };
     if (useStage2Image3) {
-<<<<<<< HEAD
-      stage2RequestBody.input_image_3 = kontextHairMask;    // Image 3: Hair-only mask from Stage 1
-=======
       stage2RequestBody.input_image_3 = normalizedPhotoUrl; // Image 3: Full user photo
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     }
     
     console.log(`📦 Stage 2 request keys: ${Object.keys(stage2RequestBody).join(", ")}`);
     console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
     console.log(`  📤 input_image_2 (${stage2InputImage2Label}): ${stage2InputImage2.length} chars`);
     if (useStage2Image3) {
-<<<<<<< HEAD
-      console.log(`  📤 input_image_3 (hair-only from Stage 1): ${kontextHairMask.length} chars`);
-=======
       console.log(`  📤 input_image_3 (full user photo): ${normalizedPhotoUrl.length} chars`);
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     } else {
       console.log("  🚫 input_image_3 disabled (2-image mode)");
     }
@@ -4336,11 +4296,7 @@ async function generateStyleFromInspirationDual(
     
     // Create hair-only mask from Kontext result using test pipeline.
     console.log(`🎭 Creating Kontext HAIR-ONLY test mask from Stage 1 result...`);
-<<<<<<< HEAD
-    const kontextHairMask = await createKontextResultMaskTest(kontextBase64, 30);
-=======
     const kontextHairMask = await createKontextResultMaskTest(kontextBase64, 0);
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     if (!kontextHairMask) {
       console.error("[KONTEXT] Failed to create hair mask from Stage 1");
       return { frontImageUrl: null, sideImageUrl: null };
@@ -4363,36 +4319,17 @@ async function generateStyleFromInspirationDual(
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedUserPhoto;
     const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
-<<<<<<< HEAD
-    const stage2InputImage2 = useStage2Image3 ? normalizedUserPhoto : kontextHairMask;
-    const stage2InputImage2Label = useStage2Image3 ? "full user photo" : "hair mask from Stage 1";
-    const stage2RequestBody: any = {
-      prompt: stage2Prompt,
-      input_image: stage2InputImage,          // Image 1: User mask (3-image) OR full user photo (2-image)
-      input_image_2: stage2InputImage2,       // Image 2: Full user photo (3-image) OR hair mask (2-image)
-=======
     const stage2InputImage2 = kontextHairMask;
     const stage2InputImage2Label = "hair mask from Stage 1";
     const stage2RequestBody: any = {
       prompt: stage2Prompt,
       input_image: stage2InputImage,          // Image 1: User mask (3-image) OR full user photo (2-image)
       input_image_2: stage2InputImage2,       // Image 2: Hair mask from Kontext Stage 1
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
     };
     if (useStage2Image3) {
-<<<<<<< HEAD
-      stage2RequestBody.input_image_3 = kontextHairMask;     // Image 3: Hair mask from Kontext Stage 1
-    }
-    
-    console.log(`📦 Stage 2 request: ${useStage2Image3 ? "img1 user mask + img2 full user + img3 hair mask" : "full user photo + hair mask"}`);
-    console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
-    console.log(`  📤 input_image_2 (${stage2InputImage2Label}): ${stage2InputImage2.length} chars`);
-    if (useStage2Image3) {
-      console.log(`  📤 input_image_3 (hair mask from Stage 1): ${kontextHairMask.length} chars`);
-=======
       stage2RequestBody.input_image_3 = normalizedUserPhoto; // Image 3: Full user photo
     }
     
@@ -4401,7 +4338,6 @@ async function generateStyleFromInspirationDual(
     console.log(`  📤 input_image_2 (${stage2InputImage2Label}): ${stage2InputImage2.length} chars`);
     if (useStage2Image3) {
       console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     } else {
       console.log("  🚫 input_image_3 disabled (2-image mode)");
     }
@@ -4570,42 +4506,25 @@ async function generateWithPrecomputedMasks(
     const useStage2Image3 = GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3;
     const stage2InputImage = useStage2Image3 ? maskedUserPhoto : normalizedUserPhoto;
     const stage2InputLabel = useStage2Image3 ? "user mask" : "full user photo";
-<<<<<<< HEAD
-    const stage2InputImage2 = useStage2Image3 ? normalizedUserPhoto : hairOnlyMask;
-    const stage2InputImage2Label = useStage2Image3 ? "full user photo" : "hair mask";
-=======
     const stage2InputImage2 = hairOnlyMask;
     const stage2InputImage2Label = "hair mask";
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     console.log(`📦 Building ${useStage2Image3 ? "3-image" : "2-image"} pipeline with pre-computed masks...`);
     const requestBody: any = {
       prompt: prompt,
       input_image: stage2InputImage, // Image 1: masked user (3-image) OR full user photo (2-image)
-<<<<<<< HEAD
-      input_image_2: stage2InputImage2, // Image 2: full user photo (3-image) OR hair-only (2-image)
-=======
       input_image_2: stage2InputImage2, // Image 2: hair-only
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
       width: outputWidth,
       height: outputHeight,
       safety_tolerance: GENERATION_CONFIG.INSPIRATION_SAFETY_TOLERANCE,
     };
     if (useStage2Image3) {
-<<<<<<< HEAD
-      requestBody.input_image_3 = hairOnlyMask; // Image 3: hair-only (pre-computed)
-=======
       requestBody.input_image_3 = normalizedUserPhoto; // Image 3: full user photo
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     }
     
     console.log(`  📤 input_image (${stage2InputLabel}): ${stage2InputImage.length} chars`);
     console.log(`  📤 input_image_2 (${stage2InputImage2Label}): ${stage2InputImage2.length} chars`);
     if (useStage2Image3) {
-<<<<<<< HEAD
-      console.log(`  📤 input_image_3 (hair mask): ${hairOnlyMask.length} chars`);
-=======
       console.log(`  📤 input_image_3 (full user): ${normalizedUserPhoto.length} chars`);
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
     } else {
       console.log("  🚫 input_image_3 disabled (2-image mode)");
     }

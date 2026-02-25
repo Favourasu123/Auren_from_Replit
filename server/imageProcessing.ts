@@ -1235,19 +1235,11 @@ export async function createHairOnlyImage(
 
 /**
  * Creates a standalone Kontext Stage-1 result mask using the hair_only pipeline.
-<<<<<<< HEAD
- * Output: hair-only mask with 30px buffer around detected hair (face excluded).
- */
-export async function createKontextResultMaskTest(
-  imageBase64: string,
-  bufferPx: number = 30
-=======
  * Output: hair-only mask with configurable buffer around detected hair (face excluded).
  */
 export async function createKontextResultMaskTest(
   imageBase64: string,
   bufferPx: number = 0
->>>>>>> 1a688e5 (Update FLUX stage2 image order, prompt, and disable hair mask buffer)
 ): Promise<string | null> {
   try {
     console.log(`Creating Kontext result mask test (${bufferPx}px buffer)...`);
