@@ -79,6 +79,7 @@ export async function addWatermark(imageData: string): Promise<string> {
 
 const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN;
 const FAL_KEY = process.env.FAL_KEY;
+const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
 const USER_MASK_MAX_CONCURRENCY = Math.max(1, parseInt(process.env.USER_MASK_MAX_CONCURRENCY || "1", 10) || 1);
 let activeUserMaskJobs = 0;
 const userMaskWaiters: Array<() => void> = [];
@@ -328,7 +329,7 @@ async function generateBiSeNetMask(
   });
   
   const result = await new Promise<string | null>((resolve) => {
-    const python = spawn('python3', ['server/hair_mask_pipeline.py']);
+    const python = spawn(PYTHON_BIN, ['server/hair_mask_pipeline.py']);
     let stdout = '';
     let stderr = '';
     
@@ -430,7 +431,7 @@ async function runMaskRefinement(
   return new Promise((resolve) => {
     console.log("Running Python mask refinement (dilation + feathering + clamp)...");
     
-    const python = spawn("python3", ["server/hair_mask.py"]);
+    const python = spawn(PYTHON_BIN, ["server/hair_mask.py"]);
     
     const input = JSON.stringify({
       action: "refine",
@@ -491,7 +492,7 @@ async function getRawHairMask(imageUrl: string): Promise<string | null> {
   return new Promise((resolve) => {
     console.log("Getting raw hair mask using LOCAL BiSeNet ONNX model...");
     
-    const python = spawn("python3", ["server/hair_segment_local.py"]);
+    const python = spawn(PYTHON_BIN, ["server/hair_segment_local.py"]);
     
     const input = JSON.stringify({ imageUrl });
     
@@ -549,7 +550,7 @@ export async function generateHairMask(
   console.log(`Config: dilation=${options.dilationKernel ?? GENERATION_CONFIG.MASK_DILATION_KERNEL}, iterations=${options.dilationIterations ?? GENERATION_CONFIG.MASK_DILATION_ITERATIONS}, feather=${options.featherSize ?? GENERATION_CONFIG.MASK_FEATHER_SIZE}`);
   
   return new Promise((resolve) => {
-    const python = spawn("python3", ["server/hair_mask_pipeline.py"]);
+    const python = spawn(PYTHON_BIN, ["server/hair_mask_pipeline.py"]);
     
     const input = JSON.stringify({
       imageUrl,
@@ -860,14 +861,15 @@ export async function generateHairMaskReplicate(imageBase64: string, maxRetries:
 }
 
 /**
- * Create a user mask showing FACE ONLY (hair/background grayed).
- * This tells FLUX which face/head identity to preserve.
+ * Create a user mask showing FACE + NECK by default (hair excluded) with background grayed.
+ * This tells FLUX which identity region to preserve.
  * Uses local Python BiSeNet pipeline with "user_mask" mode
  * 
  * @param bufferPx - Number of pixels to expand the face mask (default 10)
  * @param includeValidation - Whether to return validation data (default false)
  * @param hairlineVisiblePx - Pixels of hair to show above the hairline (default 5)
- * @param includeNeck - Whether to include neck in the visible area (default false)
+ * @param includeNeck - Whether to include neck in the visible area (default true)
+ * @param includeHair - Whether to include hair in the visible area (default false)
  */
 export async function createUserMaskedImage(
   imageBase64: string, 
@@ -875,7 +877,8 @@ export async function createUserMaskedImage(
   includeValidation?: false,
   hairlineVisiblePx?: number,
   includeNeck?: boolean,
-  grayOutBackground?: boolean
+  grayOutBackground?: boolean,
+  includeHair?: boolean
 ): Promise<string | null>;
 export async function createUserMaskedImage(
   imageBase64: string, 
@@ -883,7 +886,8 @@ export async function createUserMaskedImage(
   includeValidation: true,
   hairlineVisiblePx?: number,
   includeNeck?: boolean,
-  grayOutBackground?: boolean
+  grayOutBackground?: boolean,
+  includeHair?: boolean
 ): Promise<MaskResult>;
 export async function createUserMaskedImage(
   imageBase64: string, 
@@ -891,7 +895,8 @@ export async function createUserMaskedImage(
   includeValidation: boolean = false,
   hairlineVisiblePx: number = 0,
   includeNeck: boolean = true,
-  grayOutBackground: boolean = true
+  grayOutBackground: boolean = true,
+  includeHair: boolean = false
 ): Promise<string | null | MaskResult> {
   try {
     // Ensure we have a proper data URI
@@ -924,7 +929,7 @@ export async function createUserMaskedImage(
     
     const jobKey = createHash("sha1")
       .update(normalizedBase64)
-      .update(`|${bufferPx}|${hairlineVisiblePx}|${includeNeck}|${grayOutBackground}`)
+      .update(`|${bufferPx}|${hairlineVisiblePx}|${includeNeck}|${grayOutBackground}|${includeHair}`)
       .digest("hex");
 
     let inFlight = userMaskInFlight.get(jobKey);
@@ -937,14 +942,15 @@ export async function createUserMaskedImage(
             imageUrl: normalizedBase64,
             mode: "user_mask",
             bufferPx: bufferPx,
-            hairlineVisiblePx: hairlineVisiblePx,
-            includeNeck: includeNeck,
-            grayOutBackground: grayOutBackground,
-            validateQuality: true
-          });
+              hairlineVisiblePx: hairlineVisiblePx,
+              includeNeck: includeNeck,
+              includeHair: includeHair,
+              grayOutBackground: grayOutBackground,
+              validateQuality: true
+            });
 
           const maskResult = await new Promise<MaskResult>((resolve) => {
-            const python = spawn("python3", ["server/hair_mask_pipeline.py"], {
+            const python = spawn(PYTHON_BIN, ["server/hair_mask_pipeline.py"], {
               env: {
                 ...process.env,
                 ORT_LOG_SEVERITY_LEVEL: process.env.ORT_LOG_SEVERITY_LEVEL || "3",
@@ -953,16 +959,31 @@ export async function createUserMaskedImage(
             });
             let stdout = "";
             let stderr = "";
+            let settled = false;
+            const finish = (value: MaskResult) => {
+              if (settled) return;
+              settled = true;
+              resolve(value);
+            };
 
             python.stdout.on("data", (data) => { stdout += data.toString(); });
             python.stderr.on("data", (data) => { stderr += data.toString(); });
+            python.on("error", (error) => {
+              console.error("User mask python process error:", error);
+              finish({ image: null, width: meta.width || 0, height: meta.height || 0 });
+            });
+            python.stdin.on("error", (error: any) => {
+              if (error?.code !== "EPIPE") {
+                console.error("User mask python stdin error:", error);
+              }
+            });
 
             python.on("close", (code) => {
               if (code !== 0) {
                 const stderrTail = stderr.trim().split("\n").slice(-40).join("\n");
                 console.error(`User mask creation failed (exit ${code})`);
                 if (stderrTail) console.error(stderrTail);
-                resolve({ image: null, width: meta.width || 0, height: meta.height || 0 });
+                finish({ image: null, width: meta.width || 0, height: meta.height || 0 });
                 return;
               }
 
@@ -979,7 +1000,7 @@ export async function createUserMaskedImage(
                     console.log(`   ⚠️ Photo quality issues: ${photoQuality.issues.join(", ")}`);
                   }
 
-                  resolve({
+                  finish({
                     image: output.userMaskedImage,
                     validation,
                     photoQuality,
@@ -988,16 +1009,21 @@ export async function createUserMaskedImage(
                   });
                 } else {
                   console.error("User mask creation error:", output.error);
-                  resolve({ image: null, width: meta.width || 0, height: meta.height || 0 });
+                  finish({ image: null, width: meta.width || 0, height: meta.height || 0 });
                 }
               } catch (e) {
                 console.error("Failed to parse mask output:", e);
-                resolve({ image: null, width: meta.width || 0, height: meta.height || 0 });
+                finish({ image: null, width: meta.width || 0, height: meta.height || 0 });
               }
             });
 
-            python.stdin.write(pythonInput);
-            python.stdin.end();
+            try {
+              python.stdin.write(pythonInput);
+              python.stdin.end();
+            } catch (error) {
+              console.error("Failed writing user mask input to python:", error);
+              finish({ image: null, width: meta.width || 0, height: meta.height || 0 });
+            }
           });
 
           return maskResult;
@@ -1032,7 +1058,8 @@ export async function createUserMaskedImage(
     const maskPassed = !computed.validation || computed.validation.valid;
     
     if (qualityPassed && maskPassed) {
-      console.log(`✓ User masked image created at ${meta.width}x${meta.height} with ${bufferPx}px buffer (hair removed)`);
+      const visibleLabel = includeHair ? "face+hair visible" : "face+neck visible";
+      console.log(`✓ User masked image created at ${meta.width}x${meta.height} with ${bufferPx}px buffer (${visibleLabel})`);
     }
     
     if (includeValidation) {
@@ -1089,9 +1116,9 @@ export interface PhotoQualityValidation {
  */
 async function callBiSeNetPipeline(
   imageBase64: string,
-  mode: "kontext_result_mask_test",
+  mode: "hair_only" | "kontext_result_mask_test",
   bufferPx: number,
-  options?: { roiDilatePx?: number }
+  options?: { roiDilatePx?: number; grayOutEyes?: boolean; faceBorderPx?: number }
 ): Promise<{ result: string | null; width: number; height: number; validation?: MaskValidation }> {
   // Ensure we have a proper data URI
   let inputImage = imageBase64;
@@ -1135,18 +1162,33 @@ async function callBiSeNetPipeline(
   });
   
   const { result, validation } = await new Promise<{ result: string | null; validation?: MaskValidation }>((resolve) => {
-    const python = spawn('python3', ['server/hair_mask_pipeline.py']);
+    const python = spawn(PYTHON_BIN, ['server/hair_mask_pipeline.py']);
     let stdout = '';
     let stderr = '';
+    let settled = false;
+    const finish = (value: { result: string | null; validation?: MaskValidation }) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
     
     python.stdout.on('data', (data) => { stdout += data.toString(); });
     python.stderr.on('data', (data) => { stderr += data.toString(); });
+    python.on("error", (error) => {
+      console.error(`Mask creation process error (${mode}):`, error);
+      finish({ result: null });
+    });
+    python.stdin.on("error", (error: any) => {
+      if (error?.code !== "EPIPE") {
+        console.error(`Mask creation stdin error (${mode}):`, error);
+      }
+    });
     
     python.on('close', (code) => {
       if (code !== 0) {
         console.error(`Mask creation failed (${mode})`);
         if (stderr.trim()) console.error(stderr);
-        resolve({ result: null });
+        finish({ result: null });
         return;
       }
       
@@ -1161,19 +1203,24 @@ async function callBiSeNetPipeline(
             console.log(`   ⚠️ Mask issues: ${validation.issues.join(', ')}`);
           }
           
-          resolve({ result: output[resultKey] || null, validation });
+          finish({ result: output[resultKey] || null, validation });
         } else {
           console.error(`Mask creation error (${mode}):`, output.error);
-          resolve({ result: null });
+          finish({ result: null });
         }
       } catch (e) {
         console.error(`Failed to parse mask output:`, e);
-        resolve({ result: null });
+        finish({ result: null });
       }
     });
     
-    python.stdin.write(pythonInput);
-    python.stdin.end();
+    try {
+      python.stdin.write(pythonInput);
+      python.stdin.end();
+    } catch (error) {
+      console.error(`Failed writing mask input to python (${mode}):`, error);
+      finish({ result: null });
+    }
   });
   
   return { result, width: meta.width || 0, height: meta.height || 0, validation };
@@ -1190,7 +1237,7 @@ export interface MaskResult {
 
 /**
  * Creates a hair-only mask for FLUX.
- * This now uses the same kontext_result_mask_test pipeline as Kontext Stage-1 masking.
+ * Uses the dedicated `hair_only` pipeline (strict hair visibility).
  * 
  * @param imageBase64 - Base64 encoded image (with or without data URI prefix)
  * @param bufferPx - Number of pixels to expand the hair mask (default 3)
@@ -1212,9 +1259,9 @@ export async function createHairOnlyImage(
   includeValidation: boolean = false
 ): Promise<string | null | MaskResult> {
   try {
-    console.log(`Creating hair-only mask via kontext_result_mask_test (${bufferPx}px buffer)...`);
+    console.log(`Creating hair-only mask via hair_only (${bufferPx}px buffer)...`);
     
-    const { result, width, height, validation } = await callBiSeNetPipeline(imageBase64, "kontext_result_mask_test", bufferPx);
+    const { result, width, height, validation } = await callBiSeNetPipeline(imageBase64, "hair_only", bufferPx);
     
     if (result) {
       console.log(`✓ Hair-only mask created at ${width}x${height} with ${bufferPx}px buffer`);

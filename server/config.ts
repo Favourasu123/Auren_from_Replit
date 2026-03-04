@@ -21,6 +21,8 @@ export function getRegionBasedEthnicity(ethnicity: string | undefined | null): s
   return ETHNICITY_TO_REGION_MAP[lower] || ethnicity;
 }
 
+const DEFAULT_CHATGPT_STAGE1_PROMPT_TEMPLATE = `Interpret the user's hairstyle request and apply it to this exact same person: "{hairstyle}". Preserve the original facial features, head angle, head size, skin tone, expression, and pose exactly as shown. Modify only the hair. You may fully redesign the hair to match the request, without being constrained by the current hair shape or style. Bright frontal studio lighting, sharp photorealistic quality.`;
+
 export const GENERATION_CONFIG = {
   // Vision model for analyzing user photos (uses GPT-4o-mini via Replit AI Integrations)
   VISION_MODEL: "gpt-4o-mini",
@@ -50,7 +52,7 @@ export const GENERATION_CONFIG = {
   CHATGPT_IMAGE_SIZE: (process.env.CHATGPT_IMAGE_SIZE || "1024x1536") as "1024x1024" | "1024x1536" | "1536x1024",
   CHATGPT_IMAGE_QUALITY: (process.env.CHATGPT_IMAGE_QUALITY || "low") as "low" | "medium" | "high",
   CHATGPT_DESCRIBE_PROMPT_TEMPLATE: "Transform this person's hairstyle to: {hairstyle}. Keep the same person, same face, same features, same clothing, same background. Only change the hairstyle to match the description. Photorealistic, natural lighting, professional portrait quality.",
-  CHATGPT_STAGE1_PROMPT_TEMPLATE: "Interpret the user's hairstyle request and apply it to this exact same person: \"{hairstyle}\". Preserve identity, face geometry, skin tone, and pose. Change only the hair. Bright frontal studio lighting, sharp photorealistic quality.",
+  CHATGPT_STAGE1_PROMPT_TEMPLATE: process.env.CHATGPT_STAGE1_PROMPT_TEMPLATE || DEFAULT_CHATGPT_STAGE1_PROMPT_TEMPLATE,
   
   // BFL FLUX 2 Pro prompt template (used by AI Polish and fallback features)
   TEXT_MODE_FRONT_PROMPT_TEMPLATE: "Apply image 1's exact face and head with the hair from image 2. Place them in the exact background in image 3. Preserve image 3's head shape and dimensions. Use the hairtype in image 2. Smooth natural photorealistic lighting",
@@ -64,8 +66,17 @@ export const GENERATION_CONFIG = {
   KONTEXT_STAGE1_PROMPT: "Make the person front-facing, centered, looking directly at the camera. Preserve the exact hairstyle. The person is wearing a clean white shirt. Bright, centered, symmetrical, frontal lighting aligned with the camera axis, producing flat, even illumination across the entire subject. The full hairstyle is visible with at least 15–20% of the image height as empty space above the highest hair point. Plain studio background in neutral light gray (hex #D0D0D0), evenly lit, no texture or objects. Professional photorealistic studio portrait. Shot in a bright professional studio using a Phase One XF IQ4 medium format camera, ultra-sharp focus, high clarity, high dynamic range, no depth-of-field blur, and no cinematic softness.",
   KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE: "Give the person a {hairstyle} hairstyle while preserving the person. Use bright, frontal lighting aligned with the camera axis, producing flat, even illumination across the entire subject. Professional photorealistic studio portrait. Shot in a bright professional studio using a Phase One XF IQ4 medium format camera, ultra-sharp focus, high clarity, high dynamic range, no depth-of-field blur, and no cinematic softness.",
   KONTEXT_STAGE1_GUIDANCE: 15, // Guidance for Kontext Stage 1
-  KONTEXT_STAGE2_PROMPT: process.env.KONTEXT_STAGE2_PROMPT || "Apply image 1's exact face and head with the hair from image 2. Place them in the exact background in image 3. Preserve image 3's head shape and dimensions. Use the hairtype in image 2. Smooth natural photorealistic lighting",
+  KONTEXT_STAGE2_PROMPT: process.env.KONTEXT_STAGE2_PROMPT || "Use image 1 as the full user photo base. Preserve the person's face and neck in image 2. Edit only the hair region in image 3 (hair in original color on gray background). Apply the hairstyle from image 4. Keep all non-hair pixels from image 1. Smooth natural photorealistic lighting.",
+  KONTEXT_FILL_PROMPT: process.env.KONTEXT_FILL_PROMPT || "The person in image 1 with a {hairstyle} hairstyle.",
+  KONTEXT_FILL_GUIDANCE: parseFloat(process.env.KONTEXT_FILL_GUIDANCE || "25"),
+  KONTEXT_FILL_STEPS: parseInt(process.env.KONTEXT_FILL_STEPS || "45"),
+  KONTEXT_FILL_PROMPT_UPSAMPLING: process.env.KONTEXT_FILL_PROMPT_UPSAMPLING === "true",
+  KONTEXT_FILL_OUTPUT_FORMAT: (process.env.KONTEXT_FILL_OUTPUT_FORMAT || "jpeg").trim().toLowerCase(),
   KONTEXT_STAGE2_SAFETY_TOLERANCE: 0, // Safety tolerance for FLUX 2 Pro Stage 2
+  KONTEXT_STAGE2_BACKEND: (() => {
+    const backend = (process.env.KONTEXT_STAGE2_BACKEND || "flux2").trim().toLowerCase();
+    return backend === "fal_redux_fill" ? "flux2" : backend; // flux2 | flux_fill | blend_inpaint | gpt_fill
+  })(),
   KONTEXT_STAGE2_USE_IMAGE3: process.env.KONTEXT_STAGE2_USE_IMAGE3 !== "false", // Default true: send 3 images to FLUX Stage 2
   KONTEXT_STAGE2_FACE_OUTLINE_PX: 10, // Pixels of face outline to show in hair mask
   TEXT_MODE_VISION_SELECTION: true, // Use vision model to select best reference from candidates
@@ -115,6 +126,7 @@ export function buildGenerationPrompt(
 ): string {
   const ethnicity = mapRaceToEthnicity(race);
   return template
+    .replace("{hairstyle name}", hairstyle)
     .replace("{hairstyle}", hairstyle)
     .replace("{ethnicity}", ethnicity)
     .replace("{race}", race)
@@ -140,13 +152,35 @@ export function logConfig() {
         ? GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE
         : GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT);
     const webReferenceSearchEnabled = !GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT;
+    const stage2Backend = GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND === "blend_inpaint"
+      ? "blend_inpaint"
+      : GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND === "flux_fill"
+        ? "flux_fill"
+      : GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND === "gpt_fill"
+        ? "gpt_fill"
+        : "flux2";
+    const stage2Label = stage2Backend === "blend_inpaint"
+      ? "Blend Inpaint"
+      : stage2Backend === "flux_fill"
+        ? "FLUX Fill"
+      : stage2Backend === "gpt_fill"
+        ? `GPT Fill (${GENERATION_CONFIG.CHATGPT_MODEL})`
+        : "FLUX 2 Pro";
 
-    console.log(`Pipeline: Kontext Refined (${textModeStage1Label} → FLUX 2 Pro)`);
+    console.log(`Pipeline: Kontext Refined (${textModeStage1Label} → ${stage2Label})`);
     console.log(`  - Text Mode: ${GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT ? "direct (no web references)" : "reference-guided (web references)"}`);
     console.log(`  - Stage 1 Provider: ${textModeStage1Label}`);
     console.log(`  - Stage 1 Prompt: ${stage1PromptTemplate.substring(0, 60)}...`);
     console.log(`  - Stage 2 Prompt: ${GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.substring(0, 60)}...`);
-    console.log(`  - Stage 2 Inputs: ${GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3 ? "3 images (img1+img2+img3)" : "2 images (img1+img2)"}`);
+    console.log(`  - Stage 2 Backend: ${stage2Backend}`);
+    if (stage2Backend === "blend_inpaint" || stage2Backend === "gpt_fill" || stage2Backend === "flux_fill") {
+      console.log(`  - Fill Prompt: ${GENERATION_CONFIG.KONTEXT_FILL_PROMPT.substring(0, 60)}...`);
+      console.log(`  - Fill Params: guidance=${GENERATION_CONFIG.KONTEXT_FILL_GUIDANCE}, steps=${GENERATION_CONFIG.KONTEXT_FILL_STEPS}, upsampling=${GENERATION_CONFIG.KONTEXT_FILL_PROMPT_UPSAMPLING}, format=${GENERATION_CONFIG.KONTEXT_FILL_OUTPUT_FORMAT}`);
+    }
+    const stage2InputSummary = stage2Backend === "flux_fill"
+      ? "2 inputs (image+mask)"
+      : (GENERATION_CONFIG.KONTEXT_STAGE2_USE_IMAGE3 ? "3 images (img1+img2+img3)" : "2 images (img1+img2)");
+    console.log(`  - Stage 2 Inputs: ${stage2InputSummary}`);
     console.log(`  - Web Reference Search: ${webReferenceSearchEnabled ? "enabled" : "disabled"}`);
     if (webReferenceSearchEnabled) {
       console.log(`  - Vision Selection: ${GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION ? "enabled" : "disabled"}`);

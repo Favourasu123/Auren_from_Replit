@@ -15,7 +15,6 @@ import Dashboard from "@/pages/Dashboard";
 import Explore from "@/pages/Explore";
 import Debug from "@/pages/Debug";
 import DebugPartner from "@/pages/DebugPartner";
-import MaskComparison from "@/pages/MaskComparison";
 import ValidationDebug from "@/pages/ValidationDebug";
 import FetchedImagesDebug from "@/pages/FetchedImagesDebug";
 import BusinessDashboard from "@/pages/BusinessDashboard";
@@ -69,7 +68,6 @@ function Router() {
       <Route path="/terms" component={Terms} />
       <Route path="/debug/:id" component={Debug} />
       <Route path="/debug-partner" component={DebugPartner} />
-      <Route path="/mask-comparison" component={MaskComparison} />
       <Route path="/validation-debug" component={ValidationDebug} />
       <Route path="/fetched-images" component={FetchedImagesDebug} />
       <Route path="/survey-preview" component={SurveyPreview} />
