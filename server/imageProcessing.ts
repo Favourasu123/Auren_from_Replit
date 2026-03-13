@@ -1118,7 +1118,21 @@ async function callBiSeNetPipeline(
   imageBase64: string,
   mode: "hair_only" | "kontext_result_mask_test",
   bufferPx: number,
-  options?: { roiDilatePx?: number; grayOutEyes?: boolean; faceBorderPx?: number }
+  options?: {
+    roiDilatePx?: number;
+    grayOutEyes?: boolean;
+    faceBorderPx?: number;
+    includeFace?: boolean;
+    faceBufferPx?: number;
+    skinBorderPx?: number;
+    includeTopNeckPx?: number;
+    includeBelowNeckPx?: number;
+    grayOutFacialFeatures?: boolean;
+    featureOnlyBlot?: boolean;
+    preprocessSharpen?: boolean;
+    grayOutEarrings?: boolean;
+    useHardKeepMask?: boolean;
+  }
 ): Promise<{ result: string | null; width: number; height: number; validation?: MaskValidation }> {
   // Ensure we have a proper data URI
   let inputImage = imageBase64;
@@ -1132,19 +1146,19 @@ async function callBiSeNetPipeline(
     }
   }
 
-  // Normalize EXIF orientation and sharpen for better edge detection
+  // Normalize EXIF orientation; sharpening is optional per pipeline mode.
   const rawBuffer = Buffer.from(
     inputImage.replace(/^data:image\/\w+;base64,/, ''),
     'base64'
   );
-  
-  // Sharpen reference images before masking to improve hair edge detection
-  // Uses unsharp mask: sigma=1.0, flat=1.0, jagged=2.0 for balanced sharpening
-  const normalizedBuffer = await sharp(rawBuffer)
-    .rotate()
-    .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
-    .jpeg({ quality: 95 })
-    .toBuffer();
+
+  const shouldSharpen = options?.preprocessSharpen !== false;
+  let normalizePipeline = sharp(rawBuffer).rotate();
+  if (shouldSharpen) {
+    // Uses unsharp mask: sigma=1.0, flat=1.0, jagged=2.0 for balanced sharpening.
+    normalizePipeline = normalizePipeline.sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 });
+  }
+  const normalizedBuffer = await normalizePipeline.jpeg({ quality: 95 }).toBuffer();
   
   const normalizedBase64 = `data:image/jpeg;base64,${normalizedBuffer.toString('base64')}`;
   
@@ -1158,7 +1172,16 @@ async function callBiSeNetPipeline(
     bufferPx: bufferPx,
     grayOutEyes: options?.grayOutEyes || false,
     faceBorderPx: options?.faceBorderPx || 0,
-    roiDilatePx: options?.roiDilatePx
+    roiDilatePx: options?.roiDilatePx,
+    includeFace: options?.includeFace || false,
+    faceBufferPx: options?.faceBufferPx || 0,
+    skinBorderPx: options?.skinBorderPx || 0,
+    includeTopNeckPx: options?.includeTopNeckPx ?? 0,
+    includeBelowNeckPx: options?.includeBelowNeckPx ?? 0,
+    grayOutFacialFeatures: options?.grayOutFacialFeatures || false,
+    featureOnlyBlot: options?.featureOnlyBlot || false,
+    grayOutEarrings: options?.grayOutEarrings || false,
+    useHardKeepMask: options?.useHardKeepMask || false
   });
   
   const { result, validation } = await new Promise<{ result: string | null; validation?: MaskValidation }>((resolve) => {
@@ -1281,21 +1304,58 @@ export async function createHairOnlyImage(
 }
 
 /**
- * Creates a standalone Kontext Stage-1 result mask using the hair_only pipeline.
- * Output: hair-only mask with configurable buffer around detected hair (face excluded).
+ * Creates a standalone Kontext/GPT Stage-1 result mask.
+ * Output can be hair-only or face+hair depending on includeFace.
  */
 export async function createKontextResultMaskTest(
   imageBase64: string,
-  bufferPx: number = 0
+  bufferPx: number = 0,
+  includeFace: boolean = false,
+  grayOutEarrings: boolean = false,
+  faceBufferPx: number = 0,
+  skinBorderPx: number = 0,
+  includeTopNeckPx: number = 0,
+  includeBelowNeckPx: number = 0,
+  grayOutFacialFeatures: boolean = false,
+  useHardKeepMask: boolean = false,
+  featureOnlyBlot: boolean = false
 ): Promise<string | null> {
   try {
-    console.log(`Creating Kontext result mask test (${bufferPx}px buffer)...`);
+    const faceLabel = includeFace ? `face+hair (face buffer: ${faceBufferPx}px)` : "hair-only";
+    const skinLabel = !includeFace && skinBorderPx > 0 ? `face-edge expansion: ${skinBorderPx}px` : "face-edge expansion: 0px";
+    const neckLabel = includeTopNeckPx < 0
+      ? "neck: full"
+      : includeTopNeckPx > 0
+        ? `top neck: ${includeTopNeckPx}px`
+        : "top neck: 0px";
+    const belowNeckLabel = includeBelowNeckPx > 0 ? `below neck: ${includeBelowNeckPx}px` : "below neck: 0px";
+    const featuresLabel = grayOutFacialFeatures ? "facial features grayed" : "facial features unchanged";
+    const featureOnlyLabel = featureOnlyBlot ? "feature-only blot enabled" : "full mask logic";
+    const earringLabel = grayOutEarrings ? "earrings grayed" : "earrings unchanged";
+    const hardMaskLabel = useHardKeepMask ? "hard keep-mask enabled" : "matting enabled";
+    console.log(`Creating Kontext result mask test (${bufferPx}px buffer, ${faceLabel}, ${skinLabel}, ${neckLabel}, ${belowNeckLabel}, ${featuresLabel}, ${featureOnlyLabel}, ${earringLabel}, ${hardMaskLabel})...`);
 
     // Use raw Stage-1 output for this test pipeline (no TS-side sharpening).
-    const { result, width, height } = await callBiSeNetPipeline(imageBase64, "kontext_result_mask_test", bufferPx);
+    const { result, width, height } = await callBiSeNetPipeline(
+      imageBase64,
+      "kontext_result_mask_test",
+      bufferPx,
+      {
+        includeFace,
+        faceBufferPx,
+        skinBorderPx,
+        includeTopNeckPx,
+        includeBelowNeckPx,
+        grayOutFacialFeatures,
+        featureOnlyBlot,
+        preprocessSharpen: false,
+        grayOutEarrings,
+        useHardKeepMask
+      }
+    );
 
     if (result) {
-      console.log(`✓ Kontext result mask test created at ${width}x${height} (${bufferPx}px buffer)`);
+      console.log(`✓ Kontext result mask test created at ${width}x${height} (${bufferPx}px buffer, ${faceLabel}, ${skinLabel}, ${neckLabel}, ${belowNeckLabel}, ${featuresLabel}, ${featureOnlyLabel}, ${earringLabel}, ${hardMaskLabel})`);
     }
     return result;
   } catch (error: any) {

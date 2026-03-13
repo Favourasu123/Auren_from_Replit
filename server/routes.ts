@@ -846,6 +846,11 @@ const TOGETHER_API_URL = "https://api.together.xyz/v1/images/generations";
 const TOGETHER_CHAT_URL = "https://api.together.xyz/v1/chat/completions";
 const BFL_API_KEY = process.env.BFL_API_KEY;
 const BFL_API_URL = "https://api.bfl.ai/v1/flux-2-pro"; // FLUX 2 Pro with multi-reference support
+const BFL_FLUX_KLEIN_STAGE1_API_URL = process.env.BFL_FLUX_KLEIN_STAGE1_API_URL || "https://api.bfl.ai/v1/flux-2-klein-9b"; // Stage 1 Flux Klein provider endpoint
+const BFL_FLUX_KLEIN_STAGE2_API_URL =
+  process.env.BFL_FLUX_KLEIN_API_URL ||
+  process.env.BFL_FLUX_STAGE2_SINGLE_API_URL ||
+  "https://api.bfl.ai/v1/flux-2-klein-9b"; // Stage 2 Flux Klein endpoint for the single-stage contract
 const BFL_KONTEXT_API_URL = "https://api.bfl.ai/v1/flux-kontext-pro"; // FLUX Kontext Pro for image-to-image with context
 const BFL_FILL_API_URL = "https://api.bfl.ai/v1/flux-pro-1.0-fill"; // FLUX Fill for mask-based inpainting
 const FAL_AI_KEY = process.env.FAL_AI_KEY || process.env.FAL_KEY;
@@ -863,13 +868,22 @@ const REPLICATE_API_TOKEN = process.env.REPLICATE_API_TOKEN; // For PuLID and Ha
 const GENERATION_TIMEOUT_SECONDS = 65;
 
 const MODEL_ID_FLUX_STAGE2 = "flux-2-pro";
+const MODEL_ID_FLUX_KLEIN_STAGE2 = "flux-2-klein-9b";
+const MODEL_ID_FLUX_KLEIN_STAGE1 = "flux-2-klein-9b";
 const MODEL_ID_FLUX_FILL_STAGE2 = "flux-pro-1.0-fill";
 const MODEL_ID_FAL_REDUX_FILL_STAGE2 = "fal-ai/flux-pro/v1/redux+fill";
 const MODEL_ID_BLEND_STAGE2 = "blend-inpaint-local-v1";
 const MODEL_ID_GPT_FILL_STAGE2 = "gpt-image-fill";
 const MODEL_ID_KONTEXT_STAGE1 = "flux-kontext-pro";
 const MODEL_ID_MASK_PIPELINE = "kontext_result_mask_test";
-type KontextStage2Backend = "fal_redux_fill" | "flux_fill" | "flux2" | "blend_inpaint" | "gpt_fill";
+const KLEIN_SINGLE_STAGE_REFERENCE_PROMPT = (
+  GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT_KLEIN ||
+  "Image 1 is the full image, it contains the subject. Use image 1 as the base and reference. Preserve the person in image 1. Image 2 shows the subject's face which you should preserve. Image 3 contains a hairstyle on a mannequin, change the subject's hair to the hairstyle in image 3. Make the hair emerge naturally from the scalp. Maintain a natural hairline and root direction. Make the hairstyle match the subject's head shape and perspective. Original photorealistic lighting."
+).replace(/\s+/g, " ").trim();
+const KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT =
+  GENERATION_CONFIG.CHATGPT_STAGE1_PROMPT_TEMPLATE.replace(/\s+/g, " ").trim();
+type KontextStage2Backend = "fal_redux_fill" | "flux_fill" | "flux2" | "flux_klein" | "blend_inpaint" | "gpt_fill";
+type KontextStage1Provider = "gpt_image" | "kontext" | "flux_klein";
 
 if (FAL_AI_KEY) {
   fal.config({ credentials: FAL_AI_KEY });
@@ -877,7 +891,7 @@ if (FAL_AI_KEY) {
 
 type ModelDebugInfo = {
   pipeline: string;
-  stage1Provider?: "gpt_image" | "kontext";
+  stage1Provider?: KontextStage1Provider;
   stage1Model?: string;
   stage2Model?: string;
   stage2Backend?: KontextStage2Backend;
@@ -885,6 +899,19 @@ type ModelDebugInfo = {
   maskPipeline?: string;
   generatedAt: string;
 };
+
+function resolveKontextStage1Provider(rawProvider?: string): KontextStage1Provider {
+  const provider = (rawProvider || "").trim().toLowerCase();
+  if (provider === "flux_klein" || provider === "klein") return "flux_klein";
+  if (provider === "kontext") return "kontext";
+  return "gpt_image";
+}
+
+function getKontextStage1ProviderLabel(provider: KontextStage1Provider): string {
+  if (provider === "gpt_image") return `GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})`;
+  if (provider === "flux_klein") return "FLUX 2 Klein";
+  return "FLUX Kontext Pro";
+}
 
 function mergeCompositeData(existing: string | null | undefined, patch: Record<string, unknown>): string {
   let base: Record<string, unknown> = {};
@@ -905,9 +932,14 @@ function resolveKontextStage2Backend(rawBackend?: string): KontextStage2Backend 
   const backend = (rawBackend || "").trim().toLowerCase();
   if (backend === "fal_redux_fill") return "flux2";
   if (backend === "flux_fill") return "flux_fill";
+  if (backend === "flux_klein" || backend === "klein") return "flux_klein";
   if (backend === "blend_inpaint") return "blend_inpaint";
   if (backend === "gpt_fill") return "gpt_fill";
   return "flux2";
+}
+
+function getKontextStage2BflApiUrl(backend: KontextStage2Backend): string {
+  return backend === "flux_klein" ? BFL_FLUX_KLEIN_STAGE2_API_URL : BFL_API_URL;
 }
 
 function stripImageDataUri(dataUri: string): string {
@@ -930,6 +962,13 @@ async function saveDebugImageFromAnySource(filePath: string, imageSource: string
   }
   const imageBuffer = Buffer.from(await response.arrayBuffer());
   await fsPromises.writeFile(filePath, imageBuffer);
+}
+
+function getRequestedDebugIndex(req: any): number | null {
+  const raw = Array.isArray(req?.query?.index) ? req.query.index[0] : req?.query?.index;
+  if (raw === undefined || raw === null || raw === "") return null;
+  const idx = Number.parseInt(String(raw), 10);
+  return Number.isFinite(idx) && idx > 0 ? idx : null;
 }
 
 async function convertGrayBackgroundMaskToBinary(
@@ -1182,6 +1221,47 @@ async function buildStage2FaceNeckMaskFromHairPipeline(
     true,
     false
   );
+}
+
+async function buildStage2FaceMaskForKleinSingleStage(
+  userImageBase64: string
+): Promise<string | null> {
+  // Face-only mask for Stage 2 Klein input_image_2 (hair excluded, neck excluded).
+  return createUserMaskedImage(
+    userImageBase64,
+    0,
+    false,
+    10,
+    false,
+    true,
+    false
+  );
+}
+
+async function createReferenceHairMaskForKleinSingleStage(
+  referenceImageBase64: string
+): Promise<string | null> {
+  try {
+    // Use Stage 1 result to build a Klein guidance mask (fast path: blot only facial features).
+    console.log("🎭 Preparing reference mask: stage1_feature_only_face_blot...");
+    const referenceHairMask = await createKontextResultMaskTest(
+      referenceImageBase64,
+      0,
+      true,
+      false,
+      0,
+      0,
+      0,
+      0,
+      true,
+      false,
+      true
+    );
+    return referenceHairMask;
+  } catch (error) {
+    console.warn("[KLEIN SINGLE] Failed to prepare Stage 2 reference mask:", error);
+    return null;
+  }
 }
 
 async function buildAlphaFillImage(
@@ -1934,23 +2014,33 @@ async function runKontextStage2BlendBackend(
 }
 
 function buildKontextRefinedModelDebug(
-  stage1Provider: "gpt_image" | "kontext",
+  stage1Provider: KontextStage1Provider,
   promptSource: string = "KONTEXT_STAGE2_PROMPT"
 ): ModelDebugInfo {
   const stage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
+  const { source: defaultPromptSource } = getKontextStage2PromptTemplateForBackend(stage2Backend);
+  const resolvedPromptSource = promptSource === "KONTEXT_STAGE2_PROMPT"
+    ? defaultPromptSource
+    : promptSource;
   const stage2PromptSource = stage2Backend === "gpt_fill" || stage2Backend === "flux_fill"
     ? "KONTEXT_FILL_PROMPT"
-    : promptSource;
+    : resolvedPromptSource;
   return {
     pipeline: "kontext_refined",
     stage1Provider,
-    stage1Model: stage1Provider === "gpt_image" ? GENERATION_CONFIG.CHATGPT_MODEL : MODEL_ID_KONTEXT_STAGE1,
+    stage1Model: stage1Provider === "gpt_image"
+      ? GENERATION_CONFIG.CHATGPT_MODEL
+      : stage1Provider === "flux_klein"
+        ? MODEL_ID_FLUX_KLEIN_STAGE1
+        : MODEL_ID_KONTEXT_STAGE1,
     stage2Model: stage2Backend === "blend_inpaint"
       ? MODEL_ID_BLEND_STAGE2
       : stage2Backend === "fal_redux_fill"
         ? MODEL_ID_FAL_REDUX_FILL_STAGE2
       : stage2Backend === "flux_fill"
         ? MODEL_ID_FLUX_FILL_STAGE2
+      : stage2Backend === "flux_klein"
+        ? MODEL_ID_FLUX_KLEIN_STAGE2
       : stage2Backend === "gpt_fill"
         ? `${MODEL_ID_GPT_FILL_STAGE2}:${GENERATION_CONFIG.CHATGPT_MODEL}`
       : MODEL_ID_FLUX_STAGE2,
@@ -1962,32 +2052,33 @@ function buildKontextRefinedModelDebug(
 }
 
 function normalizeKontextStage2PromptForHairColorMask(prompt: string): string {
-  let normalized = prompt || "";
+  return (prompt || "").replace(/\s+/g, " ").trim();
+}
 
-  // Normalize legacy wording to the current 4-image contract:
-  // image_1 full user photo, image_2 face+neck mask, image_3 user hair color mask, image_4 GPT hair-only mask.
-  normalized = normalized.replace(
-    /Change ONLY the person's hair shown as white in image 1\.?/i,
-    "Use image 1 as the full user photo. Preserve the face in image 2. Edit only the hair region shown in image 3 (hair in original color on gray background). Transfer hairstyle from image 4."
-  );
-  normalized = normalized.replace(
-    /shown in a white mask/gi,
-    "shown in image 3 (hair in original color on gray background)"
-  );
-  normalized = normalized.replace(/white[-\s]?hair mask/gi, "hair color mask (image 3)");
-  normalized = normalized.replace(/\bwhite mask\b/gi, "hair color mask");
-  normalized = normalized.replace(/Preserve non-hair pixels from image 4/gi, "Preserve non-hair pixels from image 1");
-  normalized = normalized.replace(/Apply the hair in image 3 to the person/gi, "Apply the hair in image 4 to the person");
-  normalized = normalized.replace(/Preserve the person's face in image 2/gi, "Preserve the person's face in image 2");
+function normalizeKontextStage2PromptForKleinMask(prompt: string): string {
+  return (prompt || "").replace(/\s+/g, " ").trim();
+}
 
-  // Force a deterministic contract prefix so model instructions always match payload order.
-  normalized =
-    "Use image 1 as the full user photo base. Preserve the face and neck from image 2. " +
-    "Edit only the hair region from image 3 (hair color mask: hair in original color on gray background). " +
-    "Transfer hairstyle structure from image 4. Keep all non-hair pixels exactly from image 1. " +
-    normalized;
+function getKontextStage2PromptTemplateForBackend(
+  backend: KontextStage2Backend
+): { template: string; source: string } {
+  if (backend === "flux_klein") {
+    return {
+      template: GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT_KLEIN,
+      source: "KONTEXT_STAGE2_PROMPT_KLEIN",
+    };
+  }
+  return {
+    template: GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT,
+    source: "KONTEXT_STAGE2_PROMPT",
+  };
+}
 
-  return normalized;
+function buildKontextStage2PromptForBackend(prompt: string, backend: KontextStage2Backend): string {
+  if (backend === "flux_klein") {
+    return normalizeKontextStage2PromptForKleinMask(prompt);
+  }
+  return normalizeKontextStage2PromptForHairColorMask(prompt);
 }
 
 // Maximum generations per session (beta limit)
@@ -2110,7 +2201,6 @@ async function fetchImageAsBase64(imageUrl: string): Promise<string | null> {
       try {
         const jpegBuffer = await sharp(buffer).jpeg({ quality: 85 }).toBuffer();
         const jpegBase64 = jpegBuffer.toString("base64");
-        console.log(`  ✓ Converted ${mimeType} to JPEG (${Math.round(jpegBuffer.length/1024)}KB)`);
         return `data:image/jpeg;base64,${jpegBase64}`;
       } catch (conversionError) {
         console.error(`Failed to convert ${mimeType} to JPEG:`, conversionError);
@@ -2133,7 +2223,6 @@ async function fetchImageAsBase64(imageUrl: string): Promise<string | null> {
           .resize(2000, 2000, { fit: "inside", withoutEnlargement: true })
           .jpeg({ quality: 85 })
           .toBuffer();
-        console.log(`  ✓ Resized large image to fit 2000px (${Math.round(resizedBuffer.length/1024)}KB)`);
         return `data:image/jpeg;base64,${resizedBuffer.toString("base64")}`;
       }
     } catch (validationError) {
@@ -2172,13 +2261,10 @@ function isSocialMediaUrl(url: string): boolean {
 // This bypasses CDN restrictions by taking a screenshot of the actual webpage
 async function captureImageWithScreenshotOne(pageUrl: string): Promise<string | null> {
   if (!SCREENSHOTONE_ACCESS_KEY) {
-    console.log("ScreenshotOne not configured, skipping screenshot capture");
     return null;
   }
   
   try {
-    console.log(`📸 Capturing screenshot of: ${pageUrl.substring(0, 60)}...`);
-    
     // Build ScreenshotOne API URL with high-quality settings
     const params = new URLSearchParams({
       access_key: SCREENSHOTONE_ACCESS_KEY,
@@ -2223,7 +2309,6 @@ async function captureImageWithScreenshotOne(pageUrl: string): Promise<string | 
     const base64 = buffer.toString("base64");
     const dataUri = `data:image/png;base64,${base64}`;
     
-    console.log(`✓ Screenshot captured: ${buffer.length} bytes (${Math.round(buffer.length/1024)}KB)`);
     return dataUri;
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
@@ -2242,12 +2327,10 @@ async function fetchFirstAccessibleImage(imageUrls: string[]): Promise<string | 
   for (const url of imageUrls) {
     // For social media URLs, use ScreenshotOne as PRIMARY method
     if (isSocialMediaUrl(url) && SCREENSHOTONE_ACCESS_KEY) {
-      console.log(`Social media URL detected, using ScreenshotOne...`);
       const base64 = await captureImageWithScreenshotOne(url);
       if (base64) {
         return base64;
       }
-      console.log(`ScreenshotOne failed for social media URL, trying next...`);
       continue;
     }
     
@@ -2258,7 +2341,6 @@ async function fetchFirstAccessibleImage(imageUrls: string[]): Promise<string | 
     }
   }
   
-  console.log(`No accessible images found from ${imageUrls.length} URLs`);
   return null;
 }
 
@@ -2497,6 +2579,103 @@ interface CombinedAnalysisResult {
   hairstyleInterpretation: string;
 }
 
+const HAIRSTYLE_STOP_WORDS = new Set([
+  "a", "an", "and", "best", "cool", "cut", "female", "for", "front", "facing",
+  "hairstyle", "hairstyles", "hair", "haircut", "i", "in", "is", "look", "male",
+  "me", "my", "of", "on", "please", "style", "that", "the", "to", "trendy",
+  "want", "with", "world"
+]);
+
+function extractKnownHairstyleName(text: string): string | null {
+  const normalized = (text || "").toLowerCase();
+  const hairstylePatterns: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /\b(knotless braids)\b/, label: "knotless braids" },
+    { pattern: /\b(box braids)\b/, label: "box braids" },
+    { pattern: /\b(buzz cut)\b/, label: "buzz cut" },
+    { pattern: /\b(crew cut)\b/, label: "crew cut" },
+    { pattern: /\b(wolf cut)\b/, label: "wolf cut" },
+    { pattern: /\b(slick back)\b/, label: "slick back" },
+    { pattern: /\b(top knot)\b/, label: "top knot" },
+    { pattern: /\b(man bun)\b/, label: "man bun" },
+    { pattern: /\b(cornrows)\b/, label: "cornrows" },
+    { pattern: /\b(dreadlocks|locs)\b/, label: "locs" },
+    { pattern: /\b(waves)\b/, label: "waves" },
+    { pattern: /\b(afro)\b/, label: "afro" },
+    { pattern: /\b(mullet)\b/, label: "mullet" },
+    { pattern: /\b(mohawk)\b/, label: "mohawk" },
+    { pattern: /\b(undercut)\b/, label: "undercut" },
+    { pattern: /\b(taper)\b/, label: "taper" },
+    { pattern: /\b(fade)\b/, label: "fade" },
+    { pattern: /\b(bob)\b/, label: "bob" },
+    { pattern: /\b(pixie)\b/, label: "pixie" },
+    { pattern: /\b(shag)\b/, label: "shag" },
+    { pattern: /\b(quiff)\b/, label: "quiff" },
+    { pattern: /\b(pompadour)\b/, label: "pompadour" },
+    { pattern: /\b(fringe|bangs)\b/, label: "fringe" },
+    { pattern: /\b(braids?)\b/, label: "braids" },
+    { pattern: /\b(twists?)\b/, label: "twists" },
+    { pattern: /\b(curls?)\b/, label: "curls" },
+  ];
+
+  for (const { pattern, label } of hairstylePatterns) {
+    if (pattern.test(normalized)) return label;
+  }
+  return null;
+}
+
+function normalizeHairstyleName(rawValue: string, fallbackPrompt: string): string {
+  const source = (rawValue || "").trim() || (fallbackPrompt || "").trim();
+  const known = extractKnownHairstyleName(source);
+  if (known) return known;
+
+  const normalized = source
+    .toLowerCase()
+    .replace(/[`"'“”’]/g, " ")
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized) return "hairstyle";
+
+  const words = normalized.split(" ").filter(Boolean);
+  const filtered = words.filter((word) => !HAIRSTYLE_STOP_WORDS.has(word));
+  const tokens = (filtered.length > 0 ? filtered : words).slice(0, 2);
+  return tokens.join(" ") || "hairstyle";
+}
+
+function buildBestHairstyleSearchQuery(hairstyleName: string, userAnalysis: UserPhotoAnalysis): string {
+  const gender = userAnalysis.gender === "male"
+    ? "men"
+    : userAnalysis.gender === "female"
+      ? "women"
+      : "people";
+
+  const raceTerms: Record<string, string> = {
+    asian: "asian",
+    black: "black",
+    white: "white",
+    latino: "latino",
+    middle_eastern: "middle eastern",
+    south_asian: "south asian",
+    southeast_asian: "southeast asian",
+    mixed: "mixed",
+  };
+  const normalizedRace = (userAnalysis.raceEthnicity || "").toLowerCase().trim();
+  const race = raceTerms[normalizedRace] || normalizedRace.replace(/_/g, " ").trim();
+  const raceAndGender = race && race !== "unknown" && race !== "person" ? `${race} ${gender}` : gender;
+
+  return `Best ${hairstyleName} hairstyle for ${raceAndGender}`.replace(/\s+/g, " ").trim();
+}
+
+function shuffleArray<T>(items: T[]): T[] {
+  const shuffled = [...items];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
 async function analyzeUserPhotoWithPrompt(
   photoUrl: string,
   hairstylePrompt: string
@@ -2538,10 +2717,14 @@ Use these categories: asian, black, white, latino, middle_eastern, south_asian, 
 Look at: eye shape, nose bridge, lip fullness, skin undertones, facial bone structure.
 
 INTERPRET THE HAIRSTYLE REQUEST:
-Based on what the user asked for:
-1. Generate a search query to find reference images in this format:
-   "best [hairstyle name] hairstyle for [race] [gender] (front facing)"
-2. DESCRIBE THE HAIRSTYLE - State ONLY the key defining factor of this hairstyle in 20 words max.
+Extract ONLY the hairstyle name from the user request.
+Rules:
+1. Return exactly 1-2 words.
+2. No adjectives, no explanation, no sentence.
+3. Keep only the hairstyle type.
+Example:
+- User request: "I want the best slick and trendy waves hairstyle in the world"
+- hairstyleName: "waves"
 
 USER'S HAIRSTYLE REQUEST: "${hairstylePrompt}"
 
@@ -2560,8 +2743,7 @@ Return this JSON:
     "faceAngle": "front" | "three_quarter" | "side" | "tilted",
     "faceAngleConfidence": 0.0-1.0
   },
-  "searchQuery": "best [hairstyle] hairstyle for [race] [gender] (front facing)",
-  "hairstyleInterpretation": "The key defining factor of this hairstyle in 20 words max"
+  "hairstyleName": "1-2 word hairstyle label only"
 }
 
 Return ONLY valid JSON, no markdown code blocks, no explanation.`;
@@ -2708,15 +2890,21 @@ Return ONLY valid JSON, no markdown code blocks, no explanation.`;
       faceAngleConfidence: parsed.userAnalysis?.faceAngleConfidence || 0.5,
     };
 
+    const hairstyleName = normalizeHairstyleName(
+      parsed.hairstyleName || parsed.hairstyleInterpretation || "",
+      hairstylePrompt
+    );
+    const searchQuery = buildBestHairstyleSearchQuery(hairstyleName, userAnalysis);
+
     const result: CombinedAnalysisResult = {
       userAnalysis,
-      searchQuery: parsed.searchQuery || `${userAnalysis.raceEthnicity} ${userAnalysis.gender} ${hairstylePrompt} hairstyle`,
-      hairstyleInterpretation: parsed.hairstyleInterpretation || hairstylePrompt,
+      searchQuery,
+      hairstyleInterpretation: hairstyleName,
     };
     
     console.log(`[COMBINED ANALYSIS] ✓ Completed in ${(responseTime / 1000).toFixed(2)}s`);
     console.log(`   👤 User: ${userAnalysis.gender}, ${userAnalysis.raceEthnicity}, ${userAnalysis.faceShape} face`);
-    console.log(`   💇 Interpretation: "${result.hairstyleInterpretation}"`);
+    console.log(`   💇 Hairstyle name: "${result.hairstyleInterpretation}"`);
     console.log(`   🔍 Search query: "${result.searchQuery}"`);
     
     return result;
@@ -3343,24 +3531,32 @@ async function searchWebForHairstyleImages(
   // Try SerpAPI first (primary - Google Images search)
   if (SERPAPI_KEY) {
     try {
-      const serpApiUrl = new URL("https://serpapi.com/search.json");
-      serpApiUrl.searchParams.set("api_key", SERPAPI_KEY);
-      serpApiUrl.searchParams.set("engine", "google_images");
-      serpApiUrl.searchParams.set("q", searchQuery);
-      serpApiUrl.searchParams.set("num", String(Math.min(maxResults * 3, 100)));
-      serpApiUrl.searchParams.set("safe", "active");
-      
-      const response = await fetch(serpApiUrl.toString());
-      
-      if (response.ok) {
+      const perPage = 100;
+      const pages = Math.max(1, Math.ceil(maxResults / perPage));
+      const allImages: any[] = [];
+      for (let page = 0; page < pages; page++) {
+        const serpApiUrl = new URL("https://serpapi.com/search.json");
+        serpApiUrl.searchParams.set("api_key", SERPAPI_KEY);
+        serpApiUrl.searchParams.set("engine", "google_images");
+        serpApiUrl.searchParams.set("q", searchQuery);
+        serpApiUrl.searchParams.set("num", String(perPage));
+        serpApiUrl.searchParams.set("safe", "active");
+        serpApiUrl.searchParams.set("ijn", String(page));
+        
+        const response = await fetch(serpApiUrl.toString());
+        if (!response.ok) break;
+
         const data = await response.json();
         const images = data.images_results || [];
-        
-        if (images.length > 0) {
-          const results = processAndFilterImages(images, "original");
-          if (results.length > 0) {
-            return results;
-          }
+        if (images.length === 0) break;
+        allImages.push(...images);
+        if (images.length < perPage) break;
+      }
+      
+      if (allImages.length > 0) {
+        const results = processAndFilterImages(allImages, "original");
+        if (results.length > 0) {
+          return results;
         }
       }
     } catch (error) {
@@ -3495,34 +3691,39 @@ async function searchWebForHairstyleImagesWithQuery(
   // Try SerpAPI first (primary - Google Images search)
   if (SERPAPI_KEY) {
     try {
-      const serpApiUrl = new URL("https://serpapi.com/search.json");
-      serpApiUrl.searchParams.set("api_key", SERPAPI_KEY);
-      serpApiUrl.searchParams.set("engine", "google_images");
-      serpApiUrl.searchParams.set("q", searchQuery);
-      serpApiUrl.searchParams.set("num", String(Math.min(maxResults * 3, 100)));
-      serpApiUrl.searchParams.set("safe", "active");
-      serpApiUrl.searchParams.set("ijn", "0"); // First page
-      
-      console.log(`[SEARCH] Trying SerpAPI Google Images...`);
-      const response = await fetch(serpApiUrl.toString());
-      console.log(`[SEARCH] SerpAPI response status: ${response.status}`);
-      
-      if (response.ok) {
+      const perPage = 100;
+      const pages = Math.max(1, Math.ceil(maxResults / perPage));
+      const allImages: any[] = [];
+
+      for (let page = 0; page < pages; page++) {
+        const serpApiUrl = new URL("https://serpapi.com/search.json");
+        serpApiUrl.searchParams.set("api_key", SERPAPI_KEY);
+        serpApiUrl.searchParams.set("engine", "google_images");
+        serpApiUrl.searchParams.set("q", searchQuery);
+        serpApiUrl.searchParams.set("num", String(perPage));
+        serpApiUrl.searchParams.set("safe", "active");
+        serpApiUrl.searchParams.set("ijn", String(page));
+
+        const response = await fetch(serpApiUrl.toString());
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error(`[SEARCH] SerpAPI error on page ${page + 1}: ${response.status} - ${errorText}`);
+          break;
+        }
+
         const data = await response.json();
         const images = data.images_results || [];
-        console.log(`[SEARCH] SerpAPI returned ${images.length} images`);
-        
-        if (images.length > 0) {
-          // SerpAPI uses "original" for the full image URL
-          const results = processImages(images, "original");
-          console.log(`[SEARCH] After filtering: ${results.length} images from SerpAPI`);
-          if (results.length > 0) {
-            return results;
-          }
+        if (images.length === 0) break;
+        allImages.push(...images);
+        if (images.length < perPage) break;
+      }
+
+      if (allImages.length > 0) {
+        const results = processImages(allImages, "original");
+        if (results.length > 0) {
+          return results;
         }
-      } else {
-        const errorText = await response.text();
-        console.error(`[SEARCH] SerpAPI error: ${response.status} - ${errorText}`);
       }
     } catch (error) {
       console.error("[SEARCH] SerpAPI exception:", error);
@@ -3543,18 +3744,14 @@ async function searchWebForHairstyleImagesWithQuery(
       googleUrl.searchParams.set("imgType", "photo");
       googleUrl.searchParams.set("safe", "active");
       
-      console.log(`[SEARCH] Trying Google Custom Search API fallback...`);
       const response = await fetch(googleUrl.toString());
-      console.log(`[SEARCH] Google CSE response status: ${response.status}`);
       
       if (response.ok) {
         const data = await response.json();
         const items = data.items || [];
-        console.log(`[SEARCH] Google CSE returned ${items.length} images`);
         
         if (items.length > 0) {
           const results = processImages(items, "link");
-          console.log(`[SEARCH] After filtering: ${results.length} images from Google CSE`);
           if (results.length > 0) {
             return results;
           }
@@ -3571,7 +3768,6 @@ async function searchWebForHairstyleImagesWithQuery(
   // Fallback to Serper API
   if (SERPER_API_KEY) {
     try {
-      console.log(`[SEARCH] Trying Serper API fallback...`);
       const response = await fetch("https://google.serper.dev/images", {
         method: "POST",
         headers: {
@@ -3584,16 +3780,12 @@ async function searchWebForHairstyleImagesWithQuery(
         })
       });
       
-      console.log(`[SEARCH] Serper response status: ${response.status}`);
-      
       if (response.ok) {
         const data = await response.json();
         const images = data.images || [];
-        console.log(`[SEARCH] Serper returned ${images.length} total images`);
         
         if (images.length > 0) {
           const results = processImages(images, "imageUrl");
-          console.log(`[SEARCH] After filtering: ${results.length} images from Serper`);
           return results;
         }
       } else {
@@ -3755,9 +3947,11 @@ async function generateHairstyleWithChatGPT(
     quality?: ChatGPTImageQuality;
     secondaryImageUrl?: string;
     tertiaryImageUrl?: string;
+    additionalImageUrls?: string[];
   }
 ): Promise<string | null> {
   try {
+    const generationStartMs = Date.now();
     const openaiApiKey = process.env.AI_INTEGRATIONS_OPENAI_API_KEY || process.env.OPENAI_API_KEY;
     const openaiBaseUrl = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
     
@@ -3779,6 +3973,11 @@ async function generateHairstyleWithChatGPT(
     }
     if (options?.tertiaryImageUrl) {
       console.log("Image 3 (tertiary):", options.tertiaryImageUrl.substring(0, 50) + "...");
+    }
+    if (options?.additionalImageUrls?.length) {
+      options.additionalImageUrls.forEach((url, idx) => {
+        console.log(`Image ${idx + 4} (additional):`, url.substring(0, 50) + "...");
+      });
     }
     console.log("Hairstyle prompt:", hairstylePrompt);
     const promptTemplate = options?.promptTemplate || GENERATION_CONFIG.CHATGPT_DESCRIBE_PROMPT_TEMPLATE;
@@ -3805,14 +4004,14 @@ async function generateHairstyleWithChatGPT(
       return Buffer.from(arrayBuffer);
     };
 
-    // Get image buffers for multipart upload (image1 required, image2 optional).
-    const image1Buffer = await loadImageBuffer(photoUrl);
-    const image2Buffer = options?.secondaryImageUrl
-      ? await loadImageBuffer(options.secondaryImageUrl)
-      : null;
-    const image3Buffer = options?.tertiaryImageUrl
-      ? await loadImageBuffer(options.tertiaryImageUrl)
-      : null;
+    // Get image buffers for multipart upload.
+    const imageSources = [
+      photoUrl,
+      options?.secondaryImageUrl,
+      options?.tertiaryImageUrl,
+      ...(options?.additionalImageUrls || []),
+    ].filter((src): src is string => Boolean(src));
+    const imageBuffers = await Promise.all(imageSources.map(loadImageBuffer));
 
     // Use OpenAI SDK with proper multipart form-data for images/edits
     const OpenAI = await import("openai");
@@ -3822,16 +4021,13 @@ async function generateHairstyleWithChatGPT(
       baseURL: openaiBaseUrl,
     });
 
-    // Convert buffers to File-like objects for OpenAI SDK using toFile helper
-    const imageFile1 = await toFile(image1Buffer, "image_1.png", { type: "image/png" });
-    const imageFile2 = image2Buffer
-      ? await toFile(image2Buffer, "image_2.png", { type: "image/png" })
-      : null;
-    const imageFile3 = image3Buffer
-      ? await toFile(image3Buffer, "image_3.png", { type: "image/png" })
-      : null;
-    const imageFiles = [imageFile1, imageFile2, imageFile3].filter(Boolean);
-    const imagePayload = imageFiles.length === 1 ? imageFile1 : (imageFiles as any);
+    // Convert buffers to File-like objects for OpenAI SDK using toFile helper.
+    const imageFiles = await Promise.all(
+      imageBuffers.map((buffer, idx) =>
+        toFile(buffer, `image_${idx + 1}.png`, { type: "image/png" })
+      )
+    );
+    const imagePayload = imageFiles.length === 1 ? imageFiles[0] : (imageFiles as any);
 
     console.log(`Calling OpenAI images.edit with ${GENERATION_CONFIG.CHATGPT_MODEL}...`);
     
@@ -3845,6 +4041,7 @@ async function generateHairstyleWithChatGPT(
     });
 
     console.log("OpenAI images.edit response received");
+    console.log(`ChatGPT image edit total time: ${((Date.now() - generationStartMs) / 1000).toFixed(2)}s`);
 
     if (response.data && response.data[0]) {
       // gpt-image-1 returns base64 by default
@@ -4161,7 +4358,7 @@ async function generateHairstyleSingleView(
 
 // ============================================
 // KONTEXT REFINED PIPELINE: Two-stage generation
-// Stage 1: Provider-selected generation (GPT Image edit or FLUX Kontext Pro)
+// Stage 1: Provider-selected generation (GPT Image edit, FLUX Kontext Pro, or FLUX 2 Klein)
 // Stage 2: FLUX 2 Pro (user mask + hair-only mask from Stage 1 + full user photo)
 // ============================================
 async function generateWithKontextRefined(
@@ -4171,7 +4368,12 @@ async function generateWithKontextRefined(
   maskedUserPhoto: string,
   userRace: string = "person",
   userGender: string = "",
-  options?: { promptOnlyMode?: boolean; stage1Provider?: "kontext" | "gpt_image" }
+  options?: {
+    promptOnlyMode?: boolean;
+    stage1Provider?: KontextStage1Provider;
+    kontextReferenceImageForKleinMask?: string;
+    debugIndex?: number;
+  }
 ): Promise<string | null> {
   try {
     if (!BFL_API_KEY) {
@@ -4212,9 +4414,12 @@ async function generateWithKontextRefined(
     }
     console.log(`📐 Output dimensions: ${outputWidth}×${outputHeight}`);
     
+    const debugIndex = options?.debugIndex;
     const promptOnlyMode = options?.promptOnlyMode === true;
-    const stage1Provider = options?.stage1Provider === "gpt_image" ? "gpt_image" : "kontext";
-    const stage1Template = stage1Provider === "gpt_image"
+    const stage1Provider = resolveKontextStage1Provider(
+      options?.stage1Provider || GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER
+    );
+    const stage1Template = stage1Provider === "gpt_image" || stage1Provider === "flux_klein"
       ? GENERATION_CONFIG.CHATGPT_STAGE1_PROMPT_TEMPLATE
       : (promptOnlyMode ? GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT_DIRECT_TEMPLATE : GENERATION_CONFIG.KONTEXT_STAGE1_PROMPT);
     const stage1Prompt = buildGenerationPrompt(
@@ -4223,17 +4428,19 @@ async function generateWithKontextRefined(
       userRace,
       userGender
     );
-    const stage1ProviderLabel = stage1Provider === "gpt_image"
-      ? `GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})`
-      : "FLUX Kontext Pro";
+    const stage1ProviderLabel = getKontextStage1ProviderLabel(stage1Provider);
     const stage1InputLabel = stage1Provider === "gpt_image"
+      ? "image 1 reference only"
+      : stage1Provider === "flux_klein"
       ? "full user photo"
       : (promptOnlyMode ? "user image" : "reference image");
 
     console.log(`🧭 Stage 1 provider: ${stage1ProviderLabel}`);
     console.log(`📝 Stage 1 prompt: ${stage1Prompt}`);
 
-    const stage1PrimaryImage = (stage1Provider === "gpt_image" || promptOnlyMode)
+    const stage1PrimaryImage = stage1Provider === "gpt_image"
+      ? referenceBase64
+      : (stage1Provider === "flux_klein" || promptOnlyMode)
       ? normalizedPhotoUrl
       : referenceBase64;
 
@@ -4259,14 +4466,44 @@ async function generateWithKontextRefined(
           stage1PrimaryImage.replace(/^data:image\/\w+;base64,/, ''),
           'base64'
         );
-        const debugPath = stage1Provider === "gpt_image"
+        const debugPath = stage1Provider === "flux_klein"
           ? "/tmp/debug_kontext_stage1_input_user.jpg"
           : "/tmp/debug_kontext_stage1_input_ref.jpg";
         await fsDebugInputs.writeFile(debugPath, refInputBuffer);
+        if (debugIndex) {
+          const indexedPath = stage1Provider === "flux_klein"
+            ? `/tmp/debug_kontext_stage1_input_user_${debugIndex}.jpg`
+            : `/tmp/debug_kontext_stage1_input_ref_${debugIndex}.jpg`;
+          await fsDebugInputs.writeFile(indexedPath, refInputBuffer);
+        }
         console.log(`   ✓ Saved Stage 1 input to ${debugPath}`);
       }
     } catch (e) {
       console.warn("Could not save Stage 1 input debug image:", e);
+    }
+
+    try {
+      const stage1Metadata = {
+        generatedAt: new Date().toISOString(),
+        provider: stage1Provider,
+        providerLabel: stage1ProviderLabel,
+        inputLabel: stage1InputLabel,
+        prompt: stage1Prompt,
+        inputLength: stage1PrimaryImage.length,
+        inputPreview: stage1PrimaryImage.substring(0, 160),
+      };
+      await fsDebugInputs.writeFile(
+        "/tmp/debug_kontext_stage1_metadata.json",
+        JSON.stringify(stage1Metadata, null, 2)
+      );
+      if (debugIndex) {
+        await fsDebugInputs.writeFile(
+          `/tmp/debug_kontext_stage1_metadata_${debugIndex}.json`,
+          JSON.stringify(stage1Metadata, null, 2)
+        );
+      }
+    } catch (e) {
+      console.warn("Could not save Stage 1 metadata:", e);
     }
     
     let kontextResultUrl: string | null = null;
@@ -4299,6 +4536,87 @@ async function generateWithKontextRefined(
       }
       const elapsed = Math.floor((Date.now() - startTime) / 1000);
       console.log(`   ✓ Stage 1 complete (${elapsed}s)`);
+    } else if (stage1Provider === "flux_klein") {
+      console.log(`📦 Stage 1 model: ${MODEL_ID_FLUX_KLEIN_STAGE1}`);
+      const stage1RequestBody: any = {
+        prompt: stage1Prompt,
+        input_image: stage1PrimaryImage,
+        width: outputWidth,
+        height: outputHeight,
+        safety_tolerance: 0,
+      };
+      console.log(`📦 Stage 1 request keys (Flux Klein): ${Object.keys(stage1RequestBody).join(", ")}`);
+
+      const stage1SubmitResponse = await fetch(BFL_FLUX_KLEIN_STAGE1_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-key": BFL_API_KEY!,
+        },
+        body: JSON.stringify(stage1RequestBody),
+      });
+
+      if (!stage1SubmitResponse.ok) {
+        const errorText = await stage1SubmitResponse.text();
+        console.error(`[FLUX KLEIN STAGE 1] Submission error: ${stage1SubmitResponse.status} - ${errorText}`);
+        return null;
+      }
+
+      const stage1SubmitData = await stage1SubmitResponse.json();
+      console.log(`🎫 Stage 1 submission ID: ${stage1SubmitData.id}`);
+
+      const stage1PollingUrl = stage1SubmitData.polling_url;
+      if (!stage1PollingUrl) {
+        console.error("[FLUX KLEIN STAGE 1] No polling URL returned");
+        return null;
+      }
+
+      attempts = 0;
+      lastLogTime = 0;
+      while (attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        const pollResponse = await fetch(stage1PollingUrl, {
+          headers: { "x-key": BFL_API_KEY! },
+        });
+
+        if (!pollResponse.ok) {
+          attempts++;
+          continue;
+        }
+
+        const result = await pollResponse.json();
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        if (elapsed - lastLogTime >= 10) {
+          console.log(`   ⏳ Stage 1 generating... ${elapsed}s (${result.status})`);
+          lastLogTime = elapsed;
+        }
+
+        if (result.status === "Ready" || result.status === "succeeded") {
+          kontextResultUrl = result.result?.sample || null;
+          if (kontextResultUrl) {
+            console.log(`   ✓ Stage 1 complete (${elapsed}s)`);
+            break;
+          }
+          console.error("   ✗ Stage 1 failed: no image URL");
+          return null;
+        } else if (result.status === "Error" || result.status === "Failed" || result.status === "error" || result.status === "failed") {
+          console.error(`   ✗ Stage 1 failed: ${result.status}`);
+          return null;
+        }
+
+        attempts++;
+      }
+
+      if (kontextResultUrl) {
+        const resizedStage1 = await resizeImageToDimensions(kontextResultUrl, sourceWidth, sourceHeight);
+        if (resizedStage1) {
+          kontextResultUrl = resizedStage1;
+          console.log(`   ✓ Stage 1 resized to user dimensions: ${sourceWidth}x${sourceHeight}`);
+        } else {
+          console.warn("[FLUX KLEIN STAGE 1] Could not enforce exact user dimensions; using original output");
+        }
+      }
     } else {
       const kontextRequestBody: any = {
         prompt: stage1Prompt,
@@ -4388,6 +4706,9 @@ async function generateWithKontextRefined(
       const kontextImageResponse = await fetch(kontextResultUrl);
       const kontextImageBuffer = Buffer.from(await kontextImageResponse.arrayBuffer());
       await fsDebug.writeFile("/tmp/debug_kontext_stage1_result.jpg", kontextImageBuffer);
+      if (debugIndex) {
+        await fsDebug.writeFile(`/tmp/debug_kontext_stage1_result_${debugIndex}.jpg`, kontextImageBuffer);
+      }
       console.log(`✓ Saved Stage 1 result to /tmp/debug_kontext_stage1_result.jpg`);
     } catch (e) {
       console.warn("Could not save Stage 1 debug image:", e);
@@ -4415,7 +4736,7 @@ async function generateWithKontextRefined(
       
       // Create hair-only mask from Kontext result (only hair visible, face grayed out)
       console.log(`🎭 Creating hair-only mask from Stage 1 result (face grayed out)...`);
-      const stage1HairOnlyMask = await createHairOnlyImage(kontextBase64ForMask, 20);
+      const stage1HairOnlyMask = await createHairOnlyImage(kontextBase64ForMask, 0);
       if (!stage1HairOnlyMask) {
         console.error("[KONTEXT] Failed to create hair-only mask from Stage 1");
         return kontextResultUrl;
@@ -4429,6 +4750,9 @@ async function generateWithKontextRefined(
           'base64'
         );
         await fsDebug.writeFile("/tmp/debug_kontext_stage1_hair_face_mask.png", hairOnlyMaskBuffer);
+        if (debugIndex) {
+          await fsDebug.writeFile(`/tmp/debug_kontext_stage1_hair_face_mask_${debugIndex}.png`, hairOnlyMaskBuffer);
+        }
         console.log(`✓ Saved Stage 1 hair-only mask to /tmp/debug_kontext_stage1_hair_face_mask.png`);
       } catch (e) {
         console.warn("Could not save hair-only mask debug image:", e);
@@ -4537,31 +4861,51 @@ async function generateWithKontextRefined(
       return null;
     }
     
-    // Sharpen Stage 1 result before masking for better hair edge detection
-    console.log(`✨ Sharpening Stage 1 output for mask accuracy...`);
-    try {
-      const kontextBuffer = Buffer.from(
-        kontextBase64.replace(/^data:image\/\w+;base64,/, ''),
-        'base64'
-      );
-      const sharpenedBuffer = await sharp(kontextBuffer)
-        .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
-        .jpeg({ quality: 95 })
-        .toBuffer();
-      kontextBase64 = `data:image/jpeg;base64,${sharpenedBuffer.toString('base64')}`;
-      console.log(`   ✓ Stage 1 result sharpened: ${kontextBase64.length} chars`);
-    } catch (e) {
-      console.log(`   ⚠ Sharpening failed, using original: ${(e as Error).message}`);
+    if (stage1Provider === "gpt_image") {
+      console.log(`✨ Skipping sharpening for GPT Stage 1 result mask input.`);
+    } else {
+      // Keep sharpening for Kontext Stage 1 outputs.
+      console.log(`✨ Sharpening Stage 1 output for mask accuracy...`);
+      try {
+        const kontextBuffer = Buffer.from(
+          kontextBase64.replace(/^data:image\/\w+;base64,/, ''),
+          'base64'
+        );
+        const sharpenedBuffer = await sharp(kontextBuffer)
+          .sharpen({ sigma: 1.0, m1: 1.0, m2: 2.0 })
+          .jpeg({ quality: 95 })
+          .toBuffer();
+        kontextBase64 = `data:image/jpeg;base64,${sharpenedBuffer.toString('base64')}`;
+        console.log(`   ✓ Stage 1 result sharpened: ${kontextBase64.length} chars`);
+      } catch (e) {
+        console.log(`   ⚠ Sharpening failed, using original: ${(e as Error).message}`);
+      }
     }
     
-    // Create hair-only mask from Stage 1 result using hair_only pipeline.
-    console.log(`🎭 Creating Stage 1 hair-only mask (pipeline: hair_only)...`);
-    const kontextHairMask = await createHairOnlyImage(kontextBase64, 10);
-    if (!kontextHairMask) {
-      console.error("[STAGE 2] Failed to create hair-only mask from Stage 1 output");
-      return null;
+    const stage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
+    const includeFaceInStage1ResultMask = false;
+    let kontextHairMask = "";
+    const providedKleinMask = options?.kontextReferenceImageForKleinMask;
+    if (stage2Backend === "flux_klein" && providedKleinMask) {
+      kontextHairMask = providedKleinMask;
+      console.log("🎭 Using provided reference mask for Klein Stage 2 input.");
+    } else {
+      console.log(
+        `🎭 Creating Stage 1 result mask (pipeline: kontext_result_mask_test, includeFace=${includeFaceInStage1ResultMask}, grayOutEarrings=true)...`
+      );
+      const generatedKontextHairMask = await createKontextResultMaskTest(
+        kontextBase64,
+        0,
+        includeFaceInStage1ResultMask,
+        true
+      );
+      if (!generatedKontextHairMask) {
+        console.error("[STAGE 2] Failed to create Stage 1 result mask");
+        return null;
+      }
+      kontextHairMask = generatedKontextHairMask;
     }
-    console.log(`   ✓ Hair-only mask created: ${kontextHairMask.length} chars`);
+    console.log(`   ✓ Stage 1 result mask prepared: ${kontextHairMask.length} chars`);
 
     // Save hair-only mask for debugging
     try {
@@ -4570,13 +4914,22 @@ async function generateWithKontextRefined(
         'base64'
       );
       await fsDebug.writeFile("/tmp/debug_kontext_stage1_hair_face_mask.png", hairMaskBuffer);
+      if (debugIndex) {
+        await fsDebug.writeFile(`/tmp/debug_kontext_stage1_hair_face_mask_${debugIndex}.png`, hairMaskBuffer);
+      }
       console.log(`✓ Saved Stage 1 hair-only mask to /tmp/debug_kontext_stage1_hair_face_mask.png`);
     } catch (e) {
       console.warn("Could not save hair-only mask debug image:", e);
     }
     
-    const stage2Prompt = normalizeKontextStage2PromptForHairColorMask(
-      GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.replace('{ethnicity}', getRegionBasedEthnicity(userRace))
+    const { template: stage2PromptTemplate } = getKontextStage2PromptTemplateForBackend(stage2Backend);
+    const normalizedStage2Template = stage2PromptTemplate
+      .replace("{ethnicity}", getRegionBasedEthnicity(userRace))
+      .replace("{hairstyle name}", hairstylePrompt)
+      .replace("{hairstyle}", hairstylePrompt);
+    const stage2Prompt = buildKontextStage2PromptForBackend(
+      normalizedStage2Template,
+      stage2Backend
     );
     const stage2FillPrompt = buildGenerationPrompt(
       GENERATION_CONFIG.KONTEXT_FILL_PROMPT,
@@ -4610,7 +4963,6 @@ async function generateWithKontextRefined(
       console.warn("Could not save debug files:", e);
     }
 
-    const stage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
     console.log(`🧭 Stage 2 backend: ${stage2Backend}`);
 
     if (stage2Backend === "fal_redux_fill") {
@@ -4733,16 +5085,24 @@ async function generateWithKontextRefined(
       return blendedStage2Result;
     }
 
-    console.log(`🎭 Creating Stage 2 user hair color mask (hair color preserved, gray background)...`);
-    const stage2UserHairMaskGray = await createHairOnlyImage(normalizedPhotoUrl, 10);
-    if (!stage2UserHairMaskGray) {
-      console.error("[FLUX STAGE 2] Failed to create user hair mask");
-      return null;
-    }
-    try {
-      await saveBase64DebugImage("/tmp/debug_stage2_user_hair_color_mask.jpg", stage2UserHairMaskGray);
-    } catch (error) {
-      console.warn("Could not save Stage 2 user hair color mask debug image:", error);
+    let stage2UserHairMaskGray: string | null = null;
+    if (stage2Backend !== "flux_klein") {
+      console.log(`🎭 Creating Stage 2 user hair color mask (hair color preserved, gray background)...`);
+      stage2UserHairMaskGray = await createHairOnlyImage(normalizedPhotoUrl, 10);
+      if (!stage2UserHairMaskGray) {
+        console.error("[FLUX STAGE 2] Failed to create user hair mask");
+        return null;
+      }
+      try {
+        await saveBase64DebugImage("/tmp/debug_stage2_user_hair_color_mask.jpg", stage2UserHairMaskGray);
+        if (debugIndex) {
+          await saveBase64DebugImage(`/tmp/debug_stage2_user_hair_color_mask_${debugIndex}.jpg`, stage2UserHairMaskGray);
+        }
+      } catch (error) {
+        console.warn("Could not save Stage 2 user hair color mask debug image:", error);
+      }
+    } else {
+      console.log(`🎭 Using Flux Klein Stage 2 contract (no user hair color mask input).`);
     }
 
     console.log(`🎭 Creating Stage 2 face+neck mask (image 2, user_mask includeHair=false)...`);
@@ -4765,38 +5125,62 @@ async function generateWithKontextRefined(
     }
     try {
       await saveBase64DebugImage("/tmp/debug_stage2_user_face_neck_mask.jpg", stage2FaceNeckMask);
+      if (debugIndex) {
+        await saveBase64DebugImage(`/tmp/debug_stage2_user_face_neck_mask_${debugIndex}.jpg`, stage2FaceNeckMask);
+      }
     } catch (error) {
       console.warn("Could not save Stage 2 face+neck mask debug image:", error);
     }
 
-    // Flux 2 Pro contract:
-    // image 1 = full user photo (base/background source)
-    // image 2 = user face+neck mask (identity lock, no hair)
-    // image 3 = user hair color mask (editable hair region)
-    // image 4 = GPT/Kontext Stage 1 hair-only mask (hair source)
-    const stage2InputImage = normalizedPhotoUrl;
-    const stage2InputImage2 = stage2FaceNeckMask;
-    const stage2InputImage3 = stage2UserHairMaskGray;
-    const stage2InputImage4 = kontextHairMask;
-    const stage2RequestBody: any = {
-      prompt: stage2Prompt,
-      input_image: stage2InputImage,
-      input_image_2: stage2InputImage2,
-      input_image_3: stage2InputImage3,
-      input_image_4: stage2InputImage4,
-      width: outputWidth,
-      height: outputHeight,
-      safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
-    };
+    let stage2RequestBody: any;
+    if (stage2Backend === "flux_klein") {
+      // Flux Klein contract:
+      // image 1 = full user photo (base/background source)
+      // image 1 = full user photo (base/background source)
+      // image 2 = user face+neck mask (identity lock)
+      // image 3 = provided reference hair mask (or GPT/Kontext Stage 1 result mask fallback)
+      stage2RequestBody = {
+        prompt: stage2Prompt,
+        input_image: normalizedPhotoUrl,
+        input_image_2: stage2FaceNeckMask,
+        input_image_3: kontextHairMask,
+        width: outputWidth,
+        height: outputHeight,
+        safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
+      };
+    } else {
+      // Flux 2 Pro contract:
+      // image 1 = full user photo (base/background source)
+      // image 2 = user face+neck mask (identity lock, no hair)
+      // image 3 = user hair color mask (editable hair region)
+      // image 4 = GPT/Kontext Stage 1 hair-only mask (hair source)
+      stage2RequestBody = {
+        prompt: stage2Prompt,
+        input_image: normalizedPhotoUrl,
+        input_image_2: stage2FaceNeckMask,
+        input_image_3: stage2UserHairMaskGray,
+        input_image_4: kontextHairMask,
+        width: outputWidth,
+        height: outputHeight,
+        safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
+      };
+    }
+    const stage2ApiUrl = getKontextStage2BflApiUrl(stage2Backend);
+    console.log(`🛰️ Stage 2 endpoint: ${stage2ApiUrl}`);
 
     console.log(`📦 Stage 2 request keys: ${Object.keys(stage2RequestBody).join(", ")}`);
-    console.log(`  📤 input_image (full user photo): ${stage2InputImage.length} chars`);
-    console.log(`  📤 input_image_2 (user face+neck mask): ${stage2InputImage2.length} chars`);
-    console.log(`  📤 input_image_3 (user hair color mask): ${stage2InputImage3.length} chars`);
-    console.log(`  📤 input_image_4 (gpt stage1 hair-only mask): ${stage2InputImage4.length} chars`);
+    console.log(`  📤 input_image (full user photo): ${normalizedPhotoUrl.length} chars`);
+    console.log(`  📤 input_image_2 (user face+neck mask): ${stage2FaceNeckMask.length} chars`);
+    if (stage2Backend === "flux_klein") {
+      const kleinMaskSource = providedKleinMask ? "reference hair mask (20px buffer)" : "stage1 result mask";
+      console.log(`  📤 input_image_3 (${kleinMaskSource}): ${kontextHairMask.length} chars`);
+    } else {
+      console.log(`  📤 input_image_3 (user hair color mask): ${stage2UserHairMaskGray!.length} chars`);
+      console.log(`  📤 input_image_4 (stage1 hair-only mask): ${kontextHairMask.length} chars`);
+    }
     
     // Submit Stage 2
-    const stage2SubmitResponse = await fetch(BFL_API_URL, {
+    const stage2SubmitResponse = await fetch(stage2ApiUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -4859,6 +5243,9 @@ async function generateWithKontextRefined(
             if (stage2Response.ok) {
               const stage2Buffer = Buffer.from(await stage2Response.arrayBuffer());
               await fsPromises.writeFile("/tmp/debug_flux_stage2_result.jpg", stage2Buffer);
+              if (debugIndex) {
+                await fsPromises.writeFile(`/tmp/debug_flux_stage2_result_${debugIndex}.jpg`, stage2Buffer);
+              }
               console.log(`✓ Saved Stage 2 result to /tmp/debug_flux_stage2_result.jpg`);
             }
           } catch (e) {
@@ -5241,6 +5628,239 @@ async function generateSingleBflImage(
   }
 }
 
+async function generateSingleFluxKleinFromReferenceMask(
+  userPhotoBase64: string,
+  userFaceMaskBase64: string,
+  referenceHairMaskBase64: string,
+  debugIndex?: number
+): Promise<string | null> {
+  try {
+    if (!BFL_API_KEY) {
+      console.error("[KLEIN SINGLE] BFL_API_KEY is not configured.");
+      return null;
+    }
+
+    let outputWidth = 1024;
+    let outputHeight = 1024;
+    const userDims = await getImageDimensions(userPhotoBase64);
+    if (userDims) {
+      const fluxDims = calculateFluxDimensions(userDims.width, userDims.height);
+      outputWidth = fluxDims.width;
+      outputHeight = fluxDims.height;
+    }
+
+    const requestBody = {
+      prompt: KLEIN_SINGLE_STAGE_REFERENCE_PROMPT,
+      input_image: userPhotoBase64,
+      input_image_2: referenceHairMaskBase64,
+      input_image_3: userFaceMaskBase64,
+      width: outputWidth,
+      height: outputHeight,
+      safety_tolerance: GENERATION_CONFIG.TEXT_MODE_SAFETY_TOLERANCE,
+    };
+
+    console.log("🛰️ Klein single-stage endpoint:", BFL_FLUX_KLEIN_STAGE2_API_URL);
+    console.log("📦 Klein single-stage request keys:", Object.keys(requestBody).join(", "));
+    console.log(`  📤 input_image (full user photo): ${userPhotoBase64.length} chars`);
+    console.log(`  📤 input_image_2 (reference mannequin hair mask): ${referenceHairMaskBase64.length} chars`);
+    console.log(`  📤 input_image_3 (user face mask): ${userFaceMaskBase64.length} chars`);
+    console.log(`📝 Klein single-stage prompt: ${KLEIN_SINGLE_STAGE_REFERENCE_PROMPT}`);
+
+    const submitResponse = await fetch(BFL_FLUX_KLEIN_STAGE2_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-key": BFL_API_KEY!,
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!submitResponse.ok) {
+      const errorText = await submitResponse.text();
+      console.error(`[KLEIN SINGLE] Submission error: ${submitResponse.status} - ${errorText}`);
+      return null;
+    }
+
+    const submitData = await submitResponse.json();
+    console.log(`🎫 Klein single-stage submission ID: ${submitData.id}`);
+
+    const pollingUrl = submitData.polling_url;
+    if (!pollingUrl) {
+      console.error("[KLEIN SINGLE] No polling URL returned.");
+      return null;
+    }
+
+    const maxAttempts = GENERATION_TIMEOUT_SECONDS;
+    let attempts = 0;
+    const startTime = Date.now();
+    let lastLogTime = 0;
+
+    while (attempts < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      const pollResponse = await fetch(pollingUrl, {
+        headers: { "x-key": BFL_API_KEY! },
+      });
+
+      if (!pollResponse.ok) {
+        attempts++;
+        continue;
+      }
+
+      const result = await pollResponse.json();
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      if (elapsed - lastLogTime >= 10) {
+        console.log(`   ⏳ Klein single-stage generating... ${elapsed}s (${result.status})`);
+        lastLogTime = elapsed;
+      }
+
+      if (result.status === "Ready" || result.status === "succeeded") {
+        const finalImageUrl = result.result?.sample || null;
+        if (!finalImageUrl) {
+          console.error("[KLEIN SINGLE] Completed without image URL.");
+          return null;
+        }
+        console.log(`   ✓ Klein single-stage complete (${elapsed}s)`);
+        try {
+          const stage2Response = await fetch(finalImageUrl);
+          if (stage2Response.ok) {
+            const stage2Buffer = Buffer.from(await stage2Response.arrayBuffer());
+            await fsPromises.writeFile("/tmp/debug_flux_stage2_result.jpg", stage2Buffer);
+            if (debugIndex) {
+              await fsPromises.writeFile(`/tmp/debug_flux_stage2_result_${debugIndex}.jpg`, stage2Buffer);
+            }
+            console.log("✓ Saved Klein single-stage result to /tmp/debug_flux_stage2_result.jpg");
+          }
+        } catch (e) {
+          console.warn("[KLEIN SINGLE] Could not save debug output:", e);
+        }
+        return finalImageUrl;
+      }
+
+      if (result.status === "Error" || result.status === "Failed" || result.status === "error" || result.status === "failed") {
+        console.error(`   ✗ Klein single-stage failed: ${result.status}`);
+        return null;
+      }
+
+      attempts++;
+    }
+
+    console.error(`[KLEIN SINGLE] Timeout after ${GENERATION_TIMEOUT_SECONDS}s`);
+    return null;
+  } catch (error) {
+    console.error("[KLEIN SINGLE] Unexpected error:", error);
+    return null;
+  }
+}
+
+async function generateKontextStage1FromReference(
+  referenceImage: string,
+  prompt: string,
+): Promise<string | null> {
+  try {
+    if (!BFL_API_KEY) {
+      console.error("[KONTEXT STAGE 1] BFL_API_KEY is not configured.");
+      return null;
+    }
+
+    let outputWidth = 1024;
+    let outputHeight = 1024;
+    const referenceDims = await getImageDimensions(referenceImage);
+    if (referenceDims) {
+      const fluxDims = calculateFluxDimensions(referenceDims.width, referenceDims.height);
+      outputWidth = fluxDims.width;
+      outputHeight = fluxDims.height;
+    }
+
+    const requestBody = {
+      prompt,
+      input_image: referenceImage,
+      width: outputWidth,
+      height: outputHeight,
+      guidance: GENERATION_CONFIG.KONTEXT_STAGE1_GUIDANCE,
+      safety_tolerance: 0,
+      prompt_upsampling: false,
+    };
+
+    console.log("🛰️ Kontext Stage 1 endpoint:", BFL_KONTEXT_API_URL);
+    console.log("📦 Kontext Stage 1 request keys:", Object.keys(requestBody).join(", "));
+    console.log(`  📤 input_image (reference): ${referenceImage.length} chars`);
+    console.log(`📝 Kontext Stage 1 prompt: ${prompt}`);
+
+    const submitResponse = await fetch(BFL_KONTEXT_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-key": BFL_API_KEY!,
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!submitResponse.ok) {
+      const errorText = await submitResponse.text();
+      console.error(`[KONTEXT STAGE 1] Submission error: ${submitResponse.status} - ${errorText}`);
+      return null;
+    }
+
+    const submitData = await submitResponse.json();
+    console.log(`🎫 Kontext Stage 1 submission ID: ${submitData.id}`);
+
+    const pollingUrl = submitData.polling_url;
+    if (!pollingUrl) {
+      console.error("[KONTEXT STAGE 1] No polling URL returned.");
+      return null;
+    }
+
+    const maxAttempts = GENERATION_TIMEOUT_SECONDS;
+    let attempts = 0;
+    const startTime = Date.now();
+    let lastLogTime = 0;
+
+    while (attempts < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      const pollResponse = await fetch(pollingUrl, {
+        headers: { "x-key": BFL_API_KEY! },
+      });
+
+      if (!pollResponse.ok) {
+        attempts++;
+        continue;
+      }
+
+      const result = await pollResponse.json();
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      if (elapsed - lastLogTime >= 10) {
+        console.log(`   ⏳ Kontext Stage 1 generating... ${elapsed}s (${result.status})`);
+        lastLogTime = elapsed;
+      }
+
+      if (result.status === "Ready" || result.status === "succeeded") {
+        const finalImageUrl = result.result?.sample || null;
+        if (!finalImageUrl) {
+          console.error("[KONTEXT STAGE 1] Completed without image URL.");
+          return null;
+        }
+        console.log(`   ✓ Kontext Stage 1 complete (${elapsed}s)`);
+        return finalImageUrl;
+      }
+
+      if (result.status === "Error" || result.status === "Failed" || result.status === "error" || result.status === "failed") {
+        console.error(`   ✗ Kontext Stage 1 failed: ${result.status}`);
+        return null;
+      }
+
+      attempts++;
+    }
+
+    console.error(`[KONTEXT STAGE 1] Timeout after ${GENERATION_TIMEOUT_SECONDS}s`);
+    return null;
+  } catch (error) {
+    console.error("[KONTEXT STAGE 1] Unexpected error:", error);
+    return null;
+  }
+}
+
 // Generate a single image using BFL FLUX 2 Pro with 3 images (user, user mask, inspiration hair-only)
 async function generateSingleBflImageWithMasks(
   userPhotoBase64: string,
@@ -5583,9 +6203,9 @@ async function generateStyleFromInspirationDual(
       console.log(`   ⚠ Sharpening failed, using original: ${(e as Error).message}`);
     }
     
-    // Create hair-only mask from Stage 1 result using hair_only pipeline.
+    // Inspiration mode keeps Stage 1 mask in hair-only mode.
     console.log(`🎭 Creating Kontext HAIR-ONLY mask from Stage 1 result (hair_only)...`);
-    const kontextHairMask = await createHairOnlyImage(kontextBase64, 10);
+    const kontextHairMask = await createHairOnlyImage(kontextBase64, 0);
     if (!kontextHairMask) {
       console.error("[KONTEXT] Failed to create hair mask from Stage 1");
       return { frontImageUrl: null, sideImageUrl: null };
@@ -5601,8 +6221,11 @@ async function generateStyleFromInspirationDual(
       console.warn("Could not save hair mask debug image:", e);
     }
 
-    const stage2Prompt = normalizeKontextStage2PromptForHairColorMask(
-      GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT.replace('{ethnicity}', getRegionBasedEthnicity(userRace))
+    const stage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
+    const { template: stage2PromptTemplate } = getKontextStage2PromptTemplateForBackend(stage2Backend);
+    const stage2Prompt = buildKontextStage2PromptForBackend(
+      stage2PromptTemplate.replace('{ethnicity}', getRegionBasedEthnicity(userRace)),
+      stage2Backend
     );
     const stage2FillPrompt = buildGenerationPrompt(
       GENERATION_CONFIG.KONTEXT_FILL_PROMPT,
@@ -5623,7 +6246,6 @@ async function generateStyleFromInspirationDual(
       console.warn("Failed to save debug images:", e);
     }
 
-    const stage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
     console.log(`🧭 Stage 2 backend: ${stage2Backend}`);
 
     if (stage2Backend === "fal_redux_fill") {
@@ -5766,16 +6388,21 @@ async function generateStyleFromInspirationDual(
       };
     }
 
-    console.log(`🎭 Creating Stage 2 user hair color mask (hair color preserved, gray background)...`);
-    const stage2UserHairMaskGray = await createHairOnlyImage(normalizedUserPhoto, 10);
-    if (!stage2UserHairMaskGray) {
-      console.error("[KONTEXT] Failed to create Stage 2 user hair mask");
-      return { frontImageUrl: null, sideImageUrl: null };
-    }
-    try {
-      await saveBase64DebugImage("/tmp/debug_stage2_user_hair_color_mask.jpg", stage2UserHairMaskGray);
-    } catch (error) {
-      console.warn("Could not save Stage 2 user hair color mask debug image:", error);
+    let stage2UserHairMaskGray: string | null = null;
+    if (stage2Backend !== "flux_klein") {
+      console.log(`🎭 Creating Stage 2 user hair color mask (hair color preserved, gray background)...`);
+      stage2UserHairMaskGray = await createHairOnlyImage(normalizedUserPhoto, 10);
+      if (!stage2UserHairMaskGray) {
+        console.error("[KONTEXT] Failed to create Stage 2 user hair mask");
+        return { frontImageUrl: null, sideImageUrl: null };
+      }
+      try {
+        await saveBase64DebugImage("/tmp/debug_stage2_user_hair_color_mask.jpg", stage2UserHairMaskGray);
+      } catch (error) {
+        console.warn("Could not save Stage 2 user hair color mask debug image:", error);
+      }
+    } else {
+      console.log(`🎭 Using Flux Klein Stage 2 contract (no user hair color mask input).`);
     }
 
     console.log(`🎭 Creating Stage 2 face+neck mask (image 2, user_mask includeHair=false)...`);
@@ -5802,34 +6429,56 @@ async function generateStyleFromInspirationDual(
       console.warn("Could not save Stage 2 face+neck mask debug image:", error);
     }
 
-    // Flux 2 Pro contract:
-    // image 1 = full user photo (base/background source)
-    // image 2 = user face+neck mask (identity lock, no hair)
-    // image 3 = user hair color mask (editable hair region)
-    // image 4 = GPT/Kontext Stage 1 hair-only mask (hair source)
-    const stage2InputImage = normalizedUserPhoto;
-    const stage2InputImage2 = stage2FaceNeckMask;
-    const stage2InputImage3 = stage2UserHairMaskGray;
-    const stage2InputImage4 = kontextHairMask;
-    const stage2RequestBody: any = {
-      prompt: stage2Prompt,
-      input_image: stage2InputImage,
-      input_image_2: stage2InputImage2,
-      input_image_3: stage2InputImage3,
-      input_image_4: stage2InputImage4,
-      width: outputWidth,
-      height: outputHeight,
-      safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
-    };
+    let stage2RequestBody: any;
+    if (stage2Backend === "flux_klein") {
+      // Flux Klein contract:
+      // image 1 = full user photo (base/background source)
+      // image 2 = user face+neck mask (identity lock)
+      // image 3 = GPT/Kontext Stage 1 result mask (hair source guidance)
+      stage2RequestBody = {
+        prompt: stage2Prompt,
+        input_image: normalizedUserPhoto,
+        input_image_2: stage2FaceNeckMask,
+        input_image_3: kontextHairMask,
+        width: outputWidth,
+        height: outputHeight,
+        safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
+      };
+    } else {
+      // Flux 2 Pro contract:
+      // image 1 = full user photo (base/background source)
+      // image 2 = user face+neck mask (identity lock, no hair)
+      // image 3 = user hair color mask (editable hair region)
+      // image 4 = GPT/Kontext Stage 1 hair-only mask (hair source)
+      stage2RequestBody = {
+        prompt: stage2Prompt,
+        input_image: normalizedUserPhoto,
+        input_image_2: stage2FaceNeckMask,
+        input_image_3: stage2UserHairMaskGray,
+        input_image_4: kontextHairMask,
+        width: outputWidth,
+        height: outputHeight,
+        safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
+      };
+    }
+    const stage2ApiUrl = getKontextStage2BflApiUrl(stage2Backend);
+    console.log(`🛰️ Stage 2 endpoint: ${stage2ApiUrl}`);
     
-    console.log(`📦 Stage 2 request: img1 full user + img2 face+neck + img3 user hair color mask + img4 stage1 hair-only`);
-    console.log(`  📤 input_image (full user): ${stage2InputImage.length} chars`);
-    console.log(`  📤 input_image_2 (user face+neck mask): ${stage2InputImage2.length} chars`);
-    console.log(`  📤 input_image_3 (user hair color mask): ${stage2InputImage3.length} chars`);
-    console.log(`  📤 input_image_4 (gpt stage1 hair-only mask): ${stage2InputImage4.length} chars`);
+    if (stage2Backend === "flux_klein") {
+      console.log(`📦 Stage 2 request (flux_klein): img1 full user + img2 face+neck + img3 stage1 result mask`);
+      console.log(`  📤 input_image (full user): ${normalizedUserPhoto.length} chars`);
+      console.log(`  📤 input_image_2 (user face+neck mask): ${stage2FaceNeckMask.length} chars`);
+      console.log(`  📤 input_image_3 (stage1 result mask): ${kontextHairMask.length} chars`);
+    } else {
+      console.log(`📦 Stage 2 request: img1 full user + img2 face+neck + img3 user hair color mask + img4 stage1 hair-only`);
+      console.log(`  📤 input_image (full user): ${normalizedUserPhoto.length} chars`);
+      console.log(`  📤 input_image_2 (user face+neck mask): ${stage2FaceNeckMask.length} chars`);
+      console.log(`  📤 input_image_3 (user hair color mask): ${stage2UserHairMaskGray!.length} chars`);
+      console.log(`  📤 input_image_4 (stage1 hair-only mask): ${kontextHairMask.length} chars`);
+    }
 
     // Submit Stage 2
-    const stage2SubmitResponse = await fetch(BFL_API_URL, {
+    const stage2SubmitResponse = await fetch(stage2ApiUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -5954,9 +6603,12 @@ async function generateWithPrecomputedMasks(
       normalizedUserPhoto = await normalizeImageOrientation(userPhotoUrl);
     }
 
-    // Build prompt using the shared Flux Stage 2 template
+    const stage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
+
+    // Build prompt using backend-specific Stage 2 image contracts.
+    const { template: stage2PromptTemplate } = getKontextStage2PromptTemplateForBackend(stage2Backend);
     const prompt = buildGenerationPrompt(
-      normalizeKontextStage2PromptForHairColorMask(GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT),
+      buildKontextStage2PromptForBackend(stage2PromptTemplate, stage2Backend),
       "the shown hairstyle",
       userRace,
       userGender
@@ -5976,7 +6628,6 @@ async function generateWithPrecomputedMasks(
     }
     console.log(`Output dimensions: ${outputWidth}×${outputHeight}`);
 
-    const stage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
     if (stage2Backend === "fal_redux_fill") {
       const fillPrompt = buildGenerationPrompt(
         GENERATION_CONFIG.KONTEXT_FILL_PROMPT,
@@ -6024,21 +6675,24 @@ async function generateWithPrecomputedMasks(
       };
     }
 
-    // Build explicit 4-image Flux 2 Pro request:
-    // image 1 = full user photo (base/background source)
-    // image 2 = user face+neck mask (identity lock, no hair)
-    // image 3 = user hair color mask (editable hair region)
-    // image 4 = GPT/Kontext Stage 1 hair-only mask (hair source)
-    console.log(`🎭 Building Stage 2 user hair color mask (hair color preserved, gray background)...`);
-    const stage2UserHairMaskGray = await createHairOnlyImage(normalizedUserPhoto, 10);
-    if (!stage2UserHairMaskGray) {
-      console.error("[REGENERATE] Failed to create Stage 2 user hair mask");
-      return { frontImageUrl: null, sideImageUrl: null };
-    }
-    try {
-      await saveBase64DebugImage("/tmp/debug_stage2_user_hair_color_mask.jpg", stage2UserHairMaskGray);
-    } catch (error) {
-      console.warn("Could not save Stage 2 user hair color mask debug image:", error);
+    // Build Stage 2 request:
+    // flux2: image1 full user, image2 face+neck, image3 user hair color mask, image4 GPT/Kontext hair-only mask
+    // flux_klein: image1 full user, image2 face+neck, image3 GPT/Kontext result mask
+    let stage2UserHairMaskGray: string | null = null;
+    if (stage2Backend !== "flux_klein") {
+      console.log(`🎭 Building Stage 2 user hair color mask (hair color preserved, gray background)...`);
+      stage2UserHairMaskGray = await createHairOnlyImage(normalizedUserPhoto, 10);
+      if (!stage2UserHairMaskGray) {
+        console.error("[REGENERATE] Failed to create Stage 2 user hair mask");
+        return { frontImageUrl: null, sideImageUrl: null };
+      }
+      try {
+        await saveBase64DebugImage("/tmp/debug_stage2_user_hair_color_mask.jpg", stage2UserHairMaskGray);
+      } catch (error) {
+        console.warn("Could not save Stage 2 user hair color mask debug image:", error);
+      }
+    } else {
+      console.log(`🎭 Using Flux Klein Stage 2 contract (no user hair color mask input).`);
     }
 
     let stage2FaceNeckMask = await buildStage2FaceNeckMaskFromHairPipeline(normalizedUserPhoto);
@@ -6064,30 +6718,49 @@ async function generateWithPrecomputedMasks(
       console.warn("Could not save Stage 2 face+neck mask debug image:", error);
     }
 
-    const stage2InputImage = normalizedUserPhoto;
-    const stage2InputImage2 = stage2FaceNeckMask;
-    const stage2InputImage3 = stage2UserHairMaskGray;
-    const stage2InputImage4 = hairOnlyMask;
-    console.log(`📦 Building 4-image Flux 2 Pro request...`);
-    const requestBody: any = {
-      prompt: prompt,
-      input_image: stage2InputImage,
-      input_image_2: stage2InputImage2,
-      input_image_3: stage2InputImage3,
-      input_image_4: stage2InputImage4,
-      width: outputWidth,
-      height: outputHeight,
-      safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
-    };
+    let requestBody: any;
+    if (stage2Backend === "flux_klein") {
+      console.log(`📦 Building 3-image Flux Klein request...`);
+      requestBody = {
+        prompt: prompt,
+        input_image: normalizedUserPhoto,
+        input_image_2: stage2FaceNeckMask,
+        input_image_3: hairOnlyMask,
+        width: outputWidth,
+        height: outputHeight,
+        safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
+      };
+    } else {
+      console.log(`📦 Building 4-image Flux 2 Pro request...`);
+      requestBody = {
+        prompt: prompt,
+        input_image: normalizedUserPhoto,
+        input_image_2: stage2FaceNeckMask,
+        input_image_3: stage2UserHairMaskGray,
+        input_image_4: hairOnlyMask,
+        width: outputWidth,
+        height: outputHeight,
+        safety_tolerance: GENERATION_CONFIG.KONTEXT_STAGE2_SAFETY_TOLERANCE,
+      };
+    }
+    const stage2ApiUrl = getKontextStage2BflApiUrl(stage2Backend);
+    console.log(`🛰️ Regeneration Stage 2 endpoint: ${stage2ApiUrl}`);
     
-    console.log(`  📤 input_image (full user photo): ${stage2InputImage.length} chars`);
-    console.log(`  📤 input_image_2 (user face+neck mask): ${stage2InputImage2.length} chars`);
-    console.log(`  📤 input_image_3 (user hair color mask): ${stage2InputImage3.length} chars`);
-    console.log(`  📤 input_image_4 (stage1 hair-only mask): ${stage2InputImage4.length} chars`);
-    console.log(`✓ 4-image Stage 2 pipeline ready`);
+    if (stage2Backend === "flux_klein") {
+      console.log(`  📤 input_image (full user photo): ${normalizedUserPhoto.length} chars`);
+      console.log(`  📤 input_image_2 (user face+neck mask): ${stage2FaceNeckMask.length} chars`);
+      console.log(`  📤 input_image_3 (stage1 result mask): ${hairOnlyMask.length} chars`);
+      console.log(`✓ 3-image Stage 2 Klein pipeline ready`);
+    } else {
+      console.log(`  📤 input_image (full user photo): ${normalizedUserPhoto.length} chars`);
+      console.log(`  📤 input_image_2 (user face+neck mask): ${stage2FaceNeckMask.length} chars`);
+      console.log(`  📤 input_image_3 (user hair color mask): ${stage2UserHairMaskGray!.length} chars`);
+      console.log(`  📤 input_image_4 (stage1 hair-only mask): ${hairOnlyMask.length} chars`);
+      console.log(`✓ 4-image Stage 2 pipeline ready`);
+    }
 
     // Submit the generation request
-    const submitResponse = await fetch(BFL_API_URL, {
+    const submitResponse = await fetch(stage2ApiUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -6546,6 +7219,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
   
   // Debug comparison page showing all masks
   app.get("/api/debug/compare", async (req, res) => {
+    const overviewStage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
+    const { template: overviewStage2PromptTemplate } = getKontextStage2PromptTemplateForBackend(overviewStage2Backend);
+    const stage2DebugPrompt = buildKontextStage2PromptForBackend(
+      overviewStage2PromptTemplate,
+      overviewStage2Backend
+    );
+
     res.setHeader("Content-Type", "text/html");
     res.send(`
       <!DOCTYPE html>
@@ -6627,19 +7307,35 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Serve debug user image for comparison
   app.get("/api/debug/user-image", async (req, res) => {
     try {
-      const imagePath = "/tmp/debug_user_image.jpg";
       const fsPromises = await import("fs/promises");
-      
-      try {
-        const imageBuffer = await fsPromises.readFile(imagePath);
-        res.setHeader("Content-Type", "image/jpeg");
-        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
-        res.setHeader("Pragma", "no-cache");
-        res.setHeader("Expires", "0");
-        res.send(imageBuffer);
-      } catch {
-        res.status(404).json({ error: "No image available yet" });
+
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(`/tmp/debug_user_image_${requestedIndex}.jpg`);
       }
+      candidates.push("/tmp/debug_user_image.jpg");
+
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next candidate
+        }
+      }
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No image available yet" });
+      }
+
+      const imageBuffer = await fsPromises.readFile(selectedPath);
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.send(imageBuffer);
     } catch (error) {
       console.error("Error serving debug image:", error);
       res.status(500).json({ error: "Failed to serve image" });
@@ -7059,11 +7755,221 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Serve Stage 1 input image (reference only).
+  app.get("/api/debug/gpt-ref-input/:index", async (req, res) => {
+    try {
+      const index = parseInt(req.params.index);
+      if (Number.isNaN(index) || index < 1) {
+        return res.status(400).json({ error: "index must be >= 1" });
+      }
+
+      const fsPromises = await import("fs/promises");
+      const candidates = [
+        `/tmp/debug_gpt_ref_input_${index}.jpg`,
+        `/tmp/debug_gpt_ref_input_${index}.png`,
+        `/tmp/debug_gpt_ref_input_${index}.webp`,
+      ];
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+
+      if (!selectedPath) {
+        return res.status(404).json({ error: `No GPT reference-fusion input image ${index} available yet.` });
+      }
+
+      const imageBuffer = await fsPromises.readFile(selectedPath);
+      const contentType = selectedPath.endsWith(".png")
+        ? "image/png"
+        : selectedPath.endsWith(".webp")
+          ? "image/webp"
+          : "image/jpeg";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.send(imageBuffer);
+    } catch {
+      res.status(404).json({ error: `No GPT reference-fusion input image ${req.params.index} available yet.` });
+    }
+  });
+
+  // Serve Stage 1 Kontext fusion output image.
+  app.get("/api/debug/gpt-ref-result", async (_req, res) => {
+    try {
+      const fsPromises = await import("fs/promises");
+      const candidates = [
+        "/tmp/debug_stage1_kontext_fusion_result.jpg",
+        "/tmp/debug_stage1_kontext_fusion_result.png",
+        "/tmp/debug_stage1_kontext_fusion_result.webp",
+        "/tmp/debug_gpt_reference_fusion_result.jpg",
+        "/tmp/debug_gpt_reference_fusion_result.png",
+        "/tmp/debug_gpt_reference_fusion_result.webp",
+      ];
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No GPT reference-fusion result available yet." });
+      }
+
+      const imageBuffer = await fsPromises.readFile(selectedPath);
+      const contentType = selectedPath.endsWith(".png")
+        ? "image/png"
+        : selectedPath.endsWith(".webp")
+          ? "image/webp"
+          : "image/jpeg";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.send(imageBuffer);
+    } catch {
+      res.status(404).json({ error: "No Stage 1 Kontext fusion result available yet." });
+    }
+  });
+
+  // Serve Stage 1 Kontext fusion output image (explicit endpoint).
+  app.get("/api/debug/stage1-kontext-result", async (req, res) => {
+    try {
+      const fsPromises = await import("fs/promises");
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(
+          `/tmp/debug_stage1_kontext_fusion_result_${requestedIndex}.jpg`,
+          `/tmp/debug_stage1_kontext_fusion_result_${requestedIndex}.png`,
+          `/tmp/debug_stage1_kontext_fusion_result_${requestedIndex}.webp`
+        );
+      } else {
+        candidates.push(
+          "/tmp/debug_stage1_kontext_fusion_result.jpg",
+          "/tmp/debug_stage1_kontext_fusion_result.png",
+          "/tmp/debug_stage1_kontext_fusion_result.webp",
+          "/tmp/debug_gpt_reference_fusion_result.jpg",
+          "/tmp/debug_gpt_reference_fusion_result.png",
+          "/tmp/debug_gpt_reference_fusion_result.webp",
+        );
+      }
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No Stage 1 Kontext fusion result available yet." });
+      }
+
+      const imageBuffer = await fsPromises.readFile(selectedPath);
+      const contentType = selectedPath.endsWith(".png")
+        ? "image/png"
+        : selectedPath.endsWith(".webp")
+          ? "image/webp"
+          : "image/jpeg";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.send(imageBuffer);
+    } catch {
+      res.status(404).json({ error: "No Stage 1 Kontext fusion result available yet." });
+    }
+  });
+
+  // Serve Stage 1 GPT output image.
+  app.get("/api/debug/stage1-gpt-result", async (req, res) => {
+    try {
+      const fsPromises = await import("fs/promises");
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(
+          `/tmp/debug_stage1_gpt_fusion_result_${requestedIndex}.jpg`,
+          `/tmp/debug_stage1_gpt_fusion_result_${requestedIndex}.png`,
+          `/tmp/debug_stage1_gpt_fusion_result_${requestedIndex}.webp`
+        );
+      } else {
+        candidates.push(
+          "/tmp/debug_stage1_gpt_fusion_result.jpg",
+          "/tmp/debug_stage1_gpt_fusion_result.png",
+          "/tmp/debug_stage1_gpt_fusion_result.webp",
+        );
+      }
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No Stage 1 GPT result available yet." });
+      }
+
+      const imageBuffer = await fsPromises.readFile(selectedPath);
+      const contentType = selectedPath.endsWith(".png")
+        ? "image/png"
+        : selectedPath.endsWith(".webp")
+          ? "image/webp"
+          : "image/jpeg";
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.send(imageBuffer);
+    } catch {
+      res.status(404).json({ error: "No Stage 1 GPT result available yet." });
+    }
+  });
+
   // Serve Kontext Stage 1 INPUT: User photo (what was actually sent to Kontext)
   app.get("/api/debug/kontext-stage1-input-user", async (req, res) => {
     try {
       const fsPromises = await import("fs/promises");
-      const imageBuffer = await fsPromises.readFile("/tmp/debug_kontext_stage1_input_user.jpg");
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(`/tmp/debug_kontext_stage1_input_user_${requestedIndex}.jpg`);
+      }
+      candidates.push("/tmp/debug_kontext_stage1_input_user.jpg");
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No Stage 1 user input available yet." });
+      }
+      const imageBuffer = await fsPromises.readFile(selectedPath);
       res.setHeader("Content-Type", "image/jpeg");
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private"); res.setHeader("Pragma", "no-cache"); res.setHeader("Expires", "0");
       res.send(imageBuffer);
@@ -7076,7 +7982,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/debug/kontext-stage1-input-ref", async (req, res) => {
     try {
       const fsPromises = await import("fs/promises");
-      const imageBuffer = await fsPromises.readFile("/tmp/debug_kontext_stage1_input_ref.jpg");
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(`/tmp/debug_kontext_stage1_input_ref_${requestedIndex}.jpg`);
+      }
+      candidates.push("/tmp/debug_kontext_stage1_input_ref.jpg");
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No Stage 1 reference input available yet." });
+      }
+      const imageBuffer = await fsPromises.readFile(selectedPath);
       res.setHeader("Content-Type", "image/jpeg");
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private"); res.setHeader("Pragma", "no-cache"); res.setHeader("Expires", "0");
       res.send(imageBuffer);
@@ -7085,11 +8010,63 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  app.get("/api/debug/kontext-stage1-metadata", async (req, res) => {
+    try {
+      const fsPromises = await import("fs/promises");
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(`/tmp/debug_kontext_stage1_metadata_${requestedIndex}.json`);
+      }
+      candidates.push("/tmp/debug_kontext_stage1_metadata.json");
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No Stage 1 metadata available yet." });
+      }
+      const raw = await fsPromises.readFile(selectedPath, "utf8");
+      const payload = JSON.parse(raw);
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.json(payload);
+    } catch {
+      res.status(404).json({ error: "No Stage 1 metadata available yet." });
+    }
+  });
+
   // Serve Kontext Stage 1 result (from two-stage pipeline)
   app.get("/api/debug/kontext-stage1-result", async (req, res) => {
     try {
       const fsPromises = await import("fs/promises");
-      const imageBuffer = await fsPromises.readFile("/tmp/debug_kontext_stage1_result.jpg");
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(`/tmp/debug_kontext_stage1_result_${requestedIndex}.jpg`);
+      }
+      candidates.push("/tmp/debug_kontext_stage1_result.jpg");
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No Kontext Stage 1 result available. Run a generation with kontext_refined pipeline first." });
+      }
+      const imageBuffer = await fsPromises.readFile(selectedPath);
       res.setHeader("Content-Type", "image/jpeg");
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private"); res.setHeader("Pragma", "no-cache"); res.setHeader("Expires", "0");
       res.send(imageBuffer);
@@ -7102,7 +8079,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/debug/kontext-stage1-hair-face-mask", async (req, res) => {
     try {
       const fsPromises = await import("fs/promises");
-      const imageBuffer = await fsPromises.readFile("/tmp/debug_kontext_stage1_hair_face_mask.png");
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(`/tmp/debug_kontext_stage1_hair_face_mask_${requestedIndex}.png`);
+      }
+      candidates.push("/tmp/debug_kontext_stage1_hair_face_mask.png");
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No hair+face mask available. Run a generation with KONTEXT_STAGE1_ONLY=true first." });
+      }
+      const imageBuffer = await fsPromises.readFile(selectedPath);
       res.setHeader("Content-Type", "image/png");
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private"); res.setHeader("Pragma", "no-cache"); res.setHeader("Expires", "0");
       res.send(imageBuffer);
@@ -7115,12 +8111,44 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/debug/flux-stage2-result", async (req, res) => {
     try {
       const fsPromises = await import("fs/promises");
-      const imageBuffer = await fsPromises.readFile("/tmp/debug_flux_stage2_result.jpg");
-      res.setHeader("Content-Type", "image/jpeg");
+      const requestedIndex = getRequestedDebugIndex(req);
+      const candidates: string[] = [];
+      if (requestedIndex) {
+        candidates.push(
+          `/tmp/debug_flux_stage2_result_${requestedIndex}.jpg`,
+          `/tmp/debug_flux_stage2_result_${requestedIndex}.png`,
+          `/tmp/debug_flux_stage2_result_${requestedIndex}.webp`
+        );
+      }
+      candidates.push(
+        "/tmp/debug_flux_stage2_result.jpg",
+        "/tmp/debug_flux_stage2_result.png",
+        "/tmp/debug_flux_stage2_result.webp"
+      );
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No FLUX result available. Run a generation first." });
+      }
+      const imageBuffer = await fsPromises.readFile(selectedPath);
+      const contentType = selectedPath.endsWith(".png")
+        ? "image/png"
+        : selectedPath.endsWith(".webp")
+          ? "image/webp"
+          : "image/jpeg";
+      res.setHeader("Content-Type", contentType);
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private"); res.setHeader("Pragma", "no-cache"); res.setHeader("Expires", "0");
       res.send(imageBuffer);
     } catch {
-      res.status(404).json({ error: "No FLUX result available. Run a generation with KONTEXT_STAGE1_ONLY=true first." });
+      res.status(404).json({ error: "No FLUX result available. Run a generation first." });
     }
   });
 
@@ -7200,8 +8228,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Serve Stage 2 input_image hair color mask (hair preserved, non-hair gray)
-  app.get("/api/debug/stage2-user-hair-color-mask", async (_req, res) => {
+  app.get("/api/debug/stage2-user-hair-color-mask", async (req, res) => {
     try {
+      const requestedIndex = getRequestedDebugIndex(req);
+      if (requestedIndex) {
+        const indexedCandidates = [
+          `/tmp/debug_stage2_user_hair_color_mask_${requestedIndex}.jpg`,
+          `/tmp/debug_stage2_user_hair_color_mask_${requestedIndex}.png`
+        ];
+        for (const candidate of indexedCandidates) {
+          try {
+            const imageBuffer = await fsPromises.readFile(candidate);
+            const contentType = candidate.endsWith(".png") ? "image/png" : "image/jpeg";
+            res.setHeader("Content-Type", contentType);
+            res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+            res.setHeader("Pragma", "no-cache");
+            res.setHeader("Expires", "0");
+            return res.send(imageBuffer);
+          } catch {
+            // try next indexed candidate
+          }
+        }
+        return res.status(404).json({ error: `No Stage 2 user hair color mask for index ${requestedIndex}.` });
+      }
+
       const candidates = [
         "/tmp/debug_stage2_user_hair_color_mask.jpg",
         "/tmp/debug_stage2_user_hair_color_mask.png",
@@ -7240,12 +8290,114 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Serve Stage 2 face+neck mask used as input_image_2 in 4-image FLUX 2 Pro mode
   app.get("/api/debug/stage2-face-neck-mask", async (req, res) => {
     try {
-      const imageBuffer = await fsPromises.readFile("/tmp/debug_stage2_user_face_neck_mask.jpg");
+      const requestedIndex = getRequestedDebugIndex(req);
+      if (requestedIndex) {
+        const indexedPath = `/tmp/debug_stage2_user_face_neck_mask_${requestedIndex}.jpg`;
+        try {
+          const imageBuffer = await fsPromises.readFile(indexedPath);
+          res.setHeader("Content-Type", "image/jpeg");
+          res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+          res.setHeader("Pragma", "no-cache");
+          res.setHeader("Expires", "0");
+          return res.send(imageBuffer);
+        } catch {
+          return res.status(404).json({ error: `No Stage 2 face mask for index ${requestedIndex}.` });
+        }
+      }
+
+      const candidates: string[] = ["/tmp/debug_stage2_user_face_neck_mask.jpg"];
+      let selectedPath: string | null = null;
+      for (const candidate of candidates) {
+        try {
+          await fsPromises.stat(candidate);
+          selectedPath = candidate;
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (!selectedPath) {
+        return res.status(404).json({ error: "No Stage 2 face+neck mask available yet." });
+      }
+      const imageBuffer = await fsPromises.readFile(selectedPath);
       res.setHeader("Content-Type", "image/jpeg");
       res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private"); res.setHeader("Pragma", "no-cache"); res.setHeader("Expires", "0");
       res.send(imageBuffer);
     } catch {
       res.status(404).json({ error: "No Stage 2 face+neck mask available yet." });
+    }
+  });
+
+  // Serve the latest Stage 2 guidance mask (Klein reference hair mask)
+  app.get("/api/debug/stage2-reference-mask", async (req, res) => {
+    try {
+      const fsPromises = await import("fs/promises");
+      const requestedIndex = getRequestedDebugIndex(req);
+      if (requestedIndex) {
+        const indexedCandidates = [
+          `/tmp/debug_stage2_klein_reference_mask_${requestedIndex}.png`,
+          `/tmp/debug_stage2_klein_reference_mask_${requestedIndex}.jpg`,
+          `/tmp/debug_stage2_klein_reference_mask_${requestedIndex}.jpeg`,
+        ];
+        for (const candidate of indexedCandidates) {
+          try {
+            const imageBuffer = await fsPromises.readFile(candidate);
+            const contentType = candidate.endsWith(".png") ? "image/png" : "image/jpeg";
+            res.setHeader("Content-Type", contentType);
+            res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+            res.setHeader("Pragma", "no-cache");
+            res.setHeader("Expires", "0");
+            return res.send(imageBuffer);
+          } catch {
+            // try next
+          }
+        }
+        return res.status(404).json({ error: `No stage2 reference mask for index ${requestedIndex}.` });
+      }
+      const candidates: string[] = [];
+      const tmpFiles = await fsPromises.readdir("/tmp");
+      for (const file of tmpFiles) {
+        if (file.startsWith("debug_stage2_klein_reference_mask_") && (file.endsWith(".png") || file.endsWith(".jpg") || file.endsWith(".jpeg"))) {
+          candidates.push(`/tmp/${file}`);
+        }
+      }
+
+      let selectedPath: string | null = null;
+      let latestMtime = 0;
+      for (const p of candidates) {
+        try {
+          const stat = await fsPromises.stat(p);
+          if (stat.mtimeMs > latestMtime) {
+            latestMtime = stat.mtimeMs;
+            selectedPath = p;
+          }
+        } catch {
+          // ignore missing file
+        }
+      }
+
+      if (!selectedPath) {
+        try {
+          selectedPath = "/tmp/debug_kontext_stage1_hair_face_mask.png";
+          await fsPromises.stat(selectedPath);
+        } catch {
+          selectedPath = null;
+        }
+      }
+
+      if (!selectedPath) {
+        res.status(404).json({ error: "No stage2 reference mask available yet." });
+        return;
+      }
+
+      const imageBuffer = await fsPromises.readFile(selectedPath);
+      res.setHeader("Content-Type", selectedPath.endsWith(".png") ? "image/png" : "image/jpeg");
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("Expires", "0");
+      res.send(imageBuffer);
+    } catch {
+      res.status(404).json({ error: "No stage2 reference mask available yet." });
     }
   });
 
@@ -7625,6 +8777,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       </div>
     `;
     
+    const debugStage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
+    const { template: debugStage2PromptTemplate } = getKontextStage2PromptTemplateForBackend(debugStage2Backend);
+    const stage2DebugPrompt = buildKontextStage2PromptForBackend(debugStage2PromptTemplate, debugStage2Backend);
+
     res.setHeader("Content-Type", "text/html");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
     res.send(`
@@ -7689,14 +8845,105 @@ export async function registerRoutes(app: Express): Promise<Server> {
     res.set('Expires', '0');
     
     const fsPromises = await import("fs/promises");
+    const requestedIndex = getRequestedDebugIndex(req);
+    let tmpFilesForOverview: string[] = [];
+    try {
+      tmpFilesForOverview = await fsPromises.readdir("/tmp");
+    } catch {
+      tmpFilesForOverview = [];
+    }
+
+    const availableIndexSet = new Set<number>();
+    const latestIndexMtime = new Map<number, number>();
+    const latestResultIndexMtime = new Map<number, number>();
+    for (const file of tmpFilesForOverview) {
+      const match = file.match(
+        /^(?:debug_flux_stage2_result|debug_reference_full|debug_gpt_ref_input|debug_stage2_klein_reference_mask|debug_stage1_kontext_fusion_result|debug_stage1_gpt_fusion_result|debug_kontext_stage1_result|debug_kontext_stage1_hair_face_mask|debug_stage2_user_face_neck_mask|debug_stage2_user_hair_color_mask)_(\d+)\.(?:jpg|jpeg|png|webp|json)$/i
+      );
+      if (!match) continue;
+      const idx = Number.parseInt(match[1], 10);
+      if (Number.isFinite(idx) && idx > 0) {
+        availableIndexSet.add(idx);
+        try {
+          const stat = await fsPromises.stat(`/tmp/${file}`);
+          const prev = latestIndexMtime.get(idx) || 0;
+          if (stat.mtimeMs > prev) {
+            latestIndexMtime.set(idx, stat.mtimeMs);
+          }
+          if (/^debug_flux_stage2_result_\d+\.(?:jpg|jpeg|png|webp)$/i.test(file)) {
+            const prevResult = latestResultIndexMtime.get(idx) || 0;
+            if (stat.mtimeMs > prevResult) {
+              latestResultIndexMtime.set(idx, stat.mtimeMs);
+            }
+          }
+        } catch {
+          // Ignore stat errors and keep index entry.
+        }
+      }
+    }
+    const availableIndexes = Array.from(availableIndexSet).sort((a, b) => a - b);
+    const latestResultIndexByTime = Array.from(latestResultIndexMtime.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+    const latestDebugIndexByTime = Array.from(latestIndexMtime.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+    const selectedDebugIndex = requestedIndex || latestResultIndexByTime || latestDebugIndexByTime || (availableIndexes.length > 0 ? availableIndexes[availableIndexes.length - 1] : null);
+    const selectedIndexQuery = selectedDebugIndex ? `index=${selectedDebugIndex}&` : "";
+
+    const hasSelectedKleinReferenceMask = selectedDebugIndex
+      ? [
+          `/tmp/debug_stage2_klein_reference_mask_${selectedDebugIndex}.png`,
+          `/tmp/debug_stage2_klein_reference_mask_${selectedDebugIndex}.jpg`,
+          `/tmp/debug_stage2_klein_reference_mask_${selectedDebugIndex}.jpeg`,
+        ].some((candidate) => tmpFilesForOverview.includes(candidate.split("/tmp/")[1]))
+      : false;
+    const hasSelectedTwoStageArtifacts = selectedDebugIndex
+      ? (
+          tmpFilesForOverview.includes(`debug_kontext_stage1_hair_face_mask_${selectedDebugIndex}.png`) ||
+          tmpFilesForOverview.includes(`debug_kontext_stage1_result_${selectedDebugIndex}.jpg`)
+        )
+      : false;
+    const selectedGenerationMode: "single_stage_klein" | "two_stage_refined" =
+      hasSelectedKleinReferenceMask && !hasSelectedTwoStageArtifacts
+        ? "single_stage_klein"
+        : "two_stage_refined";
+
+    let stage1Metadata: { prompt?: string; inputLabel?: string; inputLength?: number; inputPreview?: string; provider?: string; generatedAt?: string } = {};
+    try {
+      const metadataPath = selectedDebugIndex
+        ? `/tmp/debug_kontext_stage1_metadata_${selectedDebugIndex}.json`
+        : "/tmp/debug_kontext_stage1_metadata.json";
+      const rawStage1Meta = await fsPromises.readFile(metadataPath, "utf8");
+      stage1Metadata = JSON.parse(rawStage1Meta);
+    } catch {
+      try {
+        const rawStage1Meta = await fsPromises.readFile("/tmp/debug_kontext_stage1_metadata.json", "utf8");
+        stage1Metadata = JSON.parse(rawStage1Meta);
+      } catch {
+        stage1Metadata = {};
+      }
+    }
     
+    const overviewStage2Backend = resolveKontextStage2Backend(GENERATION_CONFIG.KONTEXT_STAGE2_BACKEND);
+    const isKleinBackend = selectedGenerationMode === "single_stage_klein";
+    const { template: overviewStage2PromptTemplate } = getKontextStage2PromptTemplateForBackend(overviewStage2Backend);
+    const stage2DebugPrompt = isKleinBackend
+      ? KLEIN_SINGLE_STAGE_REFERENCE_PROMPT
+      : buildKontextStage2PromptForBackend(
+          overviewStage2PromptTemplate,
+          overviewStage2Backend
+        );
+    const stage2BackendSummary = isKleinBackend
+      ? "FLUX 2 Klein single-stage with 3 image inputs"
+      : "Kontext Refined two-stage with 3 image inputs to FLUX 2 Klein";
+    const stage2BackendLabel = isKleinBackend ? "FLUX 2 Klein (Single-Stage)" : "Kontext Refined (Two-Stage)";
+
     // Find Kontext result masks in /tmp (kontext stage 1 hair-only masks)
     const kontextMasks: { file: string; mtime: Date }[] = [];
     try {
-      const files = await fsPromises.readdir("/tmp");
+      const files = tmpFilesForOverview;
       for (const file of files) {
-        // Look for the stage 1 hair-only mask (the one we send to FLUX Stage 2 as image 3)
-        if (file === 'debug_kontext_stage1_hair_face_mask.png') {
+        const selectedFile = selectedDebugIndex
+          ? `debug_kontext_stage1_hair_face_mask_${selectedDebugIndex}.png`
+          : "debug_kontext_stage1_hair_face_mask.png";
+        if (file === selectedFile || (!selectedDebugIndex && file === "debug_kontext_stage1_hair_face_mask.png")) {
           const stat = await fsPromises.stat(`/tmp/${file}`);
           kontextMasks.push({ file, mtime: stat.mtime });
         }
@@ -7722,11 +8969,262 @@ export async function registerRoutes(app: Express): Promise<Server> {
             <h3 style="color: #ff6b6b;">Kontext Result Mask</h3>
             <img src="/api/debug/kontext-stage1-hair-face-mask?t=${Date.now()}" onerror="this.alt='Not available'" />
             <p class="timestamp" style="color: #888; font-size: 10px;">${timeAgo}s ago</p>
-            <p>Hair-only mask from GPT/Kontext Stage 1<br>(sent to FLUX Stage 2 as image 3)</p>
+            <p>Hair-only mask from GPT/Kontext Stage 1<br>(sent to ${stage2BackendLabel} as input_image_${isKleinBackend ? "2" : "4"})</p>
           </div>
         `;
       }
     }
+
+    const gptReferenceFusionCardsHtml = `
+      <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
+        <div class="step sent">
+          <h3 style="color: #4ecdc4;">Image 1 (Reference)</h3>
+          <img src="${selectedDebugIndex ? `/api/debug/reference-full/${selectedDebugIndex}` : "/api/debug/gpt-ref-input/1"}?t=${Date.now()}" onerror="this.alt='Not available yet'" onload="document.getElementById('gr1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+          <p class="dims" id="gr1" style="color: #4ecdc4;">-</p>
+          <p>Reference image for selected generation.</p>
+        </div>
+        <div class="step sent">
+          <h3 style="color: #ff9f43;">Kontext Stage 1 Output (Used)</h3>
+          <img id="stage1-kontext-result-img" src="/api/debug/stage1-kontext-result?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available yet'" onload="document.getElementById('gr6').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+          <p class="dims" id="gr6" style="color: #ff9f43;">-</p>
+          <p>Used for generation pipeline.</p>
+        </div>
+        <div class="step sent">
+          <h3 style="color: #a29bfe;">GPT Stage 1 Output (Compare)</h3>
+          <img id="stage1-gpt-result-img" src="/api/debug/stage1-gpt-result?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available yet'" onload="document.getElementById('gr7').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+          <p class="dims" id="gr7" style="color: #a29bfe;">-</p>
+          <p>Primary Stage 1 source for generation (Kontext is fallback).</p>
+        </div>
+      </div>
+    `;
+
+    const userInputCardsHtml = isKleinBackend
+      ? `
+          <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
+            <div class="step sent">
+              <h3 style="color: #4ecdc4;">1. input_image</h3>
+              <img src="/api/debug/user-image?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+              <p class="dims" id="d1" style="color: #4ecdc4;">-</p>
+              <p>Full user photo (base/background source)</p>
+            </div>
+            <div class="step sent">
+              <h3 style="color: #9b59b6;">2. input_image_2</h3>
+              <img src="/api/debug/stage2-reference-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d2').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+              <p class="dims" id="d2" style="color: #9b59b6;">-</p>
+              <p>Reference mannequin hair guidance mask</p>
+            </div>
+            <div class="step sent">
+              <h3 style="color: #55efc4;">3. input_image_3</h3>
+              <img src="/api/debug/stage2-face-neck-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d3').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+              <p class="dims" id="d3" style="color: #55efc4;">-</p>
+              <p>User face mask (identity lock)</p>
+            </div>
+          </div>
+        `
+      : `
+          <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+            <div class="step sent">
+              <h3 style="color: #4ecdc4;">1. input_image</h3>
+              <img src="/api/debug/user-image?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+              <p class="dims" id="d1" style="color: #4ecdc4;">-</p>
+              <p>Full user photo (base/background source)</p>
+            </div>
+            <div class="step sent">
+              <h3 style="color: #9b59b6;">2. input_image_2</h3>
+              <img src="/api/debug/stage2-face-neck-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d2').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+              <p class="dims" id="d2" style="color: #9b59b6;">-</p>
+              <p>User face+neck mask (identity lock)</p>
+            </div>
+            <div class="step sent">
+              <h3 style="color: #55efc4;">3. input_image_3</h3>
+              <img src="/api/debug/stage2-user-hair-color-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d3').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+              <p class="dims" id="d3" style="color: #55efc4;">-</p>
+              <p>User hair color mask (editable hair)</p>
+            </div>
+            <div class="step sent">
+              <h3 style="color: #fd79a8;">4. input_image_4</h3>
+              <img src="/api/debug/kontext-stage1-hair-face-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d4').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+              <p class="dims" id="d4" style="color: #fd79a8;">-</p>
+              <p>GPT/Kontext Stage 1 hair-only mask</p>
+            </div>
+          </div>
+        `;
+    const stage2InputCardsHtml = isKleinBackend
+      ? `
+            <h3 style="color: #00cec9; margin: 30px 0 10px;">Stage 2 INPUTS (what FLUX 2 Klein receives)</h3>
+            <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
+              <div class="step sent">
+                <h3 style="color: #4ecdc4;">input_image (Full User Photo)</h3>
+                <img id="stage2-full-user-img" src="/api/debug/user-image?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="ds1" style="color: #4ecdc4;">-</p>
+                <p>Image 1: full user photo (base/background source)</p>
+              </div>
+              <div class="step sent">
+                <h3 style="color: #9b59b6;">input_image_2 (Reference Mannequin Hair Mask)</h3>
+                <img id="stage2-gpt-hair-only-img" src="/api/debug/stage2-reference-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds2').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="ds2" style="color: #9b59b6;">-</p>
+                <p>Image 2: Stage 1-derived mannequin hair guidance mask</p>
+              </div>
+              <div class="step sent">
+                <h3 style="color: #55efc4;">input_image_3 (User Face Mask)</h3>
+                <img id="stage2-face-mask-img" src="/api/debug/stage2-face-neck-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds3').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="ds3" style="color: #55efc4;">-</p>
+                <p>Image 3: user face mask (identity lock)</p>
+              </div>
+            </div>
+          `
+      : `
+            <h3 style="color: #00cec9; margin: 30px 0 10px;">Stage 2 INPUTS (what FLUX 2 Pro receives)</h3>
+            <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+              <div class="step sent">
+                <h3 style="color: #4ecdc4;">input_image (Full User Photo)</h3>
+                <img id="stage2-full-user-img" src="/api/debug/user-image?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="ds1" style="color: #4ecdc4;">-</p>
+                <p>Image 1: full user photo (base/background source)</p>
+              </div>
+              <div class="step sent">
+                <h3 style="color: #fd79a8;">input_image_2 (User Face+Neck Mask)</h3>
+                <img id="stage2-face-neck-img" src="/api/debug/stage2-face-neck-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds2').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="ds2" style="color: #fd79a8;">-</p>
+                <p>Image 2: user face+neck mask (identity lock)</p>
+              </div>
+              <div class="step sent">
+                <h3 style="color: #55efc4;">input_image_3 (User Hair Color Mask)</h3>
+                <img id="stage2-user-hair-color-img" src="/api/debug/stage2-user-hair-color-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds3').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="ds3" style="color: #55efc4;">-</p>
+                <p>Image 3: user hair color mask (hair editable, non-hair gray)</p>
+              </div>
+              <div class="step sent">
+                <h3 style="color: #74b9ff;">input_image_4 (GPT/Kontext Hair-Only)</h3>
+                <img id="stage2-gpt-hair-only-img" src="/api/debug/kontext-stage1-hair-face-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds4').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="ds4" style="color: #74b9ff;">-</p>
+                <p>Image 4: hairstyle source from Stage 1</p>
+              </div>
+            </div>
+          `;
+    const stage2OutputCardsHtml = isKleinBackend
+      ? `
+          <h3 style="color: #27ae60; margin: 30px 0 10px;">Stage 2 OUTPUTS (comparison view)</h3>
+          <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
+            <div class="step sent" style="border-color: #74b9ff;">
+              <h3 style="color: #74b9ff; font-size: 16px;">Original Input (Image 1)</h3>
+              <img src="/api/debug/user-image?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='No input image'" onload="document.getElementById('dout1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+              <p class="dims" id="dout1" style="color: #74b9ff;">-</p>
+              <p>Active backend input 1 reference.</p>
+            </div>
+            <div class="step sent" style="border-color: #27ae60;">
+              <h3 style="color: #27ae60; font-size: 16px;">Stage 2 Result (Returned to App)</h3>
+              <img id="flux-result-img" src="/api/debug/flux-stage2-result?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Run generation first'" onload="document.getElementById('df1').textContent = this.naturalWidth + 'x' + this.naturalHeight" style="max-height: 400px;"/>
+              <p class="dims" id="df1" style="color: #27ae60;">-</p>
+              <p>This image is the final Stage 2 output returned to the app.</p>
+            </div>
+          </div>
+        `
+      : `
+          <h3 style="color: #27ae60; margin: 30px 0 10px;">Stage 2 OUTPUTS (comparison view)</h3>
+          <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
+            <div class="step sent" style="border-color: #27ae60;">
+              <h3 style="color: #27ae60; font-size: 16px;">Stage 2 Result (Returned to App)</h3>
+              <img id="flux-result-img" src="/api/debug/flux-stage2-result?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Run generation first'" onload="document.getElementById('df1').textContent = this.naturalWidth + 'x' + this.naturalHeight" style="max-height: 400px;"/>
+              <p class="dims" id="df1" style="color: #27ae60;">-</p>
+              <p>This image is the final Stage 2 output returned to the app for the active backend.</p>
+            </div>
+            <div class="step sent" style="border-color: #f39c12;">
+              <h3 style="color: #f39c12; font-size: 16px;">FLUX Fill Comparison (Debug Only)</h3>
+              <img id="flux-fill-result-img" src="/api/debug/flux-fill-stage2-result?t=${Date.now()}" onerror="this.alt='No comparison image yet'" onload="document.getElementById('df2').textContent = this.naturalWidth + 'x' + this.naturalHeight" style="max-height: 400px;"/>
+              <p class="dims" id="df2" style="color: #f39c12;">-</p>
+              <p>Run in parallel for quality comparison. Not returned to app.</p>
+            </div>
+          </div>
+        `;
+
+    const generationPickerHtml = availableIndexes.length > 0
+      ? `
+          <div style="margin: 16px 0 8px;">
+            <h3 style="color:#4ecdc4; margin: 0 0 8px 0;">Generation Selector</h3>
+            <p style="margin: 0 0 10px 0; color:#9aa0b5;">Showing generation <strong>#${selectedDebugIndex ?? availableIndexes[availableIndexes.length - 1]}</strong>.</p>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              ${availableIndexes.map((idx) => {
+                const active = idx === selectedDebugIndex;
+                return `<a href="/api/debug/overview?index=${idx}" style="text-decoration:none; padding:6px 10px; border-radius:6px; border:1px solid ${active ? '#4ecdc4' : '#3a3f55'}; color:${active ? '#0f0f1a' : '#c8d0ea'}; background:${active ? '#4ecdc4' : '#1a1a2e'}; font-size:12px;">#${idx}</a>`;
+              }).join("")}
+            </div>
+          </div>
+        `
+      : `
+          <div style="margin: 16px 0 8px; color:#9aa0b5;">No indexed generations yet. Run a generation first.</div>
+        `;
+
+    const allGenerationCardsHtml = availableIndexes.length > 0
+      ? availableIndexes
+          .slice()
+          .reverse()
+          .map((idx) => {
+            const singleStage = (
+              tmpFilesForOverview.includes(`debug_stage2_klein_reference_mask_${idx}.png`) ||
+              tmpFilesForOverview.includes(`debug_stage2_klein_reference_mask_${idx}.jpg`) ||
+              tmpFilesForOverview.includes(`debug_stage2_klein_reference_mask_${idx}.jpeg`)
+            ) && !tmpFilesForOverview.includes(`debug_kontext_stage1_hair_face_mask_${idx}.png`);
+
+            const modeLabel = singleStage
+              ? "Single-stage Klein"
+              : "Two-stage refined";
+
+            const secondInputCard = singleStage
+              ? `
+                  <div class="step sent">
+                    <h3 style="color: #9b59b6;">input_image_2</h3>
+                    <img src="/api/debug/stage2-reference-mask?index=${idx}&t=${Date.now()}" onerror="this.alt='Not available'"/>
+                    <p>Reference mannequin mask</p>
+                  </div>
+                  <div class="step sent">
+                    <h3 style="color: #55efc4;">input_image_3</h3>
+                    <img src="/api/debug/stage2-face-neck-mask?index=${idx}&t=${Date.now()}" onerror="this.alt='Not available'"/>
+                    <p>User face mask</p>
+                  </div>
+                `
+              : `
+                  <div class="step sent">
+                    <h3 style="color: #9b59b6;">input_image_2</h3>
+                    <img src="/api/debug/stage2-face-neck-mask?index=${idx}&t=${Date.now()}" onerror="this.alt='Not available'"/>
+                    <p>User face+neck mask</p>
+                  </div>
+                  <div class="step sent">
+                    <h3 style="color: #fd79a8;">input_image_3</h3>
+                    <img src="/api/debug/kontext-stage1-hair-face-mask?index=${idx}&t=${Date.now()}" onerror="this.alt='Not available'"/>
+                    <p>Stage 1 result mask</p>
+                  </div>
+                `;
+
+            return `
+              <div style="border:1px solid #2e3447; border-radius:10px; padding:12px; margin-bottom:14px; background:#14192a;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                  <h3 style="margin:0; color:#e7ecff;">Generation #${idx}</h3>
+                  <span style="font-size:11px; color:#8bd3dd; border:1px solid #2f5460; padding:2px 8px; border-radius:999px;">${modeLabel}</span>
+                </div>
+                <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
+                  <div class="step sent">
+                    <h3 style="color: #4ecdc4;">input_image</h3>
+                    <img src="/api/debug/user-image?index=${idx}&t=${Date.now()}" onerror="this.alt='Not available'"/>
+                    <p>Full user photo</p>
+                  </div>
+                  ${secondInputCard}
+                  <div class="step sent">
+                    <h3 style="color: #a29bfe;">Reference</h3>
+                    <img src="/api/debug/reference-full/${idx}?t=${Date.now()}" onerror="this.alt='Not available'"/>
+                    <p>Reference used for this generation</p>
+                  </div>
+                  <div class="step sent">
+                    <h3 style="color: #27ae60;">Result</h3>
+                    <img src="/api/debug/flux-stage2-result?index=${idx}&t=${Date.now()}" onerror="this.alt='Not available'"/>
+                    <p>Final generated output</p>
+                  </div>
+                </div>
+              </div>
+            `;
+          })
+          .join("")
+      : "";
     
     res.setHeader("Content-Type", "text/html");
     res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -7734,7 +9232,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Debug: FLUX 2 Pro Pipeline</title>
+        <title>Debug: ${stage2BackendLabel} Pipeline</title>
         <style>
           body { font-family: Arial; background: #0f0f1a; color: white; padding: 20px; margin: 0; }
           h1, h2 { color: #eee; margin-bottom: 10px; }
@@ -7763,108 +9261,113 @@ export async function registerRoutes(app: Express): Promise<Server> {
         </style>
       </head>
       <body>
-        <h1>Debug: FLUX 2 Pro Pipeline</h1>
+      <h1>Debug: ${stage2BackendLabel} Pipeline</h1>
         
         <div class="explanation">
           <h2>Pipeline Overview</h2>
-          <p>Active Stage 2 backend uses <strong>FLUX 2 Pro with 4 image inputs</strong> for controlled hair transfer:</p>
+          ${GENERATION_CONFIG.KONTEXT_STAGE1_ONLY
+            ? "<p>Stage 2 is currently disabled. Running <strong>Stage 1 only</strong>.</p>"
+            : `<p>Active Stage 2 backend uses <strong>${stage2BackendSummary}</strong> for controlled hair transfer:</p>`
+          }
           <div class="prompt-box">
-            <strong>Prompt:</strong> "${normalizeKontextStage2PromptForHairColorMask(GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT)}"
+            <strong>Stage 1 Prompt:</strong> ${JSON.stringify(stage1Metadata.prompt || "No Stage 1 prompt yet.")}
           </div>
+          <div class="prompt-box" style="margin-top: 10px;">
+            <strong>Stage 1 Input:</strong> ${stage1Metadata.inputLabel || "No Stage 1 input yet."} (${stage1Metadata.inputLength || 0} chars)<br/>
+            <strong>Input Preview:</strong> ${stage1Metadata.inputPreview || "No preview"}
+          </div>
+          <div class="prompt-box">
+            <strong>Prompt:</strong> "${stage2DebugPrompt}"
+          </div>
+          ${generationPickerHtml}
+        </div>
+
+        <div class="section">
+          <h2 class="section-title" style="color:#8bd3dd; border-bottom-color:#8bd3dd;">Per-Generation Inputs</h2>
+          <p style="color:#8f95ac; margin-bottom: 12px;">Indexed debug inputs/outputs for each generation run.</p>
+          ${allGenerationCardsHtml || '<p style="color:#8f95ac;">No indexed generations available yet.</p>'}
+        </div>
+
+        <div class="section">
+          <h2 class="section-title" style="color: #74b9ff; border-bottom-color: #74b9ff;">STAGE 1 GPT (DEBUG)</h2>
+          <p style="color: #888; margin-bottom: 15px;">Reference-only Stage 1: GPT receives only image 1 (reference). GPT output is used for generations.</p>
+          ${gptReferenceFusionCardsHtml}
         </div>
 
         <div class="section">
           <h2 class="section-title">USER INPUTS <span class="sent-badge">SENT</span></h2>
-          <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
-            <div class="step sent">
-              <h3 style="color: #4ecdc4;">1. input_image</h3>
-              <img src="/api/debug/user-image?t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-              <p class="dims" id="d1" style="color: #4ecdc4;">-</p>
-              <p>Original user photo<br>(unmodified)</p>
-            </div>
-            <div class="step sent">
-              <h3 style="color: #9b59b6;">2. input_image_2</h3>
-              <img src="/api/debug/stage2-user-hair-color-mask?t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('d2').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-              <p class="dims" id="d2" style="color: #9b59b6;">-</p>
-              <p>User hair color mask<br>(hair preserved, non-hair gray)</p>
-            </div>
-          </div>
+          ${userInputCardsHtml}
         </div>
 
         <div class="section">
-          <h2 class="section-title">KONTEXT RESULT MASKS <span class="ref-count">${kontextMasks.length > 0 ? '1' : '0'}</span></h2>
-          <p style="color: #888; margin-bottom: 15px;">Hair-only mask extracted from GPT/Kontext Stage 1 result (sent to FLUX 2 Pro as input_image_3).</p>
+          <h2 class="section-title">STAGE 1 RESULT MASKS <span class="ref-count">${kontextMasks.length > 0 ? '1' : '0'}</span></h2>
+          <p style="color: #888; margin-bottom: 15px;">Hair-only mask extracted from Stage 1 GPT result (sent to ${stage2BackendLabel} as input_image_${isKleinBackend ? "2" : "4"}).</p>
           <div class="grid-4">
             ${kontextMasksHtml}
           </div>
         </div>
 
         <div class="section">
-          <h2 class="section-title" style="color: #ff9f43; border-bottom-color: #ff9f43;">KONTEXT REFINED (Two-Stage Pipeline)</h2>
-          <p style="color: #888; margin-bottom: 15px;">Stage 1: GPT/Kontext generates hairstyle. Stage 2: FLUX 2 Pro applies that hairstyle while only editing masked hair.</p>
+          <h2 class="section-title" style="color: #ff9f43; border-bottom-color: #ff9f43;">${isKleinBackend ? "ACTIVE PIPELINE (GPT Stage 1 + FLUX 2 Klein)" : "KONTEXT REFINED (Two-Stage Pipeline)"}</h2>
+          <p style="color: #888; margin-bottom: 15px;">${isKleinBackend
+            ? "Stage 1: GPT receives only image 1 (reference). Stage 2: FLUX 2 Klein runs with image 1 (full user photo) + image 2 (reference mannequin mask) + image 3 (face mask)."
+            : `Stage 1: GPT/Kontext generates hairstyle. Stage 2: ${stage2BackendLabel} applies that hairstyle while only editing masked hair.`}</p>
           
-          <h3 style="color: #74b9ff; margin: 20px 0 10px;">Stage 1 INPUTS (what was sent to Kontext)</h3>
-          <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
-            <div class="step sent">
-              <h3 style="color: #74b9ff;">input_image (User Photo)</h3>
-              <img src="/api/debug/kontext-stage1-input-user?t=${Date.now()}" onerror="this.alt='Not available yet'" onload="document.getElementById('dku1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-              <p class="dims" id="dku1" style="color: #74b9ff;">-</p>
-              <p>User photo sent to Kontext<br><strong>Should be UNMASKED</strong></p>
+          ${isKleinBackend ? `
+            <h3 style="color: #74b9ff; margin: 20px 0 10px;">Stage 1 INPUTS</h3>
+            <p style="color: #888; margin-bottom: 12px;">See the <strong>STAGE 1 GPT (DEBUG)</strong> section above for exact Stage 1 input_image used by GPT.</p>
+            <h3 style="color: #ff9f43; margin: 30px 0 10px;">Stage 1 OUTPUT</h3>
+            <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
+              <div class="step sent">
+                <h3 style="color: #ff9f43;">GPT Stage 1 Output</h3>
+                <img id="kontext-result-img" src="/api/debug/stage1-gpt-result?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available yet'" onload="document.getElementById('dk1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="dk1" style="color: #ff9f43;">-</p>
+                <p>Output of GPT Stage 1 (used to build Stage 2 reference mask).</p>
+              </div>
+              <div class="step sent">
+                <h3 style="color: #fd79a8;">Stage 2 Reference Mask Source</h3>
+                <img id="hair-face-mask-img" src="/api/debug/stage2-reference-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Run generation first'" onload="document.getElementById('dk3').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="dk3" style="color: #fd79a8;">-</p>
+                <p>Final guidance mask sent to FLUX 2 Klein as input_image_2.</p>
+              </div>
             </div>
-            <div class="step sent">
-              <h3 style="color: #a29bfe;">input_image_2 (Reference)</h3>
-              <img src="/api/debug/kontext-stage1-input-ref?t=${Date.now()}" onerror="this.alt='Not available yet'" onload="document.getElementById('dku2').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-              <p class="dims" id="dku2" style="color: #a29bfe;">-</p>
-              <p>Reference sent to Kontext<br><strong>Should be UNMASKED</strong></p>
+          ` : `
+            <h3 style="color: #74b9ff; margin: 20px 0 10px;">Stage 1 INPUTS (what was sent to Kontext)</h3>
+            <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
+              <div class="step sent">
+                <h3 style="color: #74b9ff;">input_image (User Photo)</h3>
+                <img src="/api/debug/kontext-stage1-input-user?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available yet'" onload="document.getElementById('dku1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="dku1" style="color: #74b9ff;">-</p>
+                <p>User photo sent to Kontext<br><strong>Should be UNMASKED</strong></p>
+              </div>
+              <div class="step sent">
+                <h3 style="color: #a29bfe;">input_image_2 (Reference)</h3>
+                <img src="/api/debug/kontext-stage1-input-ref?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available yet'" onload="document.getElementById('dku2').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="dku2" style="color: #a29bfe;">-</p>
+                <p>Reference sent to Kontext<br><strong>Should be UNMASKED</strong></p>
+              </div>
             </div>
-          </div>
+            <h3 style="color: #ff9f43; margin: 30px 0 10px;">Stage 1 OUTPUT</h3>
+            <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
+              <div class="step sent">
+                <h3 style="color: #ff9f43;">Stage 1 Result (GPT/Kontext)</h3>
+                <img id="kontext-result-img" src="/api/debug/kontext-stage1-result?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Not available - run kontext_refined first'" onload="document.getElementById('dk1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="dk1" style="color: #ff9f43;">-</p>
+                <p>Initial generation from Kontext Pro<br>(unmasked user + unmasked ref)</p>
+              </div>
+              <div class="step sent">
+                <h3 style="color: #fd79a8;">Stage 1 Hair-Only Mask</h3>
+                <img id="hair-face-mask-img" src="/api/debug/kontext-stage1-hair-face-mask?${selectedIndexQuery}t=${Date.now()}" onerror="this.alt='Run generation first'" onload="document.getElementById('dk3').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
+                <p class="dims" id="dk3" style="color: #fd79a8;">-</p>
+                <p>Extracted from Stage 1 result<br>(sent to Stage 2 as input_image_4)</p>
+              </div>
+            </div>
+          `}
           
-          <h3 style="color: #ff9f43; margin: 30px 0 10px;">Stage 1 OUTPUT</h3>
-          <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
-            <div class="step sent">
-              <h3 style="color: #ff9f43;">Stage 1 Result (GPT/Kontext)</h3>
-              <img id="kontext-result-img" src="/api/debug/kontext-stage1-result?t=${Date.now()}" onerror="this.alt='Not available - run kontext_refined first'" onload="document.getElementById('dk1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-              <p class="dims" id="dk1" style="color: #ff9f43;">-</p>
-              <p>Initial generation from Kontext Pro<br>(unmasked user + unmasked ref)</p>
-            </div>
-            <div class="step sent">
-              <h3 style="color: #fd79a8;">Stage 1 Hair-Only Mask</h3>
-              <img id="hair-face-mask-img" src="/api/debug/kontext-stage1-hair-face-mask?t=${Date.now()}" onerror="this.alt='Run generation first'" onload="document.getElementById('dk3').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-              <p class="dims" id="dk3" style="color: #fd79a8;">-</p>
-              <p>Extracted from Stage 1 result<br>(sent to Stage 2 as input_image_4)</p>
-            </div>
-          </div>
-          
-				          <h3 style="color: #00cec9; margin: 30px 0 10px;">Stage 2 INPUTS (what FLUX 2 Pro receives)</h3>
-				          <div class="grid" style="grid-template-columns: repeat(4, 1fr);">
-            <div class="step sent">
-			              <h3 style="color: #4ecdc4;">input_image (Full User Photo)</h3>
-			              <img id="stage2-full-user-img" src="/api/debug/user-image?t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds1').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-			              <p class="dims" id="ds1" style="color: #4ecdc4;">-</p>
-			              <p>Image 1: full user photo (base/background source)</p>
-			            </div>
-				            <div class="step sent">
-				              <h3 style="color: #fd79a8;">input_image_2 (User Face+Neck Mask)</h3>
-				              <img id="stage2-face-neck-img" src="/api/debug/stage2-face-neck-mask?t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds2').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-				              <p class="dims" id="ds2" style="color: #fd79a8;">-</p>
-				              <p>Image 2: user face+neck mask (identity lock)</p>
-				            </div>
-					            <div class="step sent">
-					              <h3 style="color: #55efc4;">input_image_3 (User Hair Color Mask)</h3>
-					              <img id="stage2-user-hair-color-img" src="/api/debug/stage2-user-hair-color-mask?t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds3').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-					              <p class="dims" id="ds3" style="color: #55efc4;">-</p>
-					              <p>Image 3: user hair color mask (hair editable, non-hair gray)</p>
-					            </div>
-					            <div class="step sent">
-					              <h3 style="color: #74b9ff;">input_image_4 (GPT/Kontext Hair-Only)</h3>
-					              <img id="stage2-gpt-hair-only-img" src="/api/debug/kontext-stage1-hair-face-mask?t=${Date.now()}" onerror="this.alt='Not available'" onload="document.getElementById('ds4').textContent = this.naturalWidth + 'x' + this.naturalHeight"/>
-					              <p class="dims" id="ds4" style="color: #74b9ff;">-</p>
-					              <p>Image 4: hairstyle source from Stage 1</p>
-					            </div>
-				          </div>
+                  ${stage2InputCardsHtml}
 
 					          <h3 style="color: #f39c12; margin: 30px 0 10px;">FILL INPUTS (Only when fill backend is active)</h3>
-					          <p style="color: #888; margin-bottom: 10px;">These are ignored in current FLUX 2 Pro mode.</p>
+					          <p style="color: #888; margin-bottom: 10px;">These are ignored in current ${stage2BackendLabel} mode.</p>
 			          <div class="prompt-box">
 			            <strong>Fill Prompt:</strong> ${GENERATION_CONFIG.KONTEXT_FILL_PROMPT}
 			          </div>
@@ -7882,22 +9385,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 					              <p>Image 2: white editable hair region, black preserve</p>
 				            </div>
 			          </div>
-	          
-	          <h3 style="color: #27ae60; margin: 30px 0 10px;">Stage 2 OUTPUTS (comparison view)</h3>
-	          <div class="grid" style="grid-template-columns: repeat(2, 1fr);">
-            <div class="step sent" style="border-color: #27ae60;">
-	              <h3 style="color: #27ae60; font-size: 16px;">Stage 2 Result (Returned to App)</h3>
-              <img id="flux-result-img" src="/api/debug/flux-stage2-result?t=${Date.now()}" onerror="this.alt='Run generation first'" onload="document.getElementById('df1').textContent = this.naturalWidth + 'x' + this.naturalHeight" style="max-height: 400px;"/>
-              <p class="dims" id="df1" style="color: #27ae60;">-</p>
-              <p>This image is the final Stage 2 output returned to the app for the active backend.</p>
-            </div>
-            <div class="step sent" style="border-color: #f39c12;">
-              <h3 style="color: #f39c12; font-size: 16px;">FLUX Fill Comparison (Debug Only)</h3>
-              <img id="flux-fill-result-img" src="/api/debug/flux-fill-stage2-result?t=${Date.now()}" onerror="this.alt='No comparison image yet'" onload="document.getElementById('df2').textContent = this.naturalWidth + 'x' + this.naturalHeight" style="max-height: 400px;"/>
-              <p class="dims" id="df2" style="color: #f39c12;">-</p>
-              <p>Run in parallel for quality comparison. Not returned to app.</p>
-            </div>
-          </div>
+          ${stage2OutputCardsHtml}
         </div>
 
         <div class="section">
@@ -7917,6 +9405,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         </div>
 
         <script>
+          const isKleinBackend = ${isKleinBackend ? "true" : "false"};
+
           async function runKontextTest() {
             const prompt = document.getElementById('kontext-prompt').value.trim();
             if (!prompt) {
@@ -7944,9 +9434,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
               if (data.success) {
                 status.textContent = 'Success! Refreshing images...';
                 status.style.color = '#00b894';
-                document.getElementById('kontext-result-img').src = '/api/debug/kontext-stage1-result?t=' + Date.now();
-                document.getElementById('hair-face-mask-img').src = '/api/debug/kontext-stage1-hair-face-mask?t=' + Date.now();
-                document.getElementById('flux-result-img').src = '/api/debug/flux-stage2-result?t=' + Date.now();
+                const kontextResultImg = document.getElementById('kontext-result-img');
+                if (kontextResultImg) {
+                  kontextResultImg.src = (isKleinBackend ? '/api/debug/stage1-kontext-result?t=' : '/api/debug/kontext-stage1-result?t=') + Date.now();
+                }
+                const hairFaceMaskImg = document.getElementById('hair-face-mask-img');
+                if (hairFaceMaskImg) {
+                  hairFaceMaskImg.src = (isKleinBackend ? '/api/debug/stage2-reference-mask?t=' : '/api/debug/kontext-stage1-hair-face-mask?t=') + Date.now();
+                }
+                const stage1KontextResultImg = document.getElementById('stage1-kontext-result-img');
+                if (stage1KontextResultImg) {
+                  stage1KontextResultImg.src = '/api/debug/stage1-kontext-result?t=' + Date.now();
+                }
+                const stage1GptResultImg = document.getElementById('stage1-gpt-result-img');
+                if (stage1GptResultImg) {
+                  stage1GptResultImg.src = '/api/debug/stage1-gpt-result?t=' + Date.now();
+                }
+                const fluxResultImg = document.getElementById('flux-result-img');
+                if (fluxResultImg) {
+                  fluxResultImg.src = '/api/debug/flux-stage2-result?t=' + Date.now();
+                }
                 const fluxFillResultImg = document.getElementById('flux-fill-result-img');
                 if (fluxFillResultImg) {
                   fluxFillResultImg.src = '/api/debug/flux-fill-stage2-result?t=' + Date.now();
@@ -7969,11 +9476,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 }
                 const stage2FullUserImg = document.getElementById('stage2-full-user-img');
                 if (stage2FullUserImg) {
-                  stage2FullUserImg.src = '/api/debug/user-image?t=' + Date.now();
+                  stage2FullUserImg.src = '/api/debug/user-image?${selectedIndexQuery}t=' + Date.now();
                 }
                 const stage2GptHairOnlyImg = document.getElementById('stage2-gpt-hair-only-img');
                 if (stage2GptHairOnlyImg) {
-                  stage2GptHairOnlyImg.src = '/api/debug/kontext-stage1-hair-face-mask?t=' + Date.now();
+                  const hairMaskPath = isKleinBackend
+                    ? '/api/debug/stage2-reference-mask?t=' + Date.now()
+                    : '/api/debug/kontext-stage1-hair-face-mask?t=' + Date.now();
+                  stage2GptHairOnlyImg.src = hairMaskPath;
                 }
                 const fillStyleImg = document.getElementById('fill-style-img');
                 if (fillStyleImg) {
@@ -7997,7 +9507,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           <button class="refresh-btn" onclick="location.reload()">Refresh</button>
         </div>
         <p style="text-align: center; color: #666; margin-top: 15px; font-size: 13px;">
-          Run a "Describe Your Style" generation, then refresh this page to see all reference masks.
+          Run a "Describe Your Style" generation, then refresh this page to see all reference guidance inputs.
         </p>
       </body>
       </html>
@@ -8592,14 +10102,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       let generationSucceeded = false;
 
-      // Pre-fetch reference images for text mode variants
-      // Use vision to select the BEST reference from candidates (if enabled)
+      // Pre-fetch reference images for text mode variants.
       const textModeVariants = variants.filter(v => v.status === "pending" && v.customPrompt && !v.inspirationPhotoUrl);
       const CANDIDATES_TO_ANALYZE = GENERATION_CONFIG.TEXT_MODE_CANDIDATES_TO_ANALYZE;
+      const TOP_TEXT_MODE_REFERENCES = 50;
       const PREFILTER_TOP_N = GENERATION_CONFIG.TEXT_MODE_PREFILTER_TOP_N || 16;
       const USE_VISION_SELECTION = GENERATION_CONFIG.TEXT_MODE_VISION_SELECTION;
-      const USE_DIRECT_KONTEXT_TEXT_MODE = GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT;
-      const TEXT_MODE_STAGE1_PROVIDER: "gpt_image" = "gpt_image";
+      const USE_DIRECT_KONTEXT_TEXT_MODE = false;
+      const TEXT_MODE_STAGE1_PROVIDER: KontextStage1Provider = resolveKontextStage1Provider(
+        GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER
+      );
       
       // Store pre-fetched references: { base64: string, url: string, source: string }[]
       let prefetchedRefs: { base64: string; url: string; source: string }[] = [];
@@ -8611,7 +10123,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         const firstVariantPrompt = textModeVariants[0].customPrompt!;
 
         if (USE_DIRECT_KONTEXT_TEXT_MODE) {
-          console.log(`[TEXT MODE] Direct pipeline enabled: GPT Stage 1 -> kontext_result_mask_test -> FLUX 2 Pro (web reference search disabled)`);
+          console.log(
+            `[TEXT MODE] Direct pipeline enabled: ${getKontextStage1ProviderLabel(TEXT_MODE_STAGE1_PROVIDER)} Stage 1 -> kontext_result_mask_test -> FLUX Stage 2 (web reference search disabled)`
+          );
           visionHairstyleDescription = firstVariantPrompt;
 
           // Load existing user analysis if available; this only helps Stage 2 ethnicity replacement.
@@ -8670,8 +10184,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
             if (cachedPromptAnalysis && Date.now() - cachedPromptAnalysis.updatedAt < 30 * 60 * 1000) {
               // Use cached prompt analysis from vision model
               console.log(`[REFS] Using cached prompt analysis for: "${firstVariantPrompt}"`);
-              optimizedSearchQuery = cachedPromptAnalysis.searchQuery;
-              visionHairstyleDescription = cachedPromptAnalysis.hairstyleInterpretation;
+              const cachedHairstyleName = normalizeHairstyleName(
+                cachedPromptAnalysis.hairstyleInterpretation,
+                firstVariantPrompt
+              );
+              visionHairstyleDescription = cachedHairstyleName;
+              optimizedSearchQuery = buildBestHairstyleSearchQuery(cachedHairstyleName, userAnalysis);
             } else {
               // Call vision model to interpret the new prompt (reuse cached userAnalysis)
               console.log(`[REFS] New prompt - calling vision for interpretation: "${firstVariantPrompt}"`);
@@ -8756,12 +10274,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
             console.log(`[REFS] User: ${userAnalysis.gender}, ${userAnalysis.raceEthnicity}`);
           }
           
-          // Search for candidates using the optimized search query
-          // Use GPT output directly if available, only add front-facing if no GPT query
-          const cleanQuery = optimizedSearchQuery.replace(/\s*\d{4}\s*/g, '').trim();
-          // Only add "(front facing)" if not already present in the query
-          const hasFrontFacing = cleanQuery.toLowerCase().includes('front facing') || cleanQuery.toLowerCase().includes('front-facing');
-          const finalSearchQuery = hasFrontFacing ? cleanQuery : `${cleanQuery} (front facing)`;
+          // Search for candidates with required SerpAPI query format:
+          // "Best {hairstyle name} hairstyle for {users race} {users gender}"
+          // Always prefer interpreted hairstyle name over raw user prompt text.
+          const interpretedHairstyleName = normalizeHairstyleName(
+            visionHairstyleDescription || firstVariantPrompt,
+            firstVariantPrompt
+          );
+          const finalSearchQuery = userAnalysis
+            ? buildBestHairstyleSearchQuery(interpretedHairstyleName, userAnalysis)
+            : (optimizedSearchQuery || `Best ${interpretedHairstyleName} hairstyle`).replace(/\s+/g, " ").trim();
           console.log(`[REFS] Searching with query: "${finalSearchQuery}"`);
           const frontResults = await searchWebForHairstyleImagesWithQuery(finalSearchQuery, CANDIDATES_TO_ANALYZE);
           
@@ -8771,7 +10293,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           if (frontResults.length > 0) {
             
             // Fetch candidate images IN PARALLEL with concurrency limit for speed
-            const CONCURRENT_FETCHES = 10; // Limit concurrent requests to avoid overwhelming network
+            const CONCURRENT_FETCHES = 20; // Parallelize fetches more aggressively to reduce reference prefetch latency
             const toFetch = frontResults.slice(0, CANDIDATES_TO_ANALYZE);
             
             type FetchResult = {
@@ -8838,16 +10360,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
               return b.minDimension - a.minDimension;
             });
             const candidates: ReferenceCandidate[] = sortedByQuality.slice(0, PREFILTER_TOP_N);
-            console.log(`[REFS] Fetched ${allFetched.length}/${toFetch.length} → ${minSizeCandidates.length} passed size filter → ${candidates.length} for vision`);
-            
-            // DEBUG: Store all fetched images for viewing (persisted to disk)
-            const fetchedImagesData = sortedByQuality.map(c => ({
-              url: c.imageUrl,
-              base64: c.base64,
-              source: c.source || c.title || 'Unknown',
-              timestamp: new Date()
-            }));
-            saveFetchedImages(fetchedImagesData);
             
             if (candidates.length > 0) {
               if (USE_VISION_SELECTION) {
@@ -8856,7 +10368,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                   candidates,
                   firstVariantPrompt,
                   userAnalysis,
-                  100,  // Rank all candidates, stop only when no more references
+                  TOP_TEXT_MODE_REFERENCES,
                   visionHairstyleDescription  // Pass vision model's interpretation
                 );
                 
@@ -8866,7 +10378,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 if (visionResult.candidates.length > 0) {
                   console.log(`[REFS] Vision selected ${visionResult.candidates.length} refs | Interpreted as: "${visionHairstyleDescription.substring(0, 60)}..."`);
                   // Store ALL selected references (up to 10)
-                  for (const selectedCandidate of visionResult.candidates) {
+                  for (const selectedCandidate of visionResult.candidates.slice(0, TOP_TEXT_MODE_REFERENCES)) {
                     prefetchedRefs.push({
                       base64: selectedCandidate.base64,
                       url: selectedCandidate.imageUrl,
@@ -8876,7 +10388,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 } else {
                   console.warn("[REFS] Vision selection failed, using first 10 candidates");
                   // Fallback: use first 10 candidates
-                  for (let i = 0; i < Math.min(10, candidates.length); i++) {
+                  for (let i = 0; i < Math.min(TOP_TEXT_MODE_REFERENCES, candidates.length); i++) {
                     prefetchedRefs.push({
                       base64: candidates[i].base64,
                       url: candidates[i].imageUrl,
@@ -8885,8 +10397,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
                   }
                 }
               } else {
-                // No vision selection - use first 6 candidates
-                for (let i = 0; i < Math.min(6, candidates.length); i++) {
+                // No vision selection - use top capped candidates
+                for (let i = 0; i < Math.min(TOP_TEXT_MODE_REFERENCES, candidates.length); i++) {
                   prefetchedRefs.push({
                     base64: candidates[i].base64,
                     url: candidates[i].imageUrl,
@@ -8903,6 +10415,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
           } catch (refError) {
             console.warn("[REFS] Pre-fetch failed:", refError);
+          }
+
+          if (prefetchedRefs.length > 1) {
+            prefetchedRefs = shuffleArray(prefetchedRefs);
+            console.log(`[REFS] Shuffled ${prefetchedRefs.length} ranked references for randomized generation order`);
+          }
+
+          if (GENERATION_CONFIG.SAVE_FETCHED_REFERENCE_DEBUG && prefetchedRefs.length > 0) {
+            await saveFetchedImages(
+              prefetchedRefs.map(ref => ({
+                url: ref.url,
+                base64: ref.base64,
+                source: ref.source || "Unknown",
+                timestamp: new Date()
+              }))
+            );
           }
 
           // Store ranked references in session for generate-more feature
@@ -9120,13 +10648,26 @@ export async function registerRoutes(app: Express): Promise<Server> {
               console.log(`Skipping BFL pipeline - ChatGPT succeeded`);
             } else {
             
-            // Clear old debug files and reset counter for fresh generation
+            // Reset and clear debug images so overview refresh always shows latest generation outputs.
             debugRefIndexCounter = 0;
             try {
               const fsDebugCleanup = await import("fs/promises");
               const tmpFiles = await fsDebugCleanup.readdir("/tmp");
               for (const file of tmpFiles) {
-                if (file.startsWith("debug_reference_")) {
+                if (
+                  file.startsWith("debug_reference_") ||
+                  file.startsWith("debug_gpt_ref_input_") ||
+                  file.startsWith("debug_gpt_reference_fusion_result") ||
+                  file.startsWith("debug_stage1_kontext_fusion_result") ||
+                  file.startsWith("debug_stage1_gpt_fusion_result") ||
+                  file.startsWith("debug_kontext_stage1_result") ||
+                  file.startsWith("debug_kontext_stage1_hair_face_mask") ||
+                  file.startsWith("debug_kontext_stage1_metadata") ||
+                  file.startsWith("debug_stage2_user_face_neck_mask") ||
+                  file.startsWith("debug_stage2_user_hair_color_mask") ||
+                  file.startsWith("debug_stage2_klein_reference_mask_") ||
+                  file.startsWith("debug_flux_stage2_result")
+                ) {
                   await fsDebugCleanup.unlink(`/tmp/${file}`).catch(() => {});
                 }
               }
@@ -9136,7 +10677,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
             }
             
             if (GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT) {
-              console.log(`📦 Pipeline: kontext_refined_direct (GPT Stage 1 -> kontext_result_mask_test -> FLUX 2 Pro)`);
+              console.log(
+                `📦 Pipeline: kontext_refined_direct (${getKontextStage1ProviderLabel(TEXT_MODE_STAGE1_PROVIDER)} Stage 1 -> kontext_result_mask_test -> FLUX Stage 2)`
+              );
               console.log(`📚 Web reference search: skipped (TEXT_MODE_DIRECT_KONTEXT=true)`);
             } else {
               console.log(`📦 Pipeline: kontext_refined (reference-guided)`);
@@ -9194,11 +10737,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
             }
 
             // Direct text-mode pipeline (enforced):
-            // GPT Stage 1 on user image -> mask GPT result -> FLUX 2 Pro (user mask + GPT mask + full user photo)
+            // Selected Stage 1 provider on user image -> mask Stage 1 result -> FLUX Stage 2
             if (GENERATION_CONFIG.TEXT_MODE_DIRECT_KONTEXT) {
               const interpretedPrompt = visionHairstyleDescription || variant.customPrompt!;
               console.log(`📝 Interpreted prompt: "${interpretedPrompt}"`);
-              console.log(`🧭 Stage 1 provider (forced): GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})`);
+              console.log(`🧭 Stage 1 provider (forced): ${getKontextStage1ProviderLabel(TEXT_MODE_STAGE1_PROVIDER)}`);
+              debugRefIndexCounter++;
+              const debugIdx = debugRefIndexCounter;
               const frontImageUrl = await generateWithKontextRefined(
                 session.photoUrl,
                 interpretedPrompt,
@@ -9206,7 +10751,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 maskedUserPhoto!,
                 userAnalysis?.raceEthnicity || "natural",
                 userAnalysis?.gender || "",
-                  { promptOnlyMode: true, stage1Provider: "gpt_image" }
+                  { promptOnlyMode: true, stage1Provider: TEXT_MODE_STAGE1_PROVIDER, debugIndex: debugIdx }
               );
 
               if (frontImageUrl) {
@@ -9225,7 +10770,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
                   status: "completed",
                 });
                 console.log(`[MODEL DEBUG] Variant ${variant.id}: ${JSON.stringify(modelDebug)}`);
-                console.log(`✓ Text mode complete: direct GPT Stage 1 + FLUX Stage 2 pipeline`);
+                console.log(
+                  `✓ Text mode complete: direct ${getKontextStage1ProviderLabel(TEXT_MODE_STAGE1_PROVIDER)} Stage 1 + FLUX Stage 2 pipeline`
+                );
               } else {
                 await storage.updateGeneratedVariant(variant.id, {
                   status: "failed",
@@ -9234,20 +10781,127 @@ export async function registerRoutes(app: Express): Promise<Server> {
               continue;
             }
             
-            // Generate using references with TWO-PHASE approach:
-            // PHASE 1: Try ALL references with advanced pipeline (higher quality)
-            // PHASE 2: Only if still need more results, try failed refs with simple pipeline (last resort)
+            // Generate using single-stage FLUX Klein:
+            // input_image = full user photo, input_image_2 = reference mannequin mask,
+            // input_image_3 = user face mask.
             const MAX_GENERATIONS = 1;
             const generatedResults: { url: string; refUrl?: string; refSource?: string; refIndex: number }[] = [];
             
             console.log(`🔄 Starting generation with ${prefetchedRefs.length} available references (need ${MAX_GENERATIONS})\n`);
-            
-            // Helper function to generate with Kontext Refined pipeline
+
+            const userPhotoBase64ForKlein = session.photoUrl.startsWith("data:")
+              ? await normalizeImageOrientation(session.photoUrl)
+              : await fetchImageAsBase64(session.photoUrl);
+            if (!userPhotoBase64ForKlein) {
+              console.error("✗ Could not fetch/normalize user photo for Klein single-stage generation.");
+              await storage.updateGeneratedVariant(variant.id, { status: "failed" });
+              continue;
+            }
+            try {
+              await saveBase64DebugImage("/tmp/debug_user_image.jpg", userPhotoBase64ForKlein);
+            } catch {
+              // Best-effort debug artifact.
+            }
+
+            const userFaceMaskForKlein = await buildStage2FaceMaskForKleinSingleStage(userPhotoBase64ForKlein);
+            if (!userFaceMaskForKlein) {
+              console.error("✗ Could not create user face mask for Klein single-stage generation.");
+              await storage.updateGeneratedVariant(variant.id, { status: "failed" });
+              continue;
+            }
+            try {
+              await saveBase64DebugImage("/tmp/debug_stage2_user_face_neck_mask.jpg", userFaceMaskForKlein);
+              console.log("✓ Saved user face mask to /tmp/debug_stage2_user_face_neck_mask.jpg");
+            } catch (error) {
+              console.warn("Could not save user face mask debug image:", error);
+            }
+
+            let stage1GptComparisonResult: string | null = null;
+            let stage1PrimaryFusionResult: string | null = null;
+            let stage1PrimaryProvider: KontextStage1Provider | null = null;
+            const topReferenceForStage1 = prefetchedRefs[0];
+            if (topReferenceForStage1) {
+              const userPhotoDimsForStage1 = await getImageDimensions(userPhotoBase64ForKlein);
+              const stage1Size = userPhotoDimsForStage1
+                ? selectChatGPTImageSize(userPhotoDimsForStage1.width, userPhotoDimsForStage1.height)
+                : GENERATION_CONFIG.CHATGPT_IMAGE_SIZE;
+              try {
+                await saveBase64DebugImage("/tmp/debug_gpt_ref_input_1.jpg", topReferenceForStage1.base64);
+                console.log("✓ Saved Stage 1 reference-only input to /tmp/debug_gpt_ref_input_1.jpg");
+              } catch (error) {
+                console.warn("Could not save Stage 1 input debug images:", error);
+              }
+              try {
+                await fsPromises.writeFile(
+                  "/tmp/debug_kontext_stage1_metadata.json",
+                  JSON.stringify(
+                    {
+                      generatedAt: new Date().toISOString(),
+                      provider: "gpt_primary_only",
+                      providerLabel: "GPT Stage 1 (primary only)",
+                      inputLabel: "image 1 reference only",
+                      prompt: KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT,
+                      inputLength: topReferenceForStage1.base64.length,
+                      inputPreview: topReferenceForStage1.base64.substring(0, 160),
+                      imageSize: stage1Size,
+                    },
+                    null,
+                    2
+                  )
+                );
+              } catch (e) {
+                console.warn("Could not save Stage 1 metadata:", e);
+              }
+
+              console.log("🧠 Running GPT Stage 1 (reference only, PRIMARY source)...");
+              const stage1GptStartMs = Date.now();
+              stage1GptComparisonResult = await generateHairstyleWithChatGPT(
+                topReferenceForStage1.base64,
+                KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT,
+                {
+                  promptTemplate: "{hairstyle}",
+                  imageSize: stage1Size,
+                }
+              );
+              const stage1GptElapsedMs = Date.now() - stage1GptStartMs;
+              console.log(`⏱️ Stage 1 GPT generation time: ${(stage1GptElapsedMs / 1000).toFixed(2)}s`);
+              if (stage1GptComparisonResult && !stage1GptComparisonResult.startsWith("data:")) {
+                stage1GptComparisonResult = await fetchImageAsBase64(stage1GptComparisonResult);
+              }
+              if (stage1GptComparisonResult && userPhotoDimsForStage1) {
+                const resizedStage1 = await resizeImageToDimensions(
+                  stage1GptComparisonResult,
+                  userPhotoDimsForStage1.width,
+                  userPhotoDimsForStage1.height
+                );
+                if (resizedStage1) {
+                  stage1GptComparisonResult = resizedStage1;
+                  console.log(`✓ Stage 1 GPT resized to user dimensions: ${userPhotoDimsForStage1.width}x${userPhotoDimsForStage1.height}`);
+                }
+              }
+              if (stage1GptComparisonResult) {
+                try {
+                  await saveBase64DebugImage("/tmp/debug_stage1_gpt_fusion_result.jpg", stage1GptComparisonResult);
+                  console.log("✓ Saved Stage 1 GPT comparison result to /tmp/debug_stage1_gpt_fusion_result.jpg");
+                } catch (error) {
+                  console.warn("Could not save Stage 1 GPT comparison debug image:", error);
+                }
+              } else {
+                console.warn("⚠️ GPT Stage 1 failed (generation falls back to raw reference mask source).");
+              }
+
+              stage1PrimaryFusionResult = stage1GptComparisonResult;
+              stage1PrimaryProvider = stage1GptComparisonResult ? "gpt_image" : null;
+              if (stage1PrimaryProvider) {
+                console.log("✅ Stage 1 primary source for generation: GPT");
+              }
+            } else {
+              console.warn("⚠️ Need at least 1 reference for Stage 1 reference-only call. Falling back to reference #1 mask source.");
+            }
+
             const generateWithMask = async (
-              ref: typeof prefetchedRefs[0], 
-              refIndex: number, 
-              _unused: string,  // Legacy parameter, no longer used
-              pipelineType: string
+              ref: typeof prefetchedRefs[0],
+              refIndex: number
             ): Promise<string | null> => {
               // Use global counter for debug indices (persists across "Generate More")
               debugRefIndexCounter++;
@@ -9262,25 +10916,52 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 );
                 await fsDebug.writeFile(`/tmp/debug_reference_full_${debugIdx}.jpg`, originalRefBuffer);
                 console.log(`✓ Saved reference to /tmp/debug_reference_full_${debugIdx}.jpg`);
+                if (stage1GptComparisonResult) {
+                  await saveDebugImageFromAnySource(`/tmp/debug_stage1_gpt_fusion_result_${debugIdx}.jpg`, stage1GptComparisonResult);
+                }
               } catch (err) {
                 console.warn(`Failed to save reference ${refIndex + 1}:`, err);
               }
-              
-              // Generate with KONTEXT REFINED two-stage pipeline
               let frontImageUrl: string | null = null;
+              let referenceGuidanceMask: string | null = null;
+              const referenceMaskSource = stage1PrimaryFusionResult || ref.base64;
+
+              try {
+                referenceGuidanceMask = await createReferenceHairMaskForKleinSingleStage(referenceMaskSource);
+                if (referenceGuidanceMask) {
+                  await saveBase64DebugImage(`/tmp/debug_stage2_klein_reference_mask_${debugIdx}.jpg`, referenceGuidanceMask);
+                  console.log(`   ✓ Saved reference hair guidance mask for klein: /tmp/debug_stage2_klein_reference_mask_${debugIdx}.jpg`);
+                }
+              } catch (error) {
+                console.warn(`   ⚠️ Failed to prepare single-stage reference hair mask: ${error}`);
+              }
+
+              if (!referenceGuidanceMask) {
+                console.warn(`   ⚠️ Could not build reference hair mask for generation ${debugIdx}, skipping ref ${refIndex + 1}`);
+                return null;
+              }
               
               try {
-                // Stage 1: Kontext Pro (reference image only)
-                // Stage 2: FLUX 2 Pro (user mask + hair-only from Stage 1 + full user)
-                console.log(`🎯 Using KONTEXT REFINED two-stage pipeline`);
-                frontImageUrl = await generateWithKontextRefined(
-                  session.photoUrl,
-                  visionHairstyleDescription || variant.customPrompt!,
-                  ref.base64,  // Unmasked reference for Stage 1
-                  maskedUserPhoto!,
-                  userAnalysis?.raceEthnicity || "person",
-                  userAnalysis?.gender || ""
+                console.log(`🎯 Using FLUX Klein single-stage pipeline`);
+                try {
+                  await saveBase64DebugImage(`/tmp/debug_user_image_${debugIdx}.jpg`, userPhotoBase64ForKlein);
+                  await saveBase64DebugImage(`/tmp/debug_stage2_user_face_neck_mask_${debugIdx}.jpg`, userFaceMaskForKlein);
+                } catch (e) {
+                  console.warn(`   ⚠️ Could not save indexed Stage 2 face mask ${debugIdx}:`, e);
+                }
+                frontImageUrl = await generateSingleFluxKleinFromReferenceMask(
+                  userPhotoBase64ForKlein,
+                  userFaceMaskForKlein,
+                  referenceGuidanceMask
                 );
+                if (frontImageUrl) {
+                  try {
+                    await saveDebugImageFromAnySource(`/tmp/debug_flux_stage2_result_${debugIdx}.jpg`, frontImageUrl);
+                    console.log(`   ✓ Saved indexed Stage 2 result: /tmp/debug_flux_stage2_result_${debugIdx}.jpg`);
+                  } catch (e) {
+                    console.warn(`   ⚠️ Could not save indexed Stage 2 result ${debugIdx}:`, e);
+                  }
+                }
               } catch (err) {
                 console.error(`Text mode generation failed:`, err);
               }
@@ -9288,16 +10969,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
               return frontImageUrl;
             };
             
-            // ========== Generate with available references ==========
-            console.log(`\n━━━ Generating with ${prefetchedRefs.length} references ━━━`);
-            
-            for (let refIndex = 0; refIndex < prefetchedRefs.length && generatedResults.length < MAX_GENERATIONS; refIndex++) {
+            // ========== Generate with reference #1 only ==========
+            if (prefetchedRefs.length === 0) {
+              console.warn("✗ No references available for single-stage generation.");
+            } else {
+              const refIndex = 0;
               const ref = prefetchedRefs[refIndex];
               console.log(`\n📸 Reference ${refIndex + 1}/${prefetchedRefs.length}: ${ref.source}`);
-              
-              // Generate directly with Kontext Refined (no reference mask needed)
-              const frontImageUrl = await generateWithMask(ref, refIndex, ref.base64, 'kontext');
-              
+              const frontImageUrl = await generateWithMask(ref, refIndex);
               if (frontImageUrl) {
                 generatedResults.push({
                   url: frontImageUrl,
@@ -9320,7 +10999,24 @@ export async function registerRoutes(app: Express): Promise<Server> {
             // Store results: first one updates the original variant, others create new variants
             if (generatedResults.length > 0) {
               generationSucceeded = true;
-              const modelDebug = buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT");
+              const modelDebug: ModelDebugInfo = {
+                pipeline: stage1PrimaryProvider === "gpt_image"
+                  ? "flux_klein_single_stage_with_gpt_stage1_fusion"
+                  : "flux_klein_single_stage",
+                stage1Provider: stage1PrimaryProvider || undefined,
+                stage1Model: stage1PrimaryProvider === "gpt_image"
+                  ? GENERATION_CONFIG.CHATGPT_MODEL
+                  : undefined,
+                stage2Model: MODEL_ID_FLUX_KLEIN_STAGE2,
+                stage2Backend: "flux_klein",
+                stage2PromptSource: stage1PrimaryProvider === "gpt_image"
+                  ? "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT + CHATGPT_STAGE1_PROMPT_TEMPLATE"
+                  : "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT",
+                maskPipeline: stage1PrimaryProvider === "gpt_image"
+                  ? "gpt_stage1_fusion->stage1_feature_only_face_blot"
+                  : "stage1_feature_only_face_blot",
+                generatedAt: new Date().toISOString(),
+              };
               
               // Get the ACTUAL reference index that was used (may not be 0 if earlier refs failed)
               const actualRefIndex = generatedResults[0].refIndex;
@@ -10161,7 +11857,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
       console.log(`   📷 Found ${frontResults.length} celebrity haircut images`);
 
       // Fetch and filter candidates (same as text mode)
-      const CONCURRENT_FETCHES = 10;
+      const CONCURRENT_FETCHES = 20;
       const toFetch = frontResults.slice(0, CANDIDATES_TO_ANALYZE);
       
       type FetchResult = {
@@ -11029,7 +12725,9 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
         const deviceId = sourceSession.deviceId || getOrCreateDeviceId(req, res);
         const basePrompt = sourceSession.customPrompt || sourceVariant.customPrompt || sourceSession.hairstyleDescription || "";
         const interpretedPrompt = basePrompt;
-        const textModeStage1Provider: "gpt_image" = "gpt_image";
+        const textModeStage1Provider: KontextStage1Provider = resolveKontextStage1Provider(
+          GENERATION_CONFIG.TEXT_MODE_STAGE1_PROVIDER
+        );
 
         const newSession = await storage.createUserSession({
           photoUrl: sourceSession.photoUrl,
@@ -11053,6 +12751,8 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           referenceIndex: 0,
         });
 
+        debugRefIndexCounter++;
+        const debugIdx = debugRefIndexCounter;
         const kontextResult = await generateWithKontextRefined(
           sourceSession.photoUrl,
           interpretedPrompt,
@@ -11060,7 +12760,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           maskedUserPhoto,
           userRace,
           userGender,
-          { promptOnlyMode: true, stage1Provider: "gpt_image" }
+          { promptOnlyMode: true, stage1Provider: textModeStage1Provider, debugIndex: debugIdx }
         );
 
         if (!kontextResult) {
@@ -11087,7 +12787,9 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           status: "completed",
         });
 
-        console.log(`✅ [Generate More] Completed in direct GPT Stage 1 + FLUX Stage 2 mode: new session ${newSession.id}`);
+        console.log(
+          `✅ [Generate More] Completed in direct ${getKontextStage1ProviderLabel(textModeStage1Provider)} Stage 1 + FLUX Stage 2 mode: new session ${newSession.id}`
+        );
         return res.json({
           success: true,
           newSessionId: newSession.id,
@@ -11142,10 +12844,36 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
 
       // Try references starting from nextReferenceIndex until we find one with a valid mask
       let validRefIndex = -1;
-      let validHairOnlyImage: string | null = null;
-      let validRefBase64: string | null = null; // Full reference for Kontext pipeline
+      let validReferenceMask: string | null = null;
       let validRefUrl = "";
       let validRefSource = "";
+      let validRefStage1Provider: KontextStage1Provider | null = null;
+      let generationDebugIdx = 0;
+
+      const userPhotoBase64ForKlein = sourceSession.photoUrl.startsWith("data:")
+        ? await normalizeImageOrientation(sourceSession.photoUrl)
+        : await fetchImageAsBase64(sourceSession.photoUrl);
+      if (!userPhotoBase64ForKlein) {
+        return res.status(500).json({ error: "Failed to normalize user photo for Generate More" });
+      }
+      const userPhotoDimsForStage1 = await getImageDimensions(userPhotoBase64ForKlein);
+      const stage1SizeForGenerateMore = userPhotoDimsForStage1
+        ? selectChatGPTImageSize(userPhotoDimsForStage1.width, userPhotoDimsForStage1.height)
+        : GENERATION_CONFIG.CHATGPT_IMAGE_SIZE;
+      try {
+        await saveBase64DebugImage("/tmp/debug_user_image.jpg", userPhotoBase64ForKlein);
+      } catch {
+        // Best-effort debug artifact.
+      }
+      const userFaceMaskForKlein = await buildStage2FaceMaskForKleinSingleStage(userPhotoBase64ForKlein);
+      if (!userFaceMaskForKlein) {
+        return res.status(500).json({ error: "Failed to create user face mask for Generate More" });
+      }
+      try {
+        await saveBase64DebugImage("/tmp/debug_stage2_user_face_neck_mask.jpg", userFaceMaskForKlein);
+      } catch {
+        // Best-effort debug artifact.
+      }
       
       console.log(`🔍 [Generate More] Searching for valid reference starting at index ${nextReferenceIndex + 1}/${rankedReferences.length}...`);
       
@@ -11167,33 +12895,18 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           continue;
         }
         
-        // Create hair-only mask from reference
-        console.log(`   🎭 Creating hair mask...`);
-        const hairOnlyResult = await createHairOnlyImage(refBase64, 30, true);
-        
-        if (!hairOnlyResult.image) {
-          console.log(`   ❌ Hair mask creation failed - skipping`);
-          continue;
-        }
-        
-        // Check if mask is valid
-        if (!hairOnlyResult.validation?.valid) {
-          console.log(`   ❌ INVALID mask (score: ${hairOnlyResult.validation?.score}): ${hairOnlyResult.validation?.issues?.join(', ')} - skipping`);
-          continue;
-        }
-        
-        // Found a valid reference!
-        console.log(`   ✅ VALID mask (score: ${hairOnlyResult.validation?.score}) - using this reference`);
+        // Found an accessible reference: now build mask using the same pipeline as original generation.
+        console.log(`   ✅ Reference fetched. Building mask with original-generation pipeline...`);
         validRefIndex = i;
-        validHairOnlyImage = hairOnlyResult.image;
-        validRefBase64 = refBase64; // Store full reference for Kontext
         validRefUrl = ref.url;
         validRefSource = ref.source;
+        debugRefIndexCounter++;
+        generationDebugIdx = debugRefIndexCounter;
         
         // Save debug images for the debug page
         try {
           const fsDebug = await import("fs/promises");
-          const debugIdx = i + 1; // 1-indexed for display
+          const debugIdx = generationDebugIdx;
           
           // Save original reference
           const originalRefBuffer = Buffer.from(
@@ -11201,23 +12914,80 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
             'base64'
           );
           await fsDebug.writeFile(`/tmp/debug_reference_full_${debugIdx}.jpg`, originalRefBuffer);
+          await fsDebug.writeFile(`/tmp/debug_gpt_ref_input_${debugIdx}.jpg`, originalRefBuffer);
           
-          // Save hair-only mask
-          const hairOnlyBuffer = Buffer.from(
-            hairOnlyResult.image.replace(/^data:image\/\w+;base64,/, ''),
-            'base64'
-          );
-          await fsDebug.writeFile(`/tmp/debug_reference_hair_only_${debugIdx}.png`, hairOnlyBuffer);
-          console.log(`   📁 Saved debug images for reference ${debugIdx}`);
+          console.log(`   📁 Saved reference image for debug index ${debugIdx}`);
         } catch (debugErr) {
           console.warn(`   ⚠️ Failed to save debug images:`, debugErr);
         }
+
+        // Match original generation pipeline:
+        // 1) Stage 1 GPT (reference-only)
+        // 2) Build reference guidance mask via createReferenceHairMaskForKleinSingleStage
+        let stage1GptComparisonResult: string | null = null;
+        try {
+          const stage1GptStartMs = Date.now();
+          stage1GptComparisonResult = await generateHairstyleWithChatGPT(
+            refBase64,
+            KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT,
+            {
+              promptTemplate: "{hairstyle}",
+              imageSize: stage1SizeForGenerateMore,
+            }
+          );
+          const stage1GptElapsedMs = Date.now() - stage1GptStartMs;
+          console.log(`   ⏱️ Stage 1 GPT generation time: ${(stage1GptElapsedMs / 1000).toFixed(2)}s`);
+          if (stage1GptComparisonResult && !stage1GptComparisonResult.startsWith("data:")) {
+            stage1GptComparisonResult = await fetchImageAsBase64(stage1GptComparisonResult);
+          }
+          if (stage1GptComparisonResult && userPhotoDimsForStage1) {
+            const resizedStage1 = await resizeImageToDimensions(
+              stage1GptComparisonResult,
+              userPhotoDimsForStage1.width,
+              userPhotoDimsForStage1.height
+            );
+            if (resizedStage1) {
+              stage1GptComparisonResult = resizedStage1;
+            }
+          }
+          if (stage1GptComparisonResult) {
+            await saveDebugImageFromAnySource(
+              `/tmp/debug_stage1_gpt_fusion_result_${generationDebugIdx}.jpg`,
+              stage1GptComparisonResult
+            );
+            await saveDebugImageFromAnySource("/tmp/debug_stage1_gpt_fusion_result.jpg", stage1GptComparisonResult);
+          }
+        } catch (stage1GptErr) {
+          console.warn(`   ⚠️ Stage 1 GPT comparison failed for reference ${i + 1}.`, stage1GptErr);
+        }
+
+        const stage1PrimaryResult = stage1GptComparisonResult;
+        const stage1PrimaryProvider: KontextStage1Provider | null = stage1GptComparisonResult
+          ? "gpt_image"
+          : null;
+        validRefStage1Provider = stage1PrimaryProvider;
+        const referenceMaskSource = stage1PrimaryResult || refBase64;
+        try {
+          validReferenceMask = await createReferenceHairMaskForKleinSingleStage(referenceMaskSource);
+          if (validReferenceMask) {
+            await saveBase64DebugImage(`/tmp/debug_stage2_klein_reference_mask_${generationDebugIdx}.jpg`, validReferenceMask);
+            await saveBase64DebugImage("/tmp/debug_stage2_klein_reference_mask_1.jpg", validReferenceMask);
+            console.log(`   ✅ Reference mask ready (original pipeline): /tmp/debug_stage2_klein_reference_mask_${generationDebugIdx}.jpg`);
+            break;
+          }
+          console.log(`   ❌ Reference mask creation failed - trying next reference`);
+        } catch (maskErr) {
+          console.warn(`   ⚠️ Reference mask pipeline failed - trying next reference`, maskErr);
+        }
         
-        break;
+        validRefIndex = -1;
+        validRefUrl = "";
+        validRefSource = "";
+        validRefStage1Provider = null;
       }
       
       // If no valid reference found, return error (beta: no auto-refresh of references)
-      if (validRefIndex === -1 || !validHairOnlyImage) {
+      if (validRefIndex === -1 || !validReferenceMask) {
         console.log(`❌ [Generate More] No valid references remaining`);
         return res.status(400).json({ 
           error: "NO_REFERENCES_LEFT",
@@ -11252,8 +13022,6 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
       
       console.log(`📝 New session ${newSession.id} linked to root ${rootSessionId}`);
 
-      const hairstyleDescription = sourceSession.hairstyleDescription || sourceSession.customPrompt || "";
-
       // Create variant in the NEW session
       const newVariant = await storage.createGeneratedVariant({
         sessionId: newSession.id,
@@ -11266,27 +13034,33 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
         referenceIndex: validRefIndex,
       });
 
-      // RETRY LOOP: Try Kontext pipeline with current reference, if it fails try next references
+      // RETRY LOOP: Try FLUX Klein generation with current reference, if it fails try next references
       let generationSucceeded = false;
       let currentRefIndex = validRefIndex;
-      let currentHairOnlyImage = validHairOnlyImage;
-      let currentRefBase64 = validRefBase64; // Full reference for Kontext pipeline
       let currentRefUrl = validRefUrl;
       let currentRefSource = validRefSource;
+      let currentRefStage1Provider = validRefStage1Provider;
+      let currentReferenceMask = validReferenceMask;
       const MAX_GENERATION_RETRIES = 3; // Try up to 3 different references
       let retryCount = 0;
       
       while (!generationSucceeded && retryCount < MAX_GENERATION_RETRIES && currentRefIndex < rankedReferences.length) {
-        console.log(`🚀 [Generate More] Attempt ${retryCount + 1}/${MAX_GENERATION_RETRIES} - Starting KONTEXT pipeline with reference ${currentRefIndex + 1}...`);
+        console.log(`🚀 [Generate More] Attempt ${retryCount + 1}/${MAX_GENERATION_RETRIES} - Running single-stage FLUX Klein with reference ${currentRefIndex + 1}...`);
+        if (generationDebugIdx) {
+          try {
+            await saveBase64DebugImage(`/tmp/debug_user_image_${generationDebugIdx}.jpg`, userPhotoBase64ForKlein);
+            await saveBase64DebugImage(`/tmp/debug_stage2_user_face_neck_mask_${generationDebugIdx}.jpg`, userFaceMaskForKlein);
+          } catch {
+            // Best-effort debug artifact.
+          }
+        }
         
-        // Use Kontext Refined pipeline (same as initial text mode generation)
-        const kontextResult = await generateWithKontextRefined(
-          sourceSession.photoUrl,
-          hairstyleDescription,
-          currentRefBase64!,
-          maskedUserPhoto,
-          userRace,
-          userGender
+        // Use same single-stage path as original generation.
+        const kontextResult = await generateSingleFluxKleinFromReferenceMask(
+          userPhotoBase64ForKlein,
+          userFaceMaskForKlein,
+          currentReferenceMask!,
+          generationDebugIdx || undefined
         );
         
         // Convert Kontext result to match expected format
@@ -11316,7 +13090,26 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
             webReferenceSource: currentRefSource,
             compositeData: mergeCompositeData(
               newVariant.compositeData,
-              { modelDebug: buildKontextRefinedModelDebug("kontext", "KONTEXT_STAGE2_PROMPT") }
+              {
+                modelDebug: {
+                  pipeline: currentRefStage1Provider === "gpt_image"
+                    ? "flux_klein_single_stage_with_gpt_stage1_fusion"
+                    : "flux_klein_single_stage",
+                  stage1Provider: currentRefStage1Provider || undefined,
+                  stage1Model: currentRefStage1Provider === "gpt_image"
+                    ? GENERATION_CONFIG.CHATGPT_MODEL
+                    : undefined,
+                  stage2Model: MODEL_ID_FLUX_KLEIN_STAGE2,
+                  stage2Backend: "flux_klein",
+                  stage2PromptSource: currentRefStage1Provider === "gpt_image"
+                    ? "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT + CHATGPT_STAGE1_PROMPT_TEMPLATE"
+                    : "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT",
+                  maskPipeline: currentRefStage1Provider === "gpt_image"
+                    ? "gpt_stage1_fusion->stage1_feature_only_face_blot"
+                    : "stage1_feature_only_face_blot",
+                  generatedAt: new Date().toISOString(),
+                }
+              }
             ),
             status: "completed",
           });
@@ -11334,8 +13127,8 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
             refreshingReferences: remainingRefs <= 2, // Tell client new refs are being fetched
           });
         } else {
-          // Kontext generation failed - try next reference
-          console.log(`⚠️ [Generate More] Kontext generation failed with reference ${currentRefIndex + 1}, trying next...`);
+          // FLUX Klein generation failed - try next reference
+          console.log(`⚠️ [Generate More] FLUX Klein generation failed with reference ${currentRefIndex + 1}, trying next...`);
           retryCount++;
           
           // Find next valid reference
@@ -11357,21 +13150,77 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
               continue;
             }
             
-            console.log(`   🎭 Creating hair mask...`);
-            const hairOnlyResult = await createHairOnlyImage(refBase64, 30, true);
-            
-            if (!hairOnlyResult.image || !hairOnlyResult.validation?.valid) {
-              console.log(`   ❌ Invalid mask - skipping`);
+            // Build next reference mask using the same original-generation mask pipeline.
+            debugRefIndexCounter++;
+            generationDebugIdx = debugRefIndexCounter;
+            const debugIdx = generationDebugIdx;
+
+            try {
+              const originalRefBuffer = Buffer.from(
+                refBase64.replace(/^data:image\/\w+;base64,/, ''),
+                'base64'
+              );
+              await fsPromises.writeFile(`/tmp/debug_reference_full_${debugIdx}.jpg`, originalRefBuffer);
+              await fsPromises.writeFile(`/tmp/debug_gpt_ref_input_${debugIdx}.jpg`, originalRefBuffer);
+            } catch (saveErr) {
+              console.warn(`   ⚠️ Could not save retry reference debug image`, saveErr);
+            }
+
+            let retryStage1Gpt: string | null = null;
+            try {
+              const retryStage1GptStartMs = Date.now();
+              retryStage1Gpt = await generateHairstyleWithChatGPT(
+                refBase64,
+                KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT,
+                {
+                  promptTemplate: "{hairstyle}",
+                  imageSize: stage1SizeForGenerateMore,
+                }
+              );
+              const retryStage1GptElapsedMs = Date.now() - retryStage1GptStartMs;
+              console.log(`   ⏱️ Retry Stage 1 GPT generation time: ${(retryStage1GptElapsedMs / 1000).toFixed(2)}s`);
+              if (retryStage1Gpt && !retryStage1Gpt.startsWith("data:")) {
+                retryStage1Gpt = await fetchImageAsBase64(retryStage1Gpt);
+              }
+              if (retryStage1Gpt && userPhotoDimsForStage1) {
+                const resizedStage1 = await resizeImageToDimensions(
+                  retryStage1Gpt,
+                  userPhotoDimsForStage1.width,
+                  userPhotoDimsForStage1.height
+                );
+                if (resizedStage1) {
+                  retryStage1Gpt = resizedStage1;
+                }
+              }
+              if (retryStage1Gpt) {
+                await saveDebugImageFromAnySource(
+                  `/tmp/debug_stage1_gpt_fusion_result_${debugIdx}.jpg`,
+                  retryStage1Gpt
+                );
+                await saveDebugImageFromAnySource("/tmp/debug_stage1_gpt_fusion_result.jpg", retryStage1Gpt);
+              }
+            } catch (retryStage1GptErr) {
+              console.warn(`   ⚠️ Retry Stage 1 GPT comparison failed`, retryStage1GptErr);
+            }
+
+            const retryStage1Primary = retryStage1Gpt;
+            const retryStage1Provider: KontextStage1Provider | null = retryStage1Gpt
+              ? "gpt_image"
+              : null;
+            const retryMaskSource = retryStage1Primary || refBase64;
+            const retryReferenceMask = await createReferenceHairMaskForKleinSingleStage(retryMaskSource);
+            if (!retryReferenceMask) {
+              console.log(`   ❌ Invalid reference mask - skipping`);
               continue;
             }
-            
-            // Found next valid reference
-            console.log(`   ✅ VALID mask - will retry with this reference`);
+            await saveBase64DebugImage(`/tmp/debug_stage2_klein_reference_mask_${debugIdx}.jpg`, retryReferenceMask);
+            console.log(`   ✅ VALID mask (original pipeline) - will retry with this reference`);
+
             currentRefIndex = i;
-            currentHairOnlyImage = hairOnlyResult.image;
-            currentRefBase64 = refBase64; // Store full reference for Kontext pipeline
             currentRefUrl = ref.url;
             currentRefSource = ref.source;
+            currentRefStage1Provider = retryStage1Provider;
+            currentReferenceMask = retryReferenceMask;
             foundNext = true;
           }
           

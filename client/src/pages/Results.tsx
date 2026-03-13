@@ -28,6 +28,19 @@ const EXTENDED_SURVEY_INTERVAL = 2; // Extended survey after 2 generations, then
 const GENERATION_COUNT_KEY = "auren_generation_count";
 const LAST_QUICK_SURVEY_KEY = "auren_last_quick_survey";
 const LAST_EXTENDED_SURVEY_KEY = "auren_last_extended_survey";
+const BETA_SURVEY_POPUP_ENABLED = false;
+
+function maybeShowSurvey(
+  _setSurveyMode: (mode: "quick" | "extended" | "followup") => void,
+  _setShowSurvey: (show: boolean) => void,
+  _mode: "quick" | "extended" | "followup"
+) {
+  if (!BETA_SURVEY_POPUP_ENABLED) return;
+  setTimeout(() => {
+    _setSurveyMode(_mode);
+    _setShowSurvey(true);
+  }, 2000);
+}
 const GENERATE_MORE_TIP_KEY = "auren_generate_more_tip_shown";
 
 // Check for reset_survey URL param on load
@@ -371,26 +384,17 @@ export default function Results() {
       
       if (shouldShowExtended) {
         console.log("[SURVEY] Showing EXTENDED survey");
-        setTimeout(() => {
-          setSurveyMode("extended");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "extended");
         localStorage.setItem(LAST_EXTENDED_SURVEY_KEY, String(newCount));
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       } else if (shouldShowFollowup) {
         console.log("[SURVEY] Showing FOLLOWUP survey");
-        setTimeout(() => {
-          setSurveyMode("followup");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "followup");
         localStorage.setItem(LAST_EXTENDED_SURVEY_KEY, String(newCount));
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       } else if (newCount - lastQuickAt >= QUICK_SURVEY_INTERVAL) {
         console.log("[SURVEY] Showing QUICK survey");
-        setTimeout(() => {
-          setSurveyMode("quick");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "quick");
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       } else {
         console.log("[SURVEY] No survey triggered");
@@ -782,24 +786,15 @@ export default function Results() {
       const shouldShowFollowup = newCount >= 11 && newCount - lastExtendedAt >= 9;
       
       if (shouldShowExtended) {
-        setTimeout(() => {
-          setSurveyMode("extended");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "extended");
         localStorage.setItem(LAST_EXTENDED_SURVEY_KEY, String(newCount));
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       } else if (shouldShowFollowup) {
-        setTimeout(() => {
-          setSurveyMode("followup");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "followup");
         localStorage.setItem(LAST_EXTENDED_SURVEY_KEY, String(newCount));
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       } else if (newCount - lastQuickAt >= QUICK_SURVEY_INTERVAL) {
-        setTimeout(() => {
-          setSurveyMode("quick");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "quick");
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       }
     },
@@ -1077,23 +1072,13 @@ export default function Results() {
       
       // Invalidate session to persist dislike state
       queryClient.invalidateQueries({ queryKey: ["/api/session", sessionId] });
-      
-      toast({
-        title: data.isDisliked ? "Thanks for your feedback!" : "Feedback removed",
-        description: data.isDisliked ? "We'll use this to improve our AI." : "",
-        duration: 2000,
-      });
     },
     onError: (error: any, variables, context) => {
       // Rollback to previous state on error
       if (context?.previousState !== undefined) {
         setLocalDislikeStates(prev => ({ ...prev, [context.variantId]: context.previousState }));
       }
-      toast({
-        title: "Error",
-        description: "Failed to submit feedback. Please try again.",
-        variant: "destructive",
-      });
+      console.warn("Failed to submit dislike feedback", error);
     },
   });
 
@@ -1150,24 +1135,15 @@ export default function Results() {
       const shouldShowFollowup = newCount >= 11 && newCount - lastExtendedAt >= 9;
       
       if (shouldShowExtended) {
-        setTimeout(() => {
-          setSurveyMode("extended");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "extended");
         localStorage.setItem(LAST_EXTENDED_SURVEY_KEY, String(newCount));
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       } else if (shouldShowFollowup) {
-        setTimeout(() => {
-          setSurveyMode("followup");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "followup");
         localStorage.setItem(LAST_EXTENDED_SURVEY_KEY, String(newCount));
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       } else if (newCount - lastQuickAt >= QUICK_SURVEY_INTERVAL) {
-        setTimeout(() => {
-          setSurveyMode("quick");
-          setShowSurvey(true);
-        }, 2000);
+        maybeShowSurvey(setSurveyMode, setShowSurvey, "quick");
         localStorage.setItem(LAST_QUICK_SURVEY_KEY, String(newCount));
       }
       
@@ -2245,7 +2221,7 @@ export default function Results() {
       
       {/* Beta Survey Popup - shows every 5 generations */}
       <BetaSurveyPopup 
-        isOpen={showSurvey} 
+        isOpen={BETA_SURVEY_POPUP_ENABLED && showSurvey} 
         onClose={() => setShowSurvey(false)}
         mode={surveyMode}
       />

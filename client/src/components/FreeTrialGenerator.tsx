@@ -629,7 +629,7 @@ export default function FreeTrialGenerator({ mobileFullscreen = false, onHelpCli
                               : mobileFullscreen 
                                 ? "text-muted-foreground" 
                                 : "text-white/60"
-                          }`}>Let AI find your perfect look</p>
+                          }`}>Let us find your right look</p>
                         </div>
                         {hairstylePrompt === AI_MATCH_PROMPT && (
                           <div className="w-5 h-5 min-[375px]:w-6 min-[375px]:h-6 rounded-full bg-white flex items-center justify-center ml-auto">

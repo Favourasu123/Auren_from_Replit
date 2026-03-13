@@ -3333,6 +3333,80 @@ def create_hair_only_mask_raw(image: np.ndarray, return_masks: bool = False, fac
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
             iterations=1
         )
+        # Stage-2 hairline buffer support for strict masks:
+        # - hair_buffer_px < 0: shrink face-adjacent hairline by N pixels.
+        # - hair_buffer_px > 0: expand into face-adjacent hairline by N pixels.
+        if hair_buffer_px > 0:
+            hairline_expand_px = int(hair_buffer_px)
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (hairline_expand_px * 2 + 1, hairline_expand_px * 2 + 1)
+            )
+            dilated_hair = cv2.dilate(expanded_hair_mask.astype(np.uint8), kernel, iterations=1)
+
+            # Only add pixels on/near the face mask so this behaves like a true hairline buffer,
+            # not a global outward halo around all hair strands.
+            face_u8 = (facial_mask > 0).astype(np.uint8)
+            face_expand = cv2.dilate(
+                face_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+                iterations=1
+            )
+            add_near_face = (
+                (dilated_hair > 0)
+                & (expanded_hair_mask == 0)
+                & (face_expand > 0)
+            )
+
+            # Keep expansion in the head/face neighborhood to avoid shoulder/chest overgrowth.
+            if face_bbox is not None:
+                fx, fy, fw, fh = [int(v) for v in face_bbox]
+                x1 = max(0, fx - int(0.35 * fw))
+                x2 = min(original_w - 1, fx + fw + int(0.35 * fw))
+                y1 = max(0, fy - int(0.20 * fh))
+                y2 = min(original_h - 1, fy + int(1.05 * fh))
+                roi = np.zeros((original_h, original_w), dtype=np.uint8)
+                if x2 > x1 and y2 > y1:
+                    roi[y1:y2 + 1, x1:x2 + 1] = 1
+                    add_near_face = add_near_face & (roi > 0)
+
+            added_hairline_pixels = int(np.sum(add_near_face))
+            if added_hairline_pixels > 0:
+                expanded_hair_mask[add_near_face] = 1
+            log_debug(
+                f"[HAIR ONLY RAW] Applied positive hairline buffer (+{hairline_expand_px}px) "
+                f"added={added_hairline_pixels} px"
+            )
+
+        if hair_buffer_px < 0:
+            hairline_shrink_px = abs(int(hair_buffer_px))
+            inv_face = (facial_mask == 0).astype(np.uint8)
+            face_distance = cv2.distanceTransform(inv_face, cv2.DIST_L2, 5)
+            remove_near_face = (
+                (expanded_hair_mask > 0)
+                & (face_distance <= float(hairline_shrink_px))
+            )
+
+            # Constrain shrink to the head/face neighborhood so shoulder/chest hair remains intact.
+            if face_bbox is not None:
+                fx, fy, fw, fh = [int(v) for v in face_bbox]
+                x1 = max(0, fx - int(0.35 * fw))
+                x2 = min(original_w - 1, fx + fw + int(0.35 * fw))
+                y1 = max(0, fy - int(0.15 * fh))
+                y2 = min(original_h - 1, fy + int(0.95 * fh))
+                roi = np.zeros((original_h, original_w), dtype=np.uint8)
+                if x2 > x1 and y2 > y1:
+                    roi[y1:y2 + 1, x1:x2 + 1] = 1
+                    remove_near_face = remove_near_face & (roi > 0)
+
+            removed_hairline_pixels = int(np.sum(remove_near_face))
+            if removed_hairline_pixels > 0:
+                expanded_hair_mask[remove_near_face] = 0
+            log_debug(
+                f"[HAIR ONLY RAW] Applied negative hairline buffer ({hair_buffer_px}px) "
+                f"removed={removed_hairline_pixels} px"
+            )
+
         # Drop tiny disconnected regions (common for jewelry/noise misclassified as hair).
         min_component_area = max(96, int(round(original_h * original_w * 0.00035)))
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(expanded_hair_mask.astype(np.uint8), connectivity=8)
@@ -3399,7 +3473,16 @@ def create_kontext_result_mask_test(image: np.ndarray, return_masks: bool = Fals
                                     pass_scales: list = None, return_debug: bool = False,
                                     trimap_fg_erode_px: int = None, trimap_unknown_dilate_px: int = None,
                                     matting_backend: str = None, modnet_input_size: int = None,
-                                    edge_decontaminate: bool = None, edge_decontam_strength: float = None):
+                                    edge_decontaminate: bool = None, edge_decontam_strength: float = None,
+                                    include_face: bool = False,
+                                    face_buffer_px: int = 0,
+                                    gray_out_earrings: bool = False,
+                                    skin_border_px: int = 0,
+                                    include_top_neck_px: int = 0,
+                                    include_below_neck_px: int = 0,
+                                    gray_out_facial_features: bool = False,
+                                    use_hard_keep_mask: bool = False,
+                                    feature_only_blot: bool = False):
     """
     Kontext Stage-1 mask test with explicit trimap pipeline.
 
@@ -3420,6 +3503,162 @@ def create_kontext_result_mask_test(image: np.ndarray, return_masks: bool = Fals
     )
     face_bbox = faces[0]["bbox"] if faces else None
     face_crop_region = build_face_crop_region_from_bbox(face_bbox, image.shape) if face_bbox is not None else None
+
+    # Fast path for Stage 1 reference mask:
+    # only gray facial features when they are truly present and keep everything else unchanged.
+    if feature_only_blot:
+        ih, iw = image.shape[:2]
+        facial_feature_mask = np.zeros((ih, iw), dtype=np.uint8)
+        accepted_feature_groups = 0
+        accepted_feature_pixels = 0
+        if face_bbox is not None:
+            fx, fy, fw, fh = [int(v) for v in face_bbox]
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            session = get_session()
+            seg_map = segment_at_scale(image, 512, session)
+
+            # Keep detection constrained to the true face area.
+            roi = np.zeros((ih, iw), dtype=np.uint8)
+            rx1 = max(0, fx - int(0.10 * fw))
+            ry1 = max(0, fy - int(0.12 * fh))
+            rx2 = min(iw - 1, fx + int(1.10 * fw))
+            ry2 = min(ih - 1, fy + int(1.20 * fh))
+            if rx2 > rx1 and ry2 > ry1:
+                roi[ry1:ry2 + 1, rx1:rx2 + 1] = 1
+
+            def _window_mask(x1r: float, y1r: float, x2r: float, y2r: float) -> np.ndarray:
+                mask = np.zeros((ih, iw), dtype=np.uint8)
+                x1 = max(0, min(iw - 1, int(fx + x1r * fw)))
+                y1 = max(0, min(ih - 1, int(fy + y1r * fh)))
+                x2 = max(0, min(iw - 1, int(fx + x2r * fw)))
+                y2 = max(0, min(ih - 1, int(fy + y2r * fh)))
+                if x2 > x1 and y2 > y1:
+                    mask[y1:y2 + 1, x1:x2 + 1] = 1
+                return mask
+
+            def _clean_mask(mask: np.ndarray, min_area: int) -> np.ndarray:
+                cleaned = cv2.morphologyEx(
+                    mask.astype(np.uint8),
+                    cv2.MORPH_OPEN,
+                    cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                    iterations=1
+                )
+                if not np.any(cleaned):
+                    return cleaned
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+                keep = np.zeros_like(cleaned, dtype=np.uint8)
+                for label in range(1, num_labels):
+                    area = int(stats[label, cv2.CC_STAT_AREA])
+                    if area >= int(min_area):
+                        keep[labels == label] = 1
+                return keep
+
+            def _has_texture(mask: np.ndarray, min_std: float, min_contrast: float, min_edge_ratio: float) -> bool:
+                ys, xs = np.where(mask > 0)
+                if len(xs) == 0:
+                    return False
+                values = gray[ys, xs].astype(np.float32)
+                std_val = float(np.std(values))
+                p10 = float(np.percentile(values, 10))
+                p90 = float(np.percentile(values, 90))
+                contrast = p90 - p10
+                x1 = max(0, int(np.min(xs)) - 2)
+                y1 = max(0, int(np.min(ys)) - 2)
+                x2 = min(iw - 1, int(np.max(xs)) + 2)
+                y2 = min(ih - 1, int(np.max(ys)) + 2)
+                roi_gray = gray[y1:y2 + 1, x1:x2 + 1]
+                roi_mask = mask[y1:y2 + 1, x1:x2 + 1]
+                if roi_gray.size == 0 or not np.any(roi_mask):
+                    return False
+                edges = cv2.Canny(roi_gray, 45, 120)
+                edge_ratio = float(np.mean(edges[roi_mask > 0] > 0))
+                return (
+                    std_val >= float(min_std)
+                    and contrast >= float(min_contrast)
+                    and edge_ratio >= float(min_edge_ratio)
+                )
+
+            feature_defs = [
+                (
+                    "brows",
+                    ((seg_map == LEFT_EYEBROW_ID) | (seg_map == RIGHT_EYEBROW_ID)).astype(np.uint8),
+                    _window_mask(0.12, 0.16, 0.88, 0.46),
+                    35, 7.0, 12.0, 0.015
+                ),
+                (
+                    "eyes",
+                    ((seg_map == LEFT_EYE_ID) | (seg_map == RIGHT_EYE_ID)).astype(np.uint8),
+                    _window_mask(0.10, 0.26, 0.90, 0.62),
+                    30, 8.0, 14.0, 0.020
+                ),
+                (
+                    "nose",
+                    (seg_map == NOSE_ID).astype(np.uint8),
+                    _window_mask(0.28, 0.36, 0.72, 0.78),
+                    70, 7.0, 10.0, 0.012
+                ),
+                (
+                    "mouth",
+                    ((seg_map == MOUTH_ID) | (seg_map == UPPER_LIP_ID) | (seg_map == LOWER_LIP_ID)).astype(np.uint8),
+                    _window_mask(0.20, 0.56, 0.80, 0.96),
+                    45, 7.0, 11.0, 0.014
+                ),
+            ]
+
+            candidate_mask = np.zeros((ih, iw), dtype=np.uint8)
+            for _, raw_mask, region_mask, min_area, min_std, min_contrast, min_edge_ratio in feature_defs:
+                masked = ((raw_mask > 0) & (roi > 0) & (region_mask > 0)).astype(np.uint8)
+                cleaned = _clean_mask(masked, min_area=min_area)
+                if not np.any(cleaned):
+                    continue
+                if not _has_texture(cleaned, min_std=min_std, min_contrast=min_contrast, min_edge_ratio=min_edge_ratio):
+                    continue
+                candidate_mask = np.logical_or(candidate_mask > 0, cleaned > 0).astype(np.uint8)
+                accepted_feature_groups += 1
+
+            accepted_feature_pixels = int(np.sum(candidate_mask > 0))
+            # Guard against isolated false positives on mannequin/blank faces.
+            # Require either multiple accepted feature groups, or one substantial region.
+            if accepted_feature_groups >= 2 or accepted_feature_pixels >= 240:
+                facial_feature_mask = candidate_mask
+
+        output = image.copy()
+        feature_pixels = int(np.sum(facial_feature_mask > 0))
+        if feature_pixels > 0:
+            output[facial_feature_mask > 0] = GRAY_BG
+
+        # Keep validation/debug outputs lightweight for this fast mode.
+        hair_mask = np.zeros((ih, iw), dtype=np.uint8)
+        facial_mask = facial_feature_mask.astype(np.uint8)
+        trimap = np.full((ih, iw), 255, dtype=np.uint8)
+        alpha_u8 = np.full((ih, iw), 255, dtype=np.uint8)
+
+        log_debug(
+            f"[KONTEXT RESULT MASK TEST] feature_only_blot=True detector={detector} "
+            f"faces={len(faces)} feature_groups={accepted_feature_groups} "
+            f"candidate_pixels={accepted_feature_pixels} feature_pixels={feature_pixels}"
+        )
+
+        if return_debug:
+            debug_meta = {
+                "mattingBackendRequested": "feature_only_blot",
+                "mattingBackendUsed": "feature_only_blot",
+                "edgeDecontaminate": False,
+                "edgeDecontamStrength": 0.0,
+                "faceBufferPx": 0,
+                "skinBorderPx": 0,
+                "includeTopNeckPx": 0,
+                "includeFullNeck": False,
+                "includeBelowNeckPx": 0,
+                "grayOutFacialFeatures": True,
+                "useHardKeepMask": False,
+                "featureOnlyBlot": True,
+            }
+            return output, hair_mask, facial_mask, trimap, alpha_u8, debug_meta
+
+        if return_masks:
+            return output, hair_mask, facial_mask
+        return output
     _, hair_mask, facial_mask = create_hair_only_mask_raw(
         image,
         return_masks=True,
@@ -3430,14 +3669,197 @@ def create_kontext_result_mask_test(image: np.ndarray, return_masks: bool = Fals
         face_bbox_override=face_bbox
     )
 
-    keep_mask = hair_mask.astype(np.uint8)
+    # Build segmentation map once for beard/neck controls and feature masking.
+    # Goal:
+    # - Keep all true scalp hair, including strands over shoulders/chest
+    # - Exclude beard region explicitly
+    session = get_session()
+    seg_map = segment_at_scale(image, 512, session)
+    _, resolved_neck_class_id = resolve_dynamic_hair_neck_class_ids(seg_map, face_bbox)
+    neck_mask = (
+        (seg_map == resolved_neck_class_id)
+        | (seg_map == NECK_ID)
+        | (seg_map == 15)
+    ).astype(np.uint8)
+    top_neck_keep_mask = np.zeros_like(neck_mask, dtype=np.uint8)
+    requested_top_neck_px = int(include_top_neck_px if include_top_neck_px is not None else 0)
+    include_full_neck = requested_top_neck_px < 0
+    effective_top_neck_px = max(0, requested_top_neck_px)
+    if include_full_neck and np.any(neck_mask):
+        top_neck_keep_mask = neck_mask.copy()
+    elif effective_top_neck_px > 0 and np.any(neck_mask):
+        if face_bbox is not None:
+            fx, fy, fw, fh = [int(v) for v in face_bbox]
+            chin_y = max(0, min(seg_map.shape[0] - 1, fy + fh))
+            neck_y2 = min(seg_map.shape[0] - 1, chin_y + effective_top_neck_px)
+            if neck_y2 >= chin_y:
+                top_neck_keep_mask[chin_y:neck_y2 + 1, :] = neck_mask[chin_y:neck_y2 + 1, :]
+        else:
+            neck_rows = np.where(neck_mask.any(axis=1))[0]
+            if len(neck_rows) > 0:
+                neck_top = int(neck_rows[0])
+                neck_y2 = min(seg_map.shape[0] - 1, neck_top + effective_top_neck_px)
+                top_neck_keep_mask[neck_top:neck_y2 + 1, :] = neck_mask[neck_top:neck_y2 + 1, :]
+    requested_below_neck_px = int(include_below_neck_px if include_below_neck_px is not None else 0)
+    effective_below_neck_px = max(0, requested_below_neck_px)
+    below_neck_keep_mask = np.zeros_like(neck_mask, dtype=np.uint8)
+    if effective_below_neck_px > 0:
+        ih, iw = seg_map.shape[:2]
+        neck_rows = np.where(neck_mask.any(axis=1))[0]
+        if len(neck_rows) > 0:
+            neck_bottom = int(neck_rows[-1])
+        elif face_bbox is not None:
+            fx, fy, fw, fh = [int(v) for v in face_bbox]
+            neck_bottom = min(ih - 1, fy + fh + int(0.25 * fh))
+        else:
+            neck_bottom = int(ih * 0.60)
+        y1 = min(ih - 1, max(0, neck_bottom + 1))
+        y2 = min(ih - 1, y1 + effective_below_neck_px - 1)
+        if y2 >= y1:
+            # Use the foreground silhouette (non-gray-background pixels) in the
+            # below-neck band so extension follows shoulders/chest contours.
+            bg = np.array(GRAY_BG, dtype=np.int16).reshape(1, 1, 3)
+            delta = np.abs(image.astype(np.int16) - bg)
+            foreground_silhouette = (np.max(delta, axis=2) > 14).astype(np.uint8)
+            band_mask = np.zeros_like(neck_mask, dtype=np.uint8)
+
+            # Gate the band to a shoulder-width column span anchored at the neck.
+            # This avoids full-width horizontal bars while still capturing shoulders.
+            col_seed = np.any(neck_mask > 0, axis=0).astype(np.uint8)
+            if not np.any(col_seed) and face_bbox is not None:
+                fx, fy, fw, fh = [int(v) for v in face_bbox]
+                x1 = max(0, fx + int(0.25 * fw))
+                x2 = min(iw - 1, fx + int(0.75 * fw))
+                if x2 >= x1:
+                    col_seed[x1:x2 + 1] = 1
+            if np.any(col_seed):
+                shoulder_pad = (
+                    max(120, int(0.60 * face_bbox[2])) if face_bbox is not None else 180
+                )
+                col_kernel = cv2.getStructuringElement(
+                    cv2.MORPH_RECT,
+                    (shoulder_pad * 2 + 1, 1)
+                )
+                col_gate = cv2.dilate(col_seed.reshape(1, iw), col_kernel, iterations=1).reshape(iw)
+            else:
+                col_gate = np.zeros((iw,), dtype=np.uint8)
+
+            # Extend down per column from the local neck end (or fallback neck bottom),
+            # clipped to foreground silhouette, so it follows the shoulder contour.
+            active_cols = np.where(col_gate > 0)[0]
+            for x in active_cols:
+                col_neck_rows = np.where(neck_mask[:, x] > 0)[0]
+                if len(col_neck_rows) > 0:
+                    col_start = int(col_neck_rows[-1] + 1)
+                else:
+                    # No neck in this column: start from the first visible
+                    # foreground pixel in the below-neck band.
+                    col_band_fg = np.where(foreground_silhouette[y1:y2 + 1, x] > 0)[0]
+                    if len(col_band_fg) == 0:
+                        continue
+                    col_start = int(y1 + col_band_fg[0])
+                col_start = min(max(col_start, y1), ih - 1)
+                col_end = min(ih - 1, col_start + effective_below_neck_px - 1)
+                if col_end < col_start:
+                    continue
+                col_fg = foreground_silhouette[col_start:col_end + 1, x]
+                band_mask[col_start:col_end + 1, x] = col_fg
+
+            # Drop tiny speckles to avoid isolated artifacts.
+            if np.any(band_mask):
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    band_mask.astype(np.uint8), connectivity=8
+                )
+                cleaned_band = np.zeros_like(band_mask, dtype=np.uint8)
+                min_area = max(64, int(ih * iw * 0.00015))
+                for label in range(1, num_labels):
+                    area = int(stats[label, cv2.CC_STAT_AREA])
+                    if area >= min_area:
+                        cleaned_band[labels == label] = 1
+                if np.any(cleaned_band):
+                    band_mask = cleaned_band
+            below_neck_keep_mask = band_mask
+
+    # Use facial exclusion mask without neck so lower/shoulder hair is not clipped.
+    facial_exclusion_mask = facial_mask.astype(np.uint8).copy()
+    facial_exclusion_mask[neck_mask > 0] = 0
+
+    # Explicit beard suppression region (lower-center face/chin area only).
+    beard_exclusion_mask = np.zeros_like(facial_exclusion_mask, dtype=np.uint8)
+    if face_bbox is not None:
+        fx, fy, fw, fh = [int(v) for v in face_bbox]
+        ih, iw = seg_map.shape[:2]
+        bx1 = max(0, fx + int(0.18 * fw))
+        bx2 = min(iw - 1, fx + int(0.82 * fw))
+        by1 = max(0, fy + int(0.55 * fh))
+        by2 = min(ih - 1, fy + int(1.20 * fh))
+        if bx2 > bx1 and by2 > by1:
+            beard_exclusion_mask[by1:by2 + 1, bx1:bx2 + 1] = 1
+
+    effective_skin_border = max(0, int(skin_border_px if skin_border_px is not None else 0))
+    hair_core_mask = hair_mask.astype(np.uint8)
+    # Remove hair pixels in beard region while preserving all other hair.
+    if np.any(beard_exclusion_mask):
+        hair_core_mask[beard_exclusion_mask > 0] = 0
+    hair_keep_mask = hair_core_mask.copy()
+    keep_mask = hair_core_mask.copy()
+    face_edge_expand_mask = np.zeros_like(keep_mask, dtype=np.uint8)
+    face_edge_expand_pixels = 0
     if effective_buffer > 0:
         keep_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (effective_buffer * 2 + 1, effective_buffer * 2 + 1)
         )
-        keep_mask = cv2.dilate(keep_mask, keep_kernel, iterations=1)
-    keep_mask[facial_mask > 0] = 0
+        hair_keep_mask = cv2.dilate(hair_keep_mask, keep_kernel, iterations=1)
+    keep_mask = hair_keep_mask.copy()
+    if include_face:
+        face_keep = facial_exclusion_mask.astype(np.uint8)
+        effective_face_buffer = max(0, int(face_buffer_px if face_buffer_px is not None else 0))
+        if effective_face_buffer > 0:
+            face_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (effective_face_buffer * 2 + 1, effective_face_buffer * 2 + 1)
+            )
+            face_keep = cv2.dilate(face_keep, face_kernel, iterations=1)
+        if np.any(top_neck_keep_mask):
+            face_keep = np.logical_or(face_keep > 0, top_neck_keep_mask > 0).astype(np.uint8)
+        if np.any(below_neck_keep_mask):
+            face_keep = np.logical_or(face_keep > 0, below_neck_keep_mask > 0).astype(np.uint8)
+        keep_mask = np.logical_or(keep_mask > 0, face_keep > 0).astype(np.uint8)
+    else:
+        keep_mask[facial_exclusion_mask > 0] = 0
+        if np.any(top_neck_keep_mask):
+            keep_mask = np.logical_or(keep_mask > 0, top_neck_keep_mask > 0).astype(np.uint8)
+        if np.any(below_neck_keep_mask):
+            keep_mask = np.logical_or(keep_mask > 0, below_neck_keep_mask > 0).astype(np.uint8)
+        if effective_skin_border > 0:
+            base_keep = keep_mask.copy()
+            # Suppress tiny isolated speckles before expansion so face-edge growth only
+            # follows the true hair silhouette.
+            components = cv2.connectedComponentsWithStats(base_keep.astype(np.uint8), connectivity=8)
+            num_labels, labels, stats = components[0], components[1], components[2]
+            if num_labels > 1:
+                min_component_area = max(64, int(image.shape[0] * image.shape[1] * 0.0005))
+                filtered_keep = np.zeros_like(base_keep, dtype=np.uint8)
+                for label in range(1, num_labels):
+                    area = int(stats[label, cv2.CC_STAT_AREA])
+                    if area >= min_component_area:
+                        filtered_keep[labels == label] = 1
+                if np.any(filtered_keep):
+                    base_keep = filtered_keep
+            expand_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (effective_skin_border * 2 + 1, effective_skin_border * 2 + 1)
+            )
+            expanded_keep = cv2.dilate(base_keep, expand_kernel, iterations=1)
+            face_edge_expand_mask = (
+                (expanded_keep > 0)
+                & (base_keep == 0)
+                & (facial_exclusion_mask > 0)
+            ).astype(np.uint8)
+            face_edge_expand_pixels = int(np.sum(face_edge_expand_mask > 0))
+            if face_edge_expand_pixels > 0:
+                keep_mask = np.logical_or(keep_mask > 0, face_edge_expand_mask > 0).astype(np.uint8)
 
     if trimap_fg_erode_px is None:
         trimap_fg_erode_px = max(1, min(12, int(round(max(6, effective_buffer) * 0.20))))
@@ -3449,70 +3871,170 @@ def create_kontext_result_mask_test(image: np.ndarray, return_masks: bool = Fals
     else:
         trimap_unknown_dilate_px = max(0, int(trimap_unknown_dilate_px))
 
-    trimap, _, unknown_band = build_trimap_from_mask(
-        keep_mask,
-        exclusion_mask=facial_mask,
-        fg_erode_px=trimap_fg_erode_px,
-        unknown_dilate_px=trimap_unknown_dilate_px
-    )
-
+    if include_face:
+        exclusion_mask = None
+    else:
+        exclusion_mask = facial_exclusion_mask.copy()
+        if np.any(top_neck_keep_mask):
+            exclusion_mask[top_neck_keep_mask > 0] = 0
+        if np.any(below_neck_keep_mask):
+            exclusion_mask[below_neck_keep_mask > 0] = 0
+        if face_edge_expand_pixels > 0:
+            exclusion_mask[face_edge_expand_mask > 0] = 0
     requested_backend = (matting_backend or KONTEXT_MATTING_BACKEND or "trimap").strip().lower()
     effective_backend = resolve_runtime_matting_backend(requested_backend)
+    effective_use_hard_keep_mask = bool(use_hard_keep_mask)
 
-    alpha = None
-    if effective_backend == "modnet":
-        alpha = estimate_alpha_with_modnet(
-            image,
-            trimap=trimap,
-            keep_mask=keep_mask,
-            exclusion_mask=facial_mask,
-            target_size=modnet_input_size
+    if effective_use_hard_keep_mask:
+        keep_mask_u8 = (keep_mask > 0).astype(np.uint8)
+        # Fill pinholes to avoid gray patches inside hair regions.
+        keep_mask_u8 = cv2.morphologyEx(
+            keep_mask_u8,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+            iterations=1
         )
+        trimap = (keep_mask_u8 * 255).astype(np.uint8)
+        unknown_band = np.zeros_like(keep_mask_u8, dtype=np.uint8)
+        alpha = keep_mask_u8.astype(np.float32)
+        output = np.full_like(image, GRAY_BG)
+        output[keep_mask_u8 > 0] = image[keep_mask_u8 > 0]
+        effective_backend = "hard_keep_mask"
+        decontam_enabled = False
+        decontam_strength = 0.0
+    else:
+        trimap, _, unknown_band = build_trimap_from_mask(
+            keep_mask,
+            exclusion_mask=exclusion_mask,
+            fg_erode_px=trimap_fg_erode_px,
+            unknown_dilate_px=trimap_unknown_dilate_px
+        )
+
+        alpha = None
+        if effective_backend == "modnet":
+            alpha = estimate_alpha_with_modnet(
+                image,
+                trimap=trimap,
+                keep_mask=keep_mask,
+                exclusion_mask=facial_exclusion_mask,
+                target_size=modnet_input_size
+            )
+            if alpha is None:
+                effective_backend = "trimap"
+                log_info("[MATTING] MODNet inference unavailable; using trimap alpha")
+
         if alpha is None:
-            effective_backend = "trimap"
-            log_info("[MATTING] MODNet inference unavailable; using trimap alpha")
+            alpha = estimate_alpha_from_trimap(
+                image,
+                trimap,
+                guided_radius=max(6, trimap_unknown_dilate_px),
+                guided_eps=0.008
+            )
 
-    if alpha is None:
-        alpha = estimate_alpha_from_trimap(
-            image,
-            trimap,
-            guided_radius=max(6, trimap_unknown_dilate_px),
-            guided_eps=0.008
+        decontam_enabled = (
+            KONTEXT_EDGE_DECONTAMINATE
+            if edge_decontaminate is None
+            else bool(edge_decontaminate)
         )
-
-    decontam_enabled = (
-        KONTEXT_EDGE_DECONTAMINATE
-        if edge_decontaminate is None
-        else bool(edge_decontaminate)
-    )
-    decontam_strength = (
-        KONTEXT_EDGE_DECONTAM_STRENGTH
-        if edge_decontam_strength is None
-        else float(edge_decontam_strength)
-    )
-    decontam_strength = float(np.clip(decontam_strength, 0.0, 1.0))
-
-    image_for_comp = image
-    if decontam_enabled and decontam_strength > 0.0:
-        image_for_comp = decontaminate_edge_colors(
-            image,
-            alpha,
-            unknown_band=unknown_band,
-            strength=decontam_strength
+        decontam_strength = (
+            KONTEXT_EDGE_DECONTAM_STRENGTH
+            if edge_decontam_strength is None
+            else float(edge_decontam_strength)
         )
+        decontam_strength = float(np.clip(decontam_strength, 0.0, 1.0))
 
-    output = composite_with_alpha(image_for_comp, alpha, background=GRAY_BG)
+        image_for_comp = image
+        if decontam_enabled and decontam_strength > 0.0:
+            image_for_comp = decontaminate_edge_colors(
+                image,
+                alpha,
+                unknown_band=unknown_band,
+                strength=decontam_strength
+            )
 
-    # Keep eyes neutral for consistency with other mask modes.
-    session = get_session()
-    seg_map = segment_at_scale(image, 512, session)
-    eye_mask = ((seg_map == LEFT_EYE_ID) | (seg_map == RIGHT_EYE_ID)).astype(np.uint8)
-    output[eye_mask > 0] = GRAY_BG
+        output = composite_with_alpha(image_for_comp, alpha, background=GRAY_BG)
+
+    if gray_out_facial_features:
+        facial_feature_mask = (
+            (seg_map == LEFT_EYEBROW_ID)
+            | (seg_map == RIGHT_EYEBROW_ID)
+            | (seg_map == LEFT_EYE_ID)
+            | (seg_map == RIGHT_EYE_ID)
+            | (seg_map == NOSE_ID)
+            | (seg_map == UPPER_LIP_ID)
+            | (seg_map == LOWER_LIP_ID)
+            | (seg_map == MOUTH_ID)
+        ).astype(np.uint8)
+        if face_bbox is not None:
+            fx, fy, fw, fh = [int(v) for v in face_bbox]
+            ih, iw = seg_map.shape[:2]
+            rx1 = max(0, fx - int(0.08 * fw))
+            rx2 = min(iw - 1, fx + int(1.08 * fw))
+            ry1 = max(0, fy - int(0.10 * fh))
+            ry2 = min(ih - 1, fy + int(1.18 * fh))
+            roi = np.zeros_like(facial_feature_mask, dtype=np.uint8)
+            if rx2 > rx1 and ry2 > ry1:
+                roi[ry1:ry2 + 1, rx1:rx2 + 1] = 1
+                facial_feature_mask = (facial_feature_mask & roi).astype(np.uint8)
+        # Never gray pixels in the current hair keep region (core + buffer).
+        facial_feature_mask[hair_keep_mask > 0] = 0
+        # Keep feature suppression localized and smooth out isolated noise.
+        facial_feature_mask = cv2.morphologyEx(
+            facial_feature_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1
+        )
+        feature_pixels = int(np.sum(facial_feature_mask > 0))
+        if feature_pixels > 0:
+            output[facial_feature_mask > 0] = GRAY_BG
+        log_debug(f"[KONTEXT RESULT MASK TEST] gray_out_facial_features={bool(gray_out_facial_features)} pixels={feature_pixels}")
+
+    # In hair-only mode, keep eyes neutral for consistency with other mask modes.
+    if not include_face:
+        eye_mask = ((seg_map == LEFT_EYE_ID) | (seg_map == RIGHT_EYE_ID)).astype(np.uint8)
+        output[eye_mask > 0] = GRAY_BG
+
+    if gray_out_earrings:
+        earring_mask = (seg_map == EARRING_ID).astype(np.uint8)
+        ear_mask = ((seg_map == LEFT_EAR_ID) | (seg_map == RIGHT_EAR_ID)).astype(np.uint8)
+        ear_roi = cv2.dilate(
+            ear_mask.astype(np.uint8),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21)),
+            iterations=1
+        )
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        bright_metal = (
+            (gray >= 145)
+            & (hsv[:, :, 1] <= 100)
+            & (ear_roi > 0)
+        ).astype(np.uint8)
+        if np.any(bright_metal):
+            bright_metal = cv2.morphologyEx(
+                bright_metal,
+                cv2.MORPH_OPEN,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+                iterations=1
+            )
+            earring_mask = ((earring_mask > 0) | (bright_metal > 0)).astype(np.uint8)
+
+        earring_pixels = int(np.sum(earring_mask > 0))
+        if earring_pixels > 0:
+            output[earring_mask > 0] = GRAY_BG
+        log_debug(f"[KONTEXT RESULT MASK TEST] gray_out_earrings={bool(gray_out_earrings)} pixels={earring_pixels}")
 
     log_debug(
         f"[KONTEXT RESULT MASK TEST] detector={detector} faces={len(faces)} "
         f"face_bbox={face_bbox} crop_region={face_crop_region} buffer={effective_buffer} "
-        f"matting={effective_backend} "
+        f"matting={effective_backend} include_face={bool(include_face)} face_buffer={int(face_buffer_px or 0)} "
+        f"skin_border={effective_skin_border} face_edge_expand_pixels={face_edge_expand_pixels} "
+        f"top_neck_keep_px={effective_top_neck_px} include_full_neck={bool(include_full_neck)} top_neck_pixels={int(np.sum(top_neck_keep_mask > 0))} "
+        f"below_neck_keep_px={effective_below_neck_px} below_neck_pixels={int(np.sum(below_neck_keep_mask > 0))} "
+        f"gray_out_facial_features={bool(gray_out_facial_features)} "
+        f"use_hard_keep_mask={bool(effective_use_hard_keep_mask)} "
+        f"feature_only_blot={bool(feature_only_blot)} "
+        f"beard_excluded_pixels={int(np.sum(beard_exclusion_mask > 0))} "
         f"trimap(erode={trimap_fg_erode_px}, dilate={trimap_unknown_dilate_px}) "
         f"unknown_pixels={int(np.sum(unknown_band))} "
         f"decontam={'on' if decontam_enabled else 'off'} strength={decontam_strength:.2f}"
@@ -3525,6 +4047,14 @@ def create_kontext_result_mask_test(image: np.ndarray, return_masks: bool = Fals
             "mattingBackendUsed": effective_backend,
             "edgeDecontaminate": bool(decontam_enabled),
             "edgeDecontamStrength": float(decontam_strength),
+            "faceBufferPx": int(face_buffer_px or 0),
+            "skinBorderPx": int(effective_skin_border),
+            "includeTopNeckPx": int(requested_top_neck_px),
+            "includeFullNeck": bool(include_full_neck),
+            "includeBelowNeckPx": int(requested_below_neck_px),
+            "grayOutFacialFeatures": bool(gray_out_facial_features),
+            "useHardKeepMask": bool(effective_use_hard_keep_mask),
+            "featureOnlyBlot": bool(feature_only_blot),
         }
         return output, hair_mask, facial_mask, trimap, alpha_u8, debug_meta
 
@@ -3757,6 +4287,8 @@ def create_user_face_only_mask_from_kontext_pipeline(
     return_masks: bool = False,
     include_neck: bool = False,
     include_hair: bool = True,
+    face_buffer_px: int = 0,
+    hairline_visible_px: int = 0,
     detector_type: str = None,
     detector_threshold: float = None,
     pass_scales: list = None,
@@ -4030,15 +4562,34 @@ def create_user_face_only_mask_from_kontext_pipeline(
     face_keep = cleanup_mask(face_keep)
     face_keep[protected_keep] = 1
 
+    effective_face_buffer = max(0, int(face_buffer_px if face_buffer_px is not None else 0))
+    if effective_face_buffer > 0:
+        face_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (effective_face_buffer * 2 + 1, effective_face_buffer * 2 + 1)
+        )
+        face_keep = cv2.dilate(face_keep.astype(np.uint8), face_kernel, iterations=1)
+        face_keep = cleanup_mask(face_keep)
+        face_keep[protected_keep] = 1
+
     # Visible user-mask region can include hair + face/ears/neck (default),
     # or face/ears/neck only when include_hair=False.
     # Keep a separate face-only mask for validation metrics.
+    hairline_keep = np.zeros_like(face_keep, dtype=np.uint8)
     if include_hair:
         visible_keep = (face_keep > 0) | combined_hair_exclusion
     else:
         visible_keep = (face_keep > 0)
         # Hard exclude all detected hair from the final keep mask in face+neck mode.
         visible_keep[combined_hair_exclusion] = 0
+        effective_hairline_visible = max(0, int(hairline_visible_px if hairline_visible_px is not None else 0))
+        if effective_hairline_visible > 0 and np.any(combined_hair_exclusion):
+            hairline_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (effective_hairline_visible * 2 + 1, effective_hairline_visible * 2 + 1)
+            )
+            expanded_face = cv2.dilate(face_keep.astype(np.uint8), hairline_kernel, iterations=1)
+            hairline_keep = ((expanded_face > 0) & combined_hair_exclusion).astype(np.uint8)
         # Re-assert critical face details (brows/eyes/earrings) even if overlap noise.
         visible_keep[protected_critical] = 1
         # Re-assert ear support only where not marked as hair.
@@ -4058,6 +4609,8 @@ def create_user_face_only_mask_from_kontext_pipeline(
         visible_keep = ((visible_u8 | holes) > 0).astype(np.uint8)
         visible_keep = cleanup_mask(visible_keep)
         visible_keep[protected_critical] = 1
+    if not include_hair and np.any(hairline_keep):
+        visible_keep[hairline_keep > 0] = 1
 
     if trimap_fg_erode_px is None:
         trimap_fg_erode_px = 1
@@ -4732,7 +5285,7 @@ def create_hair_only_mask(image: np.ndarray, buffer_px: int = 25, sharpen: bool 
     raw_output, raw_hair_mask, raw_facial_mask = create_hair_only_mask_raw(
         image,
         return_masks=True,
-        hair_buffer_px=max(0, int(buffer_px)),
+        hair_buffer_px=int(buffer_px),
         sharpen=sharpen,
         blot_eyes=True,
         strict_hair_only=True
@@ -5519,6 +6072,15 @@ def main():
         elif mode == "kontext_result_mask_test":
             # Kontext Stage-1 mask test with configurable face detector comparison.
             buffer_px = int(input_data.get("bufferPx", 30))
+            include_face = parse_boolish(input_data.get("includeFace", False), default=False)
+            face_buffer_px = int(input_data.get("faceBufferPx", 10 if include_face else 0))
+            skin_border_px = int(input_data.get("skinBorderPx", 0))
+            include_top_neck_px = int(input_data.get("includeTopNeckPx", 0))
+            include_below_neck_px = int(input_data.get("includeBelowNeckPx", 0))
+            gray_out_facial_features = parse_boolish(input_data.get("grayOutFacialFeatures", False), default=False)
+            feature_only_blot = parse_boolish(input_data.get("featureOnlyBlot", False), default=False)
+            gray_out_earrings = parse_boolish(input_data.get("grayOutEarrings", False), default=False)
+            use_hard_keep_mask = parse_boolish(input_data.get("useHardKeepMask", False), default=False)
             detector_type = str(input_data.get("detectorType", KONTEXT_FACE_DETECTOR)).strip().lower()
             effective_detector_type = resolve_runtime_detector(detector_type)
             requested_matting_backend = str(
@@ -5609,7 +6171,16 @@ def main():
                 matting_backend=effective_matting_backend,
                 modnet_input_size=modnet_input_size,
                 edge_decontaminate=edge_decontaminate,
-                edge_decontam_strength=edge_decontam_strength
+                edge_decontam_strength=edge_decontam_strength,
+                include_face=include_face,
+                face_buffer_px=face_buffer_px,
+                gray_out_earrings=gray_out_earrings,
+                skin_border_px=skin_border_px,
+                include_top_neck_px=include_top_neck_px,
+                include_below_neck_px=include_below_neck_px,
+                gray_out_facial_features=gray_out_facial_features,
+                use_hard_keep_mask=use_hard_keep_mask,
+                feature_only_blot=feature_only_blot
             )
             if len(debug_result) >= 6:
                 kontext_mask, hair_mask, facial_mask, trimap, alpha_matte, debug_meta = debug_result
@@ -5620,6 +6191,13 @@ def main():
                     "mattingBackendUsed": effective_matting_backend,
                     "edgeDecontaminate": bool(edge_decontaminate),
                     "edgeDecontamStrength": float(edge_decontam_strength),
+                    "faceBufferPx": int(face_buffer_px),
+                    "skinBorderPx": int(skin_border_px),
+                    "includeTopNeckPx": int(include_top_neck_px),
+                    "includeBelowNeckPx": int(include_below_neck_px),
+                    "grayOutFacialFeatures": bool(gray_out_facial_features),
+                    "useHardKeepMask": bool(use_hard_keep_mask),
+                    "featureOnlyBlot": bool(feature_only_blot),
                 }
 
             validation = validate_hair_mask(hair_mask, facial_mask, image.shape)
@@ -5670,6 +6248,18 @@ def main():
                 "trimapParams": {
                     "fgErodePx": int(resolved_trimap_fg_erode_px),
                     "unknownDilatePx": int(resolved_trimap_unknown_dilate_px)
+                },
+                "maskControls": {
+                    "includeFace": bool(include_face),
+                    "faceBufferPx": int(face_buffer_px),
+                    "skinBorderPx": int(skin_border_px),
+                    "includeTopNeckPx": int(include_top_neck_px),
+                    "includeBelowNeckPx": int(include_below_neck_px),
+                    "includeFullNeck": bool(int(include_top_neck_px) < 0),
+                    "grayOutFacialFeatures": bool(gray_out_facial_features),
+                    "grayOutEarrings": bool(gray_out_earrings),
+                    "useHardKeepMask": bool(use_hard_keep_mask),
+                    "featureOnlyBlot": bool(feature_only_blot),
                 }
             }
         elif mode == "kontext_result_mask_test_v2":
@@ -5988,7 +6578,9 @@ def main():
                 image,
                 return_masks=True,
                 include_neck=include_neck,
-                include_hair=include_hair
+                include_hair=include_hair,
+                face_buffer_px=buffer_px,
+                hairline_visible_px=hairline_visible_px
             )
             
             # Run validation on the user mask
