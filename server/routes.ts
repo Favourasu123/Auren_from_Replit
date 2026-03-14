@@ -11026,7 +11026,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                 stage2Model: MODEL_ID_FLUX_KLEIN_STAGE2,
                 stage2Backend: "flux_klein",
                 stage2PromptSource: stage1PrimaryProvider === "gpt_image"
-                  ? "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT + CHATGPT_STAGE1_PROMPT_TEMPLATE"
+                  ? "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT + STAGE1_PROMPT_GPT"
                   : "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT",
                 maskPipeline: stage1PrimaryProvider === "gpt_image"
                   ? "gpt_stage1_fusion->stage1_feature_only_face_blot"
@@ -13129,7 +13129,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
                   stage2Model: MODEL_ID_FLUX_KLEIN_STAGE2,
                   stage2Backend: "flux_klein",
                   stage2PromptSource: currentRefStage1Provider === "gpt_image"
-                    ? "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT + CHATGPT_STAGE1_PROMPT_TEMPLATE"
+                    ? "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT + STAGE1_PROMPT_GPT"
                     : "KLEIN_SINGLE_STAGE_REFERENCE_PROMPT",
                   maskPipeline: currentRefStage1Provider === "gpt_image"
                     ? "gpt_stage1_fusion->stage1_feature_only_face_blot"

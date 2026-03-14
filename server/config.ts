@@ -86,7 +86,10 @@ export const GENERATION_CONFIG = {
   CHATGPT_IMAGE_SIZE: (process.env.CHATGPT_IMAGE_SIZE || "1024x1536") as "1024x1024" | "1024x1536" | "1536x1024",
   CHATGPT_IMAGE_QUALITY: (process.env.CHATGPT_IMAGE_QUALITY || "low") as "low" | "medium" | "high",
   CHATGPT_DESCRIBE_PROMPT_TEMPLATE: "Transform this person's hairstyle to: {hairstyle}. Keep the same person, same face, same features, same clothing, same background. Only change the hairstyle to match the description. Photorealistic, natural lighting, professional portrait quality.",
-  CHATGPT_STAGE1_PROMPT_TEMPLATE: envValue("CHATGPT_STAGE1_PROMPT_TEMPLATE") || DEFAULT_CHATGPT_STAGE1_PROMPT_TEMPLATE,
+  CHATGPT_STAGE1_PROMPT_TEMPLATE:
+    envValue("STAGE1_PROMPT_GPT") ||
+    envValue("CHATGPT_STAGE1_PROMPT_TEMPLATE") ||
+    DEFAULT_CHATGPT_STAGE1_PROMPT_TEMPLATE,
   
   // BFL FLUX 2 Pro prompt template (used by AI Polish and fallback features)
   TEXT_MODE_FRONT_PROMPT_TEMPLATE: "Apply image 1's exact face and head with the hair from image 2. Place them in the exact background in image 3. Preserve image 3's head shape and dimensions. Use the hairtype in image 2. Smooth natural photorealistic lighting",
