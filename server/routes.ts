@@ -880,8 +880,6 @@ const KLEIN_SINGLE_STAGE_REFERENCE_PROMPT = (
   GENERATION_CONFIG.KONTEXT_STAGE2_PROMPT_KLEIN ||
   "Image 1 is the full image, it contains the subject. Use image 1 as the base and reference. Preserve the person in image 1. Image 2 shows the subject's face which you should preserve. Image 3 contains a hairstyle on a mannequin, change the subject's hair to the hairstyle in image 3. Make the hair emerge naturally from the scalp. Maintain a natural hairline and root direction. Make the hairstyle match the subject's head shape and perspective. Original photorealistic lighting."
 ).replace(/\s+/g, " ").trim();
-const KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT =
-  GENERATION_CONFIG.CHATGPT_STAGE1_PROMPT_TEMPLATE.replace(/\s+/g, " ").trim();
 type KontextStage2Backend = "fal_redux_fill" | "flux_fill" | "flux2" | "flux_klein" | "blend_inpaint" | "gpt_fill";
 type KontextStage1Provider = "gpt_image" | "kontext" | "flux_klein";
 
@@ -911,6 +909,19 @@ function getKontextStage1ProviderLabel(provider: KontextStage1Provider): string 
   if (provider === "gpt_image") return `GPT Image (${GENERATION_CONFIG.CHATGPT_MODEL})`;
   if (provider === "flux_klein") return "FLUX 2 Klein";
   return "FLUX Kontext Pro";
+}
+
+function getCurrentChatGptStage1Prompt(
+  hairstylePrompt: string,
+  userRace?: string | null,
+  userGender?: string | null
+): string {
+  return buildGenerationPrompt(
+    GENERATION_CONFIG.CHATGPT_STAGE1_PROMPT_TEMPLATE,
+    hairstylePrompt,
+    userRace || "natural",
+    userGender || ""
+  ).replace(/\s+/g, " ").trim();
 }
 
 function mergeCompositeData(existing: string | null | undefined, patch: Record<string, unknown>): string {
@@ -10821,6 +10832,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
             let stage1PrimaryProvider: KontextStage1Provider | null = null;
             const topReferenceForStage1 = prefetchedRefs[0];
             if (topReferenceForStage1) {
+              const runtimeStage1Prompt = getCurrentChatGptStage1Prompt(
+                visionHairstyleDescription || variant.customPrompt!,
+                userAnalysis?.raceEthnicity,
+                userAnalysis?.gender
+              );
               const userPhotoDimsForStage1 = await getImageDimensions(userPhotoBase64ForKlein);
               const stage1Size = userPhotoDimsForStage1
                 ? selectChatGPTImageSize(userPhotoDimsForStage1.width, userPhotoDimsForStage1.height)
@@ -10840,7 +10856,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
                       provider: "gpt_primary_only",
                       providerLabel: "GPT Stage 1 (primary only)",
                       inputLabel: "image 1 reference only",
-                      prompt: KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT,
+                      prompt: runtimeStage1Prompt,
                       inputLength: topReferenceForStage1.base64.length,
                       inputPreview: topReferenceForStage1.base64.substring(0, 160),
                       imageSize: stage1Size,
@@ -10857,7 +10873,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
               const stage1GptStartMs = Date.now();
               stage1GptComparisonResult = await generateHairstyleWithChatGPT(
                 topReferenceForStage1.base64,
-                KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT,
+                runtimeStage1Prompt,
                 {
                   promptTemplate: "{hairstyle}",
                   imageSize: stage1Size,
@@ -12860,6 +12876,17 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
       const stage1SizeForGenerateMore = userPhotoDimsForStage1
         ? selectChatGPTImageSize(userPhotoDimsForStage1.width, userPhotoDimsForStage1.height)
         : GENERATION_CONFIG.CHATGPT_IMAGE_SIZE;
+      let sourceSessionFeatures: any = {};
+      try {
+        sourceSessionFeatures = sourceSession.facialFeatures ? JSON.parse(sourceSession.facialFeatures) : {};
+      } catch {
+        sourceSessionFeatures = {};
+      }
+      const runtimeGenerateMoreStage1Prompt = getCurrentChatGptStage1Prompt(
+        sourceSession.hairstyleDescription || sourceSession.customPrompt || sourceVariant.customPrompt || "",
+        sourceSessionFeatures.raceEthnicity,
+        sourceSessionFeatures.gender
+      );
       try {
         await saveBase64DebugImage("/tmp/debug_user_image.jpg", userPhotoBase64ForKlein);
       } catch {
@@ -12929,7 +12956,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
           const stage1GptStartMs = Date.now();
           stage1GptComparisonResult = await generateHairstyleWithChatGPT(
             refBase64,
-            KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT,
+            runtimeGenerateMoreStage1Prompt,
             {
               promptTemplate: "{hairstyle}",
               imageSize: stage1SizeForGenerateMore,
@@ -13171,7 +13198,7 @@ Return ONLY these two lines. No explanations or preamble. Do NOT include a perio
               const retryStage1GptStartMs = Date.now();
               retryStage1Gpt = await generateHairstyleWithChatGPT(
                 refBase64,
-                KONTEXT_STAGE1_MULTI_REFERENCE_PROMPT,
+                runtimeGenerateMoreStage1Prompt,
                 {
                   promptTemplate: "{hairstyle}",
                   imageSize: stage1SizeForGenerateMore,
